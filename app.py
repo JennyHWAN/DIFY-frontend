@@ -12,6 +12,7 @@ load_dotenv()
 
 API_BASE_URL = os.getenv("DIFY_API_BASE_URL", "https://api.dify.ai/v1")
 API_KEY = os.getenv("DIFY_API_KEY", "")
+api_key = API_KEY
 
 st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 st.title("AI-Driven SOC Report Generation")
@@ -20,7 +21,7 @@ st.title("AI-Driven SOC Report Generation")
 with st.sidebar:
     st.header("API Configuration")
     api_base = st.text_input("API Base URL", value=API_BASE_URL)
-    api_key = st.text_input("API Secret Key", value=API_KEY, type="password")
+    api_key_encrypted = st.text_input("API Secret Key", value="******", type="password")
 
 
 def upload_file_to_dify(file_bytes, filename, api_base, api_key):
