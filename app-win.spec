@@ -35,7 +35,7 @@ if os.path.exists(".env.example"):
 
 # ── Analysis ───────────────────────────────────────────────────────────────────
 a = Analysis(
-    ["launcher.py"],
+    ["launcher-win.py"],
     pathex=[],
     binaries=binaries,
     datas=datas,
