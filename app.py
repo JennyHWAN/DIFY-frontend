@@ -322,7 +322,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     if run_main:
         errors = []
-        if not key_main:   errors.append("MAIN Workflow API key is required (set in sidebar).")
+        if not key_main:   errors.append("MAIN Workflow API key is not set. Add DIFY_API_KEY_MAIN to the .env file next to the executable.")
         if not company_name: errors.append("Company Name is required.")
         if not co_short_name: errors.append("Company Short Name is required.")
         if not system_name: errors.append("Service/System Name is required.")

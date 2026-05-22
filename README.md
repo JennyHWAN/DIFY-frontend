@@ -1,17 +1,17 @@
 # AI-Driven SOC Report Generator
 
-A web application that generates SOC 1 and SOC 2 audit reports from your control matrix files using a Dify AI workflow. Upload Excel, PDF, or Word files and receive a formatted `.docx` report.
+A Streamlit application that generates SOC 1 and SOC 2 audit reports from control matrix files using a Dify AI workflow. Upload Excel, PDF, or Word files and receive a formatted `.docx` report.
 
 ---
 
 ## Table of Contents
 
 - [Prerequisites](#prerequisites)
-- [Installation](#installation)
+- [Developer Setup](#developer-setup)
 - [Configuration](#configuration)
-- [Running the App](#running-the-app)
-- [Windows Shortcuts](#windows-shortcuts)
-- [Building a Windows Executable](#building-a-windows-executable)
+- [Running the App Locally](#running-the-app-locally)
+- [Building the Windows Executable](#building-the-windows-executable)
+- [Distributing to Users](#distributing-to-users)
 - [Using the App](#using-the-app)
 - [Troubleshooting](#troubleshooting)
 
@@ -23,171 +23,125 @@ A web application that generates SOC 1 and SOC 2 audit reports from your control
 |---|---|---|
 | Python | 3.9 or higher | [Download here](https://www.python.org/downloads/) |
 | pip | bundled with Python | Used to install dependencies |
-| Dify API key | — | Required to run the workflow |
+| Dify API keys | — | Three keys required (MAIN, SUB1, SUB2 workflows) |
 
-> **Windows users:** During Python installation, check **"Add Python to PATH"** or the app will not start.
+> **Windows users:** During Python installation, check **"Add Python to PATH"**.
 
 ---
 
-## Installation
-
-### Windows
+## Developer Setup
 
 ```bat
 pip install -r requirements.txt
-```
-
-### macOS / Linux
-
-```bash
-pip install -r requirements.txt
-```
-
-If you have both Python 2 and Python 3 installed on macOS/Linux, use `pip3` instead:
-
-```bash
-pip3 install -r requirements.txt
 ```
 
 ---
 
 ## Configuration
 
-The app needs your Dify API key to call the workflow. You have two options:
+API keys are loaded from a `.env` file. This file is gitignored and must never be committed.
 
-### Option A — .env file (recommended for repeated use)
-
-Create a file named `.env` in the same folder as `app.py`:
+Create `.env` in the project root (use `.env.example` as a template):
 
 ```
 DIFY_API_BASE_URL=https://api.dify.ai/v1
-DIFY_API_KEY=your_api_key_here
+DIFY_API_KEY_MAIN=app-xxxxxxxxxxxxxxxx
+DIFY_API_KEY_SUB1=app-xxxxxxxxxxxxxxxx
+DIFY_API_KEY_SUB2=app-xxxxxxxxxxxxxxxx
 ```
 
-- `DIFY_API_BASE_URL` is optional — it defaults to `https://api.dify.ai/v1` if omitted.
-- The `.env` file is loaded automatically when the app starts.
-- Never commit this file to Git (it contains your secret key).
+- `DIFY_API_KEY_MAIN` — used by Step 1 (Extract & Prepare)
+- `DIFY_API_KEY_SUB1` — used by Step 2 (Entity Level Controls)
+- `DIFY_API_KEY_SUB2` — used by Step 3 (Final Report Assembly)
 
-### Option B — Enter the key at runtime
-
-Leave the sidebar **API Secret Key** field and type your key there each time you open the app. This overrides whatever is in `.env`.
+The `.env` file is also **baked into the Windows executable** at build time so end users require no configuration.
 
 ---
 
-## Running the App
+## Running the App Locally
 
-### Windows
-
-**Option 1 — Double-click (easiest):**
-Double-click `run_app-win.bat`. It installs dependencies on the first run, then opens the app in your browser automatically.
-
-**Option 2 — Command Prompt:**
 ```bat
 python -m streamlit run app.py
 ```
 
-### macOS
-
-```bash
-python3 -m streamlit run app.py
-```
-
-### Linux
-
-```bash
-python3 -m streamlit run app.py
-```
-
-The app opens at **http://localhost:8501** in your browser. If it does not open automatically, copy that URL and paste it into your browser.
-
-To stop the app, press `Ctrl+C` in the terminal.
+The app opens at **http://localhost:8501**. Press `Ctrl+C` in the terminal to stop it.
 
 ---
 
-## Windows Shortcuts
+## Building the Windows Executable
 
-Two `.bat` files are included for Windows users who prefer not to use the terminal:
-
-| File | What it does |
-|---|---|
-| `run_app-win.bat` | Installs dependencies (first run only) and launches the app in your browser |
-| `build_exe-win.bat` | Builds a standalone `.exe` that runs without Python installed |
-
----
-
-## Building a Windows Executable
-
-If you want to distribute the app to someone who does not have Python installed, you can build a self-contained `.exe` on Windows.
-
-**Requirements:** Must be run on a Windows machine.
+Run on a Windows machine. The `.env` file must exist and contain valid keys before building — it is bundled into the output.
 
 ```bat
 build_exe-win.bat
 ```
 
-This will:
-1. Install/upgrade all dependencies and PyInstaller
-2. Clean any previous build output
-3. Produce `dist\SOC_Report_Generator\SOC_Report_Generator.exe`
+The script will:
+1. Install / upgrade all dependencies and PyInstaller
+2. Clean previous build output from `C:\DIFY_build\`
+3. Bundle the app, all libraries, and the `.env` into `C:\DIFY_build\dist\SOC_Report_Generator\`
 
-**Distributing the executable:**
-1. Copy the entire `dist\SOC_Report_Generator\` folder to the target machine
-2. In that folder, rename `.env.example` to `.env`
-3. Fill in `DIFY_API_KEY` (and optionally `DIFY_API_BASE_URL`) in the `.env` file
-4. Double-click `SOC_Report_Generator.exe`
+> Build output is written to `C:\DIFY_build\` (not inside the project folder) to avoid Windows MAX_PATH errors caused by the long paths Streamlit creates inside the bundle.
 
-> The `.exe` bundles Python and all libraries — no installation needed on the target machine.
+---
+
+## Distributing to Users
+
+1. Copy the entire `C:\DIFY_build\dist\SOC_Report_Generator\` folder to the target machine
+2. Users double-click `SOC_Report_Generator.exe` — no Python, no configuration required
+
+API keys are embedded inside `_internal\` within the bundle and are not visible to end users.
 
 ---
 
 ## Using the App
 
-### 1. Configure API (sidebar)
+The app runs as a three-step workflow. Each step must complete before the next becomes available.
 
-- The sidebar on the left shows **API Base URL** and **API Secret Key**
-- If you set up a `.env` file the key is pre-loaded; otherwise enter it manually
+### Step 1 — MAIN: Extract & Prepare
 
-### 2. Fill in Report Parameters
+**Upload files:** One or more Excel, PDF, or Word files containing the control matrix and supporting data.
 
-Required fields (marked with `*`):
+**Required fields:**
 
 | Field | Description |
 |---|---|
-| Company Name | Full legal name of the company |
-| Company Short Name | Abbreviated name used in the filename |
-| Service/System Name | Name of the system being audited |
+| Company Name | Full legal name |
+| Company Short Name | Abbreviated name (used in the output filename) |
+| Service / System Name | Name of the system being audited |
 | Service Description | Brief description of the service |
-| Report Period Start | Start date, e.g. `2024-01-01` |
+| Report Period Start | Start date, e.g. `2025-01-01` (use as-of date for TYPE1) |
 | Report Type | SOC1 TYPE1, SOC1 TYPE2, SOC2 TYPE1, or SOC2 TYPE2 |
-| Output Language | English, 中文, or Both |
-| Scope of Report | All carve out, Inclusive, or None |
+| Output Language | English or 中文 |
+| Subservice Organization Testing Strategy | None, All carve out, or Inclusive |
 
-Optional fields:
+**Optional fields:**
 
 | Field | Description |
 |---|---|
-| Report Period End | Required for TYPE2 reports; enter `N/A` for TYPE1 |
-| Company Website | Used in the report header |
+| Report Period End | Required for TYPE2; leave blank for TYPE1 |
+| Company Website | Included in the report header |
 | Industry | SaaS, Cloud Service, AI, PaaS, IaaS, General, or Other |
-| Internal Supporting Systems | Auto-extracted from the control matrix if left empty |
+| Internal Supporting Systems | Auto-extracted from the control matrix if left blank |
+| Systems Function | Describes the purpose of the supporting systems |
 | Control Domain | Only needed if not present in the uploaded document |
-| Subservice Organization | Name of any subservice organization |
+| Subservice Organization | Name and services; required if testing strategy is not None |
 
-### 3. Trust Service Criteria (SOC 2 only)
+**Trust Service Criteria (SOC 2 only):** Check Security, Availability, Processing Integrity, Confidentiality, and/or Privacy as applicable.
 
-Check the applicable criteria: Security, Availability, Processing Integrity, Confidentiality, Privacy.
+Click **Run Step 1 — MAIN Workflow** to start. This step typically takes several minutes.
 
-### 4. Upload Control Matrix File(s)
+### Step 2 — SUB1: Entity Level Controls
 
-Upload one or more files (Excel, PDF, Word). These are sent to the Dify workflow for analysis.
+Appears after Step 1 completes. Click **Run Step 2 — SUB1 Workflow**. No additional inputs required.
 
-### 5. Generate Report
+### Step 3 — SUB2: Final Report Assembly
 
-Click **Generate Report**. The workflow can take several minutes to complete.
+Appears after Step 2 completes. Click **Run Step 3 — SUB2 Workflow**. No additional inputs required.
 
-When done:
-- A preview of the result appears on screen
-- Click **Download Report (.docx)** to save the Word document
+### Download
+
+When Step 3 finishes, a report preview appears and a **Download Report (.docx)** button is shown.
 
 The downloaded file is named: `{CompanyShortName}_{ReportType}_Report.docx`
 
@@ -195,23 +149,18 @@ The downloaded file is named: `{CompanyShortName}_{ReportType}_Report.docx`
 
 ## Troubleshooting
 
-**"Python not found" on Windows**
-- Reinstall Python from https://www.python.org/downloads/ and check **"Add Python to PATH"** during setup
-- Or use the full path: `C:\Users\YourName\AppData\Local\Programs\Python\Python3x\python.exe`
+**Executable flashes and closes immediately**
+- A `launch_error.log` file is created next to `SOC_Report_Generator.exe` — open it to see the full error.
 
-**App opens but API key error appears**
-- Check that your `.env` file is in the same folder as `app.py`
-- Make sure the key does not have extra spaces or quotes around it
+**"MAIN/SUB1/SUB2 API key is not set" error**
+- The `.env` was missing when the executable was built. Add the keys to `.env` and rebuild.
 
-**Workflow times out**
-- The workflow has a 600-second (10 minute) timeout. If it fails, try uploading a smaller file or splitting the control matrix
+**Workflow times out or returns an error**
+- The workflow uses a 30-minute streaming timeout. Try uploading a smaller or simpler control matrix file.
+- Check that the Dify platform is reachable from the machine running the exe.
 
-**Port 8501 already in use**
-- Another instance of the app is running. Stop it with `Ctrl+C`, or run on a different port:
-  ```bash
-  python3 -m streamlit run app.py --server.port 8502
+**Port 8501 already in use (local dev only)**
+- Another instance is running. Stop it with `Ctrl+C`, or run on a different port:
+  ```bat
+  python -m streamlit run app.py --server.port 8502
   ```
-
-**macOS/Linux: `pip` installs but `streamlit` command not found**
-- Use `python3 -m streamlit run app.py` instead of `streamlit run app.py`
-- Or add your Python scripts folder to PATH: `export PATH="$HOME/.local/bin:$PATH"`

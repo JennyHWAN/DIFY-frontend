@@ -30,8 +30,29 @@ for pkg in ("docx", "altair", "pyarrow", "pydeck"):
 
 # ── Include app source files ───────────────────────────────────────────────────
 datas += [("app.py", ".")]
-if os.path.exists(".env.example"):
-    datas += [(".env.example", ".")]
+
+# ── Embed API keys as compiled bytecode (not a readable plaintext file) ────────
+# Read .env at build time, write values into a Python module, then bundle it.
+# PyInstaller compiles _bundled_config.py to .pyc — keys are in bytecode, not
+# a plaintext file that users can open from the _internal folder.
+try:
+    from dotenv import dotenv_values as _dv
+    _env = _dv(".env")
+except Exception:
+    raise FileNotFoundError(".env not found — create it with your API keys before building.")
+
+for _key in ("DIFY_API_KEY_MAIN", "DIFY_API_KEY_SUB1", "DIFY_API_KEY_SUB2"):
+    if not _env.get(_key):
+        raise ValueError(f"{_key} is missing or empty in .env")
+
+with open("_bundled_config.py", "w") as _f:
+    _f.write(
+        f"API_BASE_URL = {repr(_env.get('DIFY_API_BASE_URL', 'https://api.dify.ai/v1'))}\n"
+        f"API_KEY_MAIN = {repr(_env.get('DIFY_API_KEY_MAIN', ''))}\n"
+        f"API_KEY_SUB1 = {repr(_env.get('DIFY_API_KEY_SUB1', ''))}\n"
+        f"API_KEY_SUB2 = {repr(_env.get('DIFY_API_KEY_SUB2', ''))}\n"
+    )
+datas += [("_bundled_config.py", ".")]
 
 # ── Analysis ───────────────────────────────────────────────────────────────────
 a = Analysis(
