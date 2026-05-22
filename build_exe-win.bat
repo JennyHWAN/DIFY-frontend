@@ -55,7 +55,7 @@ echo.
 echo  TO DISTRIBUTE TO USERS:
 echo    1. Copy the entire folder to the target machine
 echo    2. Double-click SOC_Report_Generator.exe
-echo    (API keys are baked in — no setup required by the user)
+echo    (API keys are baked in - no setup required by the user)
 echo ============================================================
 echo.
 pause
