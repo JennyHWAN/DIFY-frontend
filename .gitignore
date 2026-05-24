@@ -2,3 +2,6 @@ env
 .claude
 .env
 _bundled_config.py
+/dist
+/build
+/__pycache__

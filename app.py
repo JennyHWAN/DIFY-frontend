@@ -5,7 +5,8 @@ import io
 import re
 import json
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor, Cm
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from dotenv import load_dotenv
@@ -225,11 +226,70 @@ def _add_table_from_md(doc, table_lines):
             _inline(cell.paragraphs[0], text)
 
 
-def markdown_to_docx(md_text: str) -> bytes:
+def _add_numpipe_table(doc, lines, language="English"):
+    """Parse 'N | Term | Description' rows (no leading pipe) and add a Word table."""
+    rows = []
+    for line in lines:
+        parts = [c.strip() for c in line.strip().split("|") if c.strip()]
+        if parts:
+            rows.append(parts)
+    if not rows:
+        return
+    num_cols = max(len(r) for r in rows)
+    if language.startswith("中"):
+        hdr = ("编号", "名词/系统名称", "名词解释/系统简介")
+    else:
+        hdr = ("SN", "Term/Application Name", "Terminology/System Introduction")
+    header_row = list(hdr[:num_cols])
+    table = doc.add_table(rows=1 + len(rows), cols=num_cols)
+    table.style = "Table Grid"
+    for j, h in enumerate(header_row):
+        cell = table.rows[0].cells[j]
+        cell.text = ""
+        run = cell.paragraphs[0].add_run(h)
+        run.bold = True
+        _apply_fonts(run)
+        _set_cell_background(cell, "D9D9D9")
+    for i, row_data in enumerate(rows):
+        for j in range(num_cols):
+            cell = table.rows[i + 1].cells[j]
+            cell.text = ""
+            text = row_data[j] if j < len(row_data) else ""
+            run = cell.paragraphs[0].add_run(text)
+            _apply_fonts(run)
+    _set_col_widths(table, [1.2, 5.0, 9.7])
+
+
+def _set_col_widths(tbl, widths_cm):
+    """Force fixed column widths (list of cm values) on a table."""
+    tblPr = tbl._tbl.tblPr
+    layout = tblPr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tblPr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+    for row in tbl.rows:
+        for j, w_cm in enumerate(widths_cm):
+            if j < len(row.cells):
+                row.cells[j].width = Cm(w_cm)
+
+
+def _add_heading(doc, text, level):
+    """Add a Heading-N paragraph: black, 11 pt, bold, then one blank line."""
+    p = doc.add_paragraph(style=f"Heading {level}")
+    run = p.add_run(text)
+    _apply_fonts(run)
+    run.font.color.rgb = RGBColor(0, 0, 0)
+    run.font.size = Pt(11)
+    doc.add_paragraph()
+
+
+def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     doc = Document()
 
     _set_style_fonts(doc.styles["Normal"])
     doc.styles["Normal"].font.size = Pt(11)
+    doc.styles["Normal"].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
     lines = md_text.split("\n")
     i = 0
@@ -246,53 +306,92 @@ def markdown_to_docx(md_text: str) -> bytes:
             _add_table_from_md(doc, table_lines)
             continue
 
-        # ── Headings (plain paragraphs with manual formatting) ─────────────
+        # ── Number-pipe table  (N | Term | Description) ────────────────────
+        if re.match(r"^\d+\s*\|", line.strip()):
+            npt_lines = []
+            while i < len(lines) and re.match(r"^\d+\s*\|", lines[i].strip()):
+                npt_lines.append(lines[i])
+                i += 1
+            _add_numpipe_table(doc, npt_lines, language)
+            continue
+
+        # ── Headings ───────────────────────────────────────────────────────
         if line.startswith("#### "):
-            p = doc.add_paragraph()
-            run = p.add_run(line[5:].strip())
-            run.bold = True
-            _apply_fonts(run)
+            _add_heading(doc, line[5:].strip(), 4)
 
         elif line.startswith("### "):
-            p = doc.add_paragraph()
-            run = p.add_run(line[4:].strip())
-            run.underline = True
-            _apply_fonts(run)
+            _add_heading(doc, line[4:].strip(), 3)
 
         elif line.startswith("## "):
-            p = doc.add_paragraph()
-            run = p.add_run(line[3:].strip())
-            run.bold = True
-            run.italic = True
-            _apply_fonts(run)
+            _add_heading(doc, line[3:].strip(), 2)
 
         elif line.startswith("# "):
-            p = doc.add_paragraph()
-            run = p.add_run(line[2:].strip())
-            run.bold = True
-            _apply_fonts(run)
+            _add_heading(doc, line[2:].strip(), 1)
 
         # ── Bullet lists ───────────────────────────────────────────────────
         elif re.match(r"^[-*+] ", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, line[2:].strip())
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
         elif re.match(r"^[•·]\s+", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
         elif re.match(r"^\d+\. ", line):
-            p = doc.add_paragraph(style="List Number")
-            _inline_bullet(p, re.sub(r"^\d+\. ", "", line).strip())
+            # Collect the whole consecutive numbered block, keeping the SN
+            numbered_items = []
+            while i < len(lines) and re.match(r"^\d+\. ", lines[i]):
+                m = re.match(r"^(\d+)\. (.*)", lines[i])
+                numbered_items.append((m.group(1), m.group(2).strip()))
+                i += 1
+            # If every item follows "Term: Description", convert to a 3-column table
+            _def_pat = re.compile(r"^(?!https?:)([^:]{1,80}):\s+(.*)", re.DOTALL)
+            texts = [rest for _, rest in numbered_items]
+            if len(texts) >= 2 and all(_def_pat.match(t) for t in texts):
+                if language.startswith("中"):
+                    hdr = ("编号", "名词/系统名称", "名词解释/系统简介")
+                else:
+                    hdr = ("SN", "Term/Application Name", "Terminology/System Introduction")
+                tbl = doc.add_table(rows=1 + len(numbered_items), cols=3)
+                tbl.style = "Table Grid"
+                for j, h in enumerate(hdr):
+                    cell = tbl.rows[0].cells[j]
+                    cell.text = ""
+                    r = cell.paragraphs[0].add_run(h)
+                    r.bold = True
+                    _apply_fonts(r)
+                    _set_cell_background(cell, "D9D9D9")
+                for idx, (sn, rest) in enumerate(numbered_items):
+                    m = _def_pat.match(rest)
+                    term, desc = m.group(1).strip(), m.group(2)
+                    for j, text in enumerate((sn, term, desc)):
+                        cell = tbl.rows[idx + 1].cells[j]
+                        cell.text = ""
+                        run = cell.paragraphs[0].add_run(text)
+                        _apply_fonts(run)
+                _set_col_widths(tbl, [1.2, 5.0, 9.7])
+            else:
+                for _, rest in numbered_items:
+                    p = doc.add_paragraph(style="List Number")
+                    _inline_bullet(p, rest)
+                    p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            continue  # i already advanced past the block
 
         # ── Blank line ─────────────────────────────────────────────────────
         elif line.strip() == "":
             pass
 
+        # ── Plain-text heading (no # marker: short line, no terminal punct) ─
+        elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(('.', '?', '!', ',', ';', ':')):
+            _add_heading(doc, line.strip(), 2)
+
         # ── Normal paragraph ───────────────────────────────────────────────
         else:
             p = doc.add_paragraph()
             _inline(p, line)
+            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
         i += 1
 
@@ -662,7 +761,7 @@ if final_done:
     with st.expander("📖 Preview Report", expanded=True):
         st.markdown(result_text)
 
-    docx_bytes = markdown_to_docx(result_text)
+    docx_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
     filename = (
         f"{ui.get('Co_short_name', 'Report')}_"
         f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
