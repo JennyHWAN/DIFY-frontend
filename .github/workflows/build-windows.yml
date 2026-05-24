@@ -24,6 +24,16 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller --upgrade
 
+      - name: Create .env from secrets
+        run: |
+          @"
+          DIFY_API_BASE_URL=${{ secrets.DIFY_API_BASE_URL }}
+          DIFY_API_KEY_MAIN=${{ secrets.DIFY_API_KEY_MAIN }}
+          DIFY_API_KEY_SUB1=${{ secrets.DIFY_API_KEY_SUB1 }}
+          DIFY_API_KEY_SUB2=${{ secrets.DIFY_API_KEY_SUB2 }}
+          "@ | Set-Content -Encoding UTF8 .env
+        shell: pwsh
+
       - name: Build executable
         run: pyinstaller app-win.spec
 

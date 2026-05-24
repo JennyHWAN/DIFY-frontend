@@ -173,51 +173,128 @@ def _set_style_fonts(style):
     rFonts.set(qn("w:cs"),       FONT_LATIN)
 
 
+def _set_cell_background(cell, fill_hex):
+    """Apply a solid background fill to a table cell. fill_hex e.g. 'D9D9D9'."""
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), fill_hex)
+    tcPr.append(shd)
+
+
+def _add_table_from_md(doc, table_lines):
+    """Parse markdown table lines and add a Word table with a gray header row."""
+    if len(table_lines) < 2:
+        return
+
+    def parse_row(line):
+        return [cell.strip() for cell in line.strip().strip("|").split("|")]
+
+    def is_separator(cells):
+        return all(re.match(r"^:?-+:?$", c) for c in cells if c)
+
+    headers = parse_row(table_lines[0])
+    num_cols = len(headers)
+
+    data_rows = []
+    for line in table_lines[1:]:
+        cells = parse_row(line)
+        if not is_separator(cells):
+            data_rows.append(cells)
+
+    table = doc.add_table(rows=1 + len(data_rows), cols=num_cols)
+    table.style = "Table Grid"
+
+    # Header row — gray background, bold text
+    for j, header_text in enumerate(headers):
+        cell = table.rows[0].cells[j]
+        cell.text = ""
+        run = cell.paragraphs[0].add_run(header_text)
+        run.bold = True
+        _apply_fonts(run)
+        _set_cell_background(cell, "D9D9D9")
+
+    # Data rows — no background
+    for i, row_data in enumerate(data_rows):
+        for j in range(num_cols):
+            cell = table.rows[i + 1].cells[j]
+            cell.text = ""
+            text = row_data[j] if j < len(row_data) else ""
+            _inline(cell.paragraphs[0], text)
+
+
 def markdown_to_docx(md_text: str) -> bytes:
     doc = Document()
 
-    # Apply dual fonts to Normal and all heading styles
     _set_style_fonts(doc.styles["Normal"])
     doc.styles["Normal"].font.size = Pt(11)
-    for h in ["Heading 1", "Heading 2", "Heading 3", "Heading 4"]:
-        try:
-            _set_style_fonts(doc.styles[h])
-        except KeyError:
-            pass
 
-    for line in md_text.split("\n"):
+    lines = md_text.split("\n")
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+
+        # ── Markdown table block ───────────────────────────────────────────
+        if line.strip().startswith("|"):
+            table_lines = []
+            while i < len(lines) and lines[i].strip().startswith("|"):
+                table_lines.append(lines[i])
+                i += 1
+            _add_table_from_md(doc, table_lines)
+            continue
+
+        # ── Headings (plain paragraphs with manual formatting) ─────────────
         if line.startswith("#### "):
-            p = doc.add_heading(line[5:].strip(), level=4)
-            for run in p.runs:
-                _apply_fonts(run)
+            p = doc.add_paragraph()
+            run = p.add_run(line[5:].strip())
+            run.bold = True
+            _apply_fonts(run)
+
         elif line.startswith("### "):
-            p = doc.add_heading(line[4:].strip(), level=3)
-            for run in p.runs:
-                _apply_fonts(run)
+            p = doc.add_paragraph()
+            run = p.add_run(line[4:].strip())
+            run.underline = True
+            _apply_fonts(run)
+
         elif line.startswith("## "):
-            p = doc.add_heading(line[3:].strip(), level=2)
-            for run in p.runs:
-                _apply_fonts(run)
+            p = doc.add_paragraph()
+            run = p.add_run(line[3:].strip())
+            run.bold = True
+            run.italic = True
+            _apply_fonts(run)
+
         elif line.startswith("# "):
-            p = doc.add_heading(line[2:].strip(), level=1)
-            for run in p.runs:
-                _apply_fonts(run)
-        # Standard markdown bullets: - / * / +
+            p = doc.add_paragraph()
+            run = p.add_run(line[2:].strip())
+            run.bold = True
+            _apply_fonts(run)
+
+        # ── Bullet lists ───────────────────────────────────────────────────
         elif re.match(r"^[-*+] ", line):
             p = doc.add_paragraph(style="List Bullet")
-            _inline(p, line[2:].strip())
-        # Unicode bullet character • (U+2022) used by the LLM
+            _inline_bullet(p, line[2:].strip())
+
         elif re.match(r"^[•·]\s+", line):
             p = doc.add_paragraph(style="List Bullet")
-            _inline(p, re.sub(r"^[•·]\s+", "", line))
+            _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
+
         elif re.match(r"^\d+\. ", line):
             p = doc.add_paragraph(style="List Number")
-            _inline(p, re.sub(r"^\d+\. ", "", line).strip())
+            _inline_bullet(p, re.sub(r"^\d+\. ", "", line).strip())
+
+        # ── Blank line ─────────────────────────────────────────────────────
         elif line.strip() == "":
             pass
+
+        # ── Normal paragraph ───────────────────────────────────────────────
         else:
             p = doc.add_paragraph()
             _inline(p, line)
+
+        i += 1
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -238,6 +315,26 @@ def _inline(paragraph, text):
         else:
             run = paragraph.add_run(part)
             _apply_fonts(run)
+
+
+def _inline_bullet(paragraph, text):
+    """For bullet items: if markdown bold markers are present use _inline as-is;
+    otherwise auto-bold the 'Header: content' pattern before the first colon."""
+    if "**" in text:
+        _inline(paragraph, text)
+        return
+    # Match 'Header: content' — colon within 80 chars, not a URL scheme (http/https)
+    m = re.match(r"^(?!https?:)([^:]{1,80}):\s*(.*)", text, re.DOTALL)
+    if m:
+        header, content = m.group(1).strip(), m.group(2)
+        run = paragraph.add_run(header + ": ")
+        run.bold = True
+        _apply_fonts(run)
+        if content:
+            run2 = paragraph.add_run(content)
+            _apply_fonts(run2)
+    else:
+        _inline(paragraph, text)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
