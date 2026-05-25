@@ -6,6 +6,14 @@ and opens the browser automatically.
 
 import sys
 import os
+
+# Force pure-Python protobuf before any import of google.protobuf (including
+# transitive imports via streamlit).  The bundled _message.pyd C-extension
+# crashes with STATUS_ACCESS_VIOLATION (c0000005) when Streamlit sends a
+# WebSocket delta right after json.loads allocates the large MAIN-Output
+# node_finished payload.  The pure-Python implementation is slower but stable.
+os.environ.setdefault("PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION", "python")
+
 import webbrowser
 import threading
 import time
