@@ -336,6 +336,24 @@ def _next_nonblank_is_heading(lines, i):
     return bool(s) and len(s) <= 130 and not nxt.rstrip().endswith(('.', '?', '!', ',', ';', ':'))
 
 
+def _section_contains_subheadings(lines, i):
+    """Return True if there is an H3 or H4 heading anywhere between line i+1
+    and the next H1/H2 boundary (i.e. within the body of this H2 section).
+
+    Used to identify section-container H2 headings that should be bold-only even
+    when their immediately following line is body text rather than a heading.
+    """
+    j = i + 1
+    while j < len(lines):
+        ln = lines[j]
+        if ln.startswith("# ") or ln.startswith("## "):
+            break
+        if ln.startswith("### ") or ln.startswith("#### "):
+            return True
+        j += 1
+    return False
+
+
 def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     doc = Document()
 
@@ -352,6 +370,11 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     # sequences the LLM produced.  Start True so leading blank lines are
     # silently dropped.
     last_was_blank = True
+    # Once a section-container H2 is confirmed (has H3 sub-headings or its
+    # immediately-next line is itself a heading), sibling H2 headings that
+    # follow at the same level should also be bold-only.  Reset whenever an
+    # H1 heading is encountered (new major section).
+    last_h2_section = False
 
     while i < len(lines):
         line = lines[i]
@@ -386,17 +409,28 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             _add_heading(doc, line[4:].strip(), 3, italic=False)
             last_was_blank = True
 
-        # H2 — italic only when the next non-blank line is NOT itself a heading
-        # (i.e., this heading introduces content → subsection); when the next
-        # non-blank is also a heading this is a section/parent header → no italic.
+        # H2 — bold-only when:
+        #   (a) the immediately-next non-blank line is itself a heading, OR
+        #   (b) this section contains H3/H4 sub-headings (section container), OR
+        #   (c) a sibling H2 was already confirmed as section-level (last_h2_section).
+        # Otherwise italic (content subsection label).
+        # last_h2_section resets to False when an H1 is encountered.
         elif line.startswith("## "):
-            italic = not _next_nonblank_is_heading(lines, i)
+            if (_next_nonblank_is_heading(lines, i)
+                    or _section_contains_subheadings(lines, i)
+                    or last_h2_section):
+                italic = False
+                last_h2_section = True
+            else:
+                italic = True
+                last_h2_section = False
             _add_heading(doc, line[3:].strip(), 2, italic=italic)
             last_was_blank = True
 
-        # H1 — bold only, never italic
+        # H1 — bold only, never italic; resets H2 section-sibling tracking
         elif line.startswith("# "):
             _add_heading(doc, line[2:].strip(), 1, italic=False)
+            last_h2_section = False
             last_was_blank = True
 
         # ── Bullet lists ───────────────────────────────────────────────────
@@ -464,7 +498,14 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
 
         # ── Plain-text heading (no # marker: short line, no terminal punct) ─
         elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(('.', '?', '!', ',', ';', ':')):
-            italic = not _next_nonblank_is_heading(lines, i)
+            if (_next_nonblank_is_heading(lines, i)
+                    or _section_contains_subheadings(lines, i)
+                    or last_h2_section):
+                italic = False
+                last_h2_section = True
+            else:
+                italic = True
+                last_h2_section = False
             _add_heading(doc, line.strip(), 2, italic=italic)
             last_was_blank = True
 
