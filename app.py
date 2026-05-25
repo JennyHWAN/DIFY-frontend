@@ -105,6 +105,7 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
     outputs = {}
     node_count = 0
+    workflow_finished_received = False
 
     for raw_line in resp.iter_lines():
         if not raw_line:
@@ -121,11 +122,21 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
         if event_type == "node_finished":
             node_count += 1
-            node_title = event.get("data", {}).get("title", "")
+            node_data = event.get("data", {})
+            node_title = str(node_data.get("title", ""))
+            node_status = str(node_data.get("status", ""))
+            node_error = str(node_data.get("error", "")) if node_status == "failed" else ""
+            # Release the (potentially very large) event dict before any
+            # Streamlit UI call — the MAIN-Output end-node payload contains
+            # all 19 output fields and can be several hundred KB.
+            event = node_data = None
             if status_placeholder:
                 status_placeholder.info(f"⚙️ Nodes completed: {node_count}   (last: {node_title})")
+            if node_status == "failed":
+                raise RuntimeError(f"Workflow node failed: {node_error or f'node {node_title!r} (#{node_count})'}")
 
         elif event_type == "workflow_finished":
+            workflow_finished_received = True
             data = event.get("data", {})
             if data.get("status") == "failed":
                 raise RuntimeError(f"Workflow failed: {data.get('error', 'unknown error')}")
@@ -136,6 +147,12 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
         elif event_type == "error":
             raise RuntimeError(event.get("message", "Streaming error from Dify"))
+
+    if not workflow_finished_received:
+        raise RuntimeError(
+            f"Workflow stream ended unexpectedly after {node_count} node(s) "
+            "without a completion event — the workflow may have crashed or timed out on the Dify side."
+        )
 
     return outputs
 
