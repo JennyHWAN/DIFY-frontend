@@ -258,6 +258,7 @@ def _add_numpipe_table(doc, lines, language="English"):
             run = cell.paragraphs[0].add_run(text)
             _apply_fonts(run)
     _set_col_widths(table, [1.2, 5.0, 9.7])
+    _set_repeat_header(table)
 
 
 def _set_col_widths(tbl, widths_cm):
@@ -274,14 +275,48 @@ def _set_col_widths(tbl, widths_cm):
                 row.cells[j].width = Cm(w_cm)
 
 
-def _add_heading(doc, text, level):
-    """Add a Heading-N paragraph: black, 11 pt, bold, then one blank line."""
+def _set_repeat_header(table):
+    """Make the first row repeat as a header row when the table spans pages."""
+    tr = table.rows[0]._tr
+    trPr = tr.get_or_add_trPr()
+    tblHeader = OxmlElement("w:tblHeader")
+    tblHeader.set(qn("w:val"), "true")
+    trPr.append(tblHeader)
+
+
+def _add_heading(doc, text, level, italic=False):
+    """Add a Heading-N paragraph: black, 11 pt, bold; italic only when caller requests it."""
     p = doc.add_paragraph(style=f"Heading {level}")
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after  = Pt(0)
     run = p.add_run(text)
     _apply_fonts(run)
     run.font.color.rgb = RGBColor(0, 0, 0)
     run.font.size = Pt(11)
-    doc.add_paragraph()
+    if italic:
+        run.font.italic = True
+    blank = doc.add_paragraph()
+    blank.paragraph_format.space_after  = Pt(0)
+    blank.paragraph_format.space_before = Pt(0)
+
+
+def _next_nonblank_is_heading(lines, i):
+    """Return True if the next non-blank line after index i looks like a heading.
+
+    Used to decide whether the *current* heading is a section header (not italic)
+    or a subsection header (italic): if the next content is itself a heading, the
+    current one is a parent / section-level entry and should not be italicised.
+    """
+    j = i + 1
+    while j < len(lines) and lines[j].strip() == "":
+        j += 1
+    if j >= len(lines):
+        return False
+    nxt = lines[j]
+    if nxt.startswith("#"):
+        return True
+    s = nxt.strip()
+    return bool(s) and len(s) <= 130 and not nxt.rstrip().endswith(('.', '?', '!', ',', ';', ':'))
 
 
 def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
@@ -289,10 +324,17 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
 
     _set_style_fonts(doc.styles["Normal"])
     doc.styles["Normal"].font.size = Pt(11)
-    doc.styles["Normal"].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+    doc.styles["Normal"].paragraph_format.alignment    = WD_ALIGN_PARAGRAPH.JUSTIFY
+    doc.styles["Normal"].paragraph_format.space_after  = Pt(0)
+    doc.styles["Normal"].paragraph_format.space_before = Pt(0)
 
     lines = md_text.split("\n")
     i = 0
+    # Track whether the last thing added was a blank paragraph so we never
+    # emit more than one consecutive blank line regardless of how many '\n'
+    # sequences the LLM produced.  Start True so leading blank lines are
+    # silently dropped.
+    last_was_blank = True
 
     while i < len(lines):
         line = lines[i]
@@ -304,6 +346,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                 table_lines.append(lines[i])
                 i += 1
             _add_table_from_md(doc, table_lines)
+            last_was_blank = False
             continue
 
         # ── Number-pipe table  (N | Term | Description) ────────────────────
@@ -313,31 +356,44 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                 npt_lines.append(lines[i])
                 i += 1
             _add_numpipe_table(doc, npt_lines, language)
+            last_was_blank = False
             continue
 
         # ── Headings ───────────────────────────────────────────────────────
+        # H4 / H3 — bold only, no italic
         if line.startswith("#### "):
-            _add_heading(doc, line[5:].strip(), 4)
+            _add_heading(doc, line[5:].strip(), 4, italic=False)
+            last_was_blank = True  # _add_heading appends a blank internally
 
         elif line.startswith("### "):
-            _add_heading(doc, line[4:].strip(), 3)
+            _add_heading(doc, line[4:].strip(), 3, italic=False)
+            last_was_blank = True
 
+        # H2 — italic only when the next non-blank line is NOT itself a heading
+        # (i.e., this heading introduces content → subsection); when the next
+        # non-blank is also a heading this is a section/parent header → no italic.
         elif line.startswith("## "):
-            _add_heading(doc, line[3:].strip(), 2)
+            italic = not _next_nonblank_is_heading(lines, i)
+            _add_heading(doc, line[3:].strip(), 2, italic=italic)
+            last_was_blank = True
 
+        # H1 — bold only, never italic
         elif line.startswith("# "):
-            _add_heading(doc, line[2:].strip(), 1)
+            _add_heading(doc, line[2:].strip(), 1, italic=False)
+            last_was_blank = True
 
         # ── Bullet lists ───────────────────────────────────────────────────
         elif re.match(r"^[-*+] ", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, line[2:].strip())
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            last_was_blank = False
 
         elif re.match(r"^[•·]\s+", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            last_was_blank = False
 
         elif re.match(r"^\d+\. ", line):
             # Collect the whole consecutive numbered block, keeping the SN
@@ -372,26 +428,37 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                         run = cell.paragraphs[0].add_run(text)
                         _apply_fonts(run)
                 _set_col_widths(tbl, [1.2, 5.0, 9.7])
+                _set_repeat_header(tbl)
             else:
                 for _, rest in numbered_items:
                     p = doc.add_paragraph(style="List Number")
                     _inline_bullet(p, rest)
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            last_was_blank = False
             continue  # i already advanced past the block
 
-        # ── Blank line ─────────────────────────────────────────────────────
+        # ── Blank line — emit at most one consecutive blank paragraph ──────
         elif line.strip() == "":
-            pass
+            if not last_was_blank:
+                blank = doc.add_paragraph()
+                blank.paragraph_format.space_after  = Pt(0)
+                blank.paragraph_format.space_before = Pt(0)
+                last_was_blank = True
 
         # ── Plain-text heading (no # marker: short line, no terminal punct) ─
         elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(('.', '?', '!', ',', ';', ':')):
-            _add_heading(doc, line.strip(), 2)
+            italic = not _next_nonblank_is_heading(lines, i)
+            _add_heading(doc, line.strip(), 2, italic=italic)
+            last_was_blank = True
 
         # ── Normal paragraph ───────────────────────────────────────────────
         else:
             p = doc.add_paragraph()
             _inline(p, line)
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            p.paragraph_format.space_after  = Pt(0)
+            p.paragraph_format.space_before = Pt(0)
+            last_was_blank = False
 
         i += 1
 

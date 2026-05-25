@@ -4,6 +4,9 @@
 ::  Double-click this file to start the app in your browser.
 :: ============================================================
 
+:: Change to the directory containing this script
+cd /d "%~dp0"
+
 echo ============================================================
 echo  SOC Report Generator
 echo ============================================================
@@ -21,7 +24,7 @@ if errorlevel 1 (
 echo Checking dependencies...
 pip show streamlit >nul 2>&1
 if errorlevel 1 (
-    echo Installing dependencies (first run only)...
+    echo Installing dependencies ^(first run only^)...
     pip install -r requirements.txt
     if errorlevel 1 (
         echo [ERROR] Failed to install dependencies.
