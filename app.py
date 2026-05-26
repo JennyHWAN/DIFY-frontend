@@ -551,7 +551,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         "1. 请上传Excel大表，其中必须包含Control Matrix及组织架构描述相关sheet；"
         "2. 若有，上传子服务机构及其服务内容Sheet；"
         "3. 若有，上传CUEC内容清单Sheet；"
-        "4. 若有，上传子服务机构补充控制清单Sheet；"
+        # "4. 若有，上传子服务机构补充控制清单Sheet；"
         "5. 若有，上传名词解释Sheet；"
         "6. 若适用，上传控制目标Sheet"
     )

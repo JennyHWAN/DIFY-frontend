@@ -5,3 +5,4 @@ _bundled_config.py
 /dist
 /build
 /__pycache__
+.idea/
