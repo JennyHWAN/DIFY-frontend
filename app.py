@@ -596,7 +596,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     with opt1:
         industry         = st.selectbox("Industry",
-            ["Other", "SaaS", "Cloud Service", "AI", "General", "PaaS", "IaaS"])
+            ["Other", "HR", "Cloud Service", "AI", "General"])
         co_website       = st.text_input("Company Website",               max_chars=256)
         system_extra     = st.text_input("Internal Supporting Systems",
                             placeholder="e.g. Feishu Platform, Gitlab Platform, Alibaba Cloud Console",
@@ -803,6 +803,7 @@ if sub1_done:
                 st.stop()
 
             so = st.session_state["sub1_outputs"]
+            mo = st.session_state["main_outputs"]
             ui = st.session_state.get("user_inputs", {})
 
             inputs_sub2 = {
@@ -830,6 +831,7 @@ if sub1_done:
                 "Company_name":           to_str(so.get("Company_name") or ui.get("Company_name")),
                 "Co_short_name":          to_str(so.get("Co_short_name") or ui.get("Co_short_name")),
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
+                "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
             }
 
             status = st.empty()
