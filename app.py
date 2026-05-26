@@ -571,6 +571,8 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         period_start    = st.text_input("Report Period Start (as of date if SOC1)", placeholder="e.g. 2025-01-01")
         scope_of_report = st.selectbox("Subservice Organization Testing Strategy",
             ["None", "All carve out", "Inclusive"])
+        industry = st.selectbox("Industry",
+                                ["HR", "Cloud Service", "AI"])
 
     with req2:
         report_type     = st.selectbox("Report Type",
@@ -589,26 +591,24 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             st.warning("⚠️ Subservice Organization exceeds 256 characters. Please shorten it.")
 
 
+
     # ── Optional fields ────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Optional Fields")
     opt1, opt2 = st.columns(2)
 
     with opt1:
-        industry         = st.selectbox("Industry",
-            ["Other", "SaaS", "Cloud Service", "AI", "General", "PaaS", "IaaS"])
-        co_website       = st.text_input("Company Website",               max_chars=256)
-        system_extra     = st.text_input("Internal Supporting Systems",
-                            placeholder="e.g. Feishu Platform, Gitlab Platform, Alibaba Cloud Console",
-                            help="Optional. List the internal systems used to support operations. If left blank, the workflow will auto-extract from the Control Matrix.",   
-                            max_chars=256)
-
-    with opt2:
         domain         = st.text_input("Control Domain",                  max_chars=256)
+        co_website = st.text_input("Company Website", max_chars=256)
+    with opt2:
         systems_function = st.text_input("Systems Function",
                         placeholder="e.g. workflow approval, code management, cloud resource management",
-                        help="Optional. Describe the purpose of the internal supporting systems listed above.",              
+                        help="Optional. Describe the purpose of the internal supporting systems listed above.",
                         max_chars=256)
+        system_extra = st.text_input("Internal Supporting Systems",
+                         placeholder="e.g. Feishu Platform, Gitlab Platform, Alibaba Cloud Console",
+                         help="Optional. List the internal systems used to support operations. If left blank, the workflow will auto-extract from the Control Matrix.",
+                         max_chars=256)
 
     st.subheader("Trust Service Criteria (SOC2 only)")
     tsc_cols = st.columns(5)
@@ -803,6 +803,7 @@ if sub1_done:
                 st.stop()
 
             so = st.session_state["sub1_outputs"]
+            mo = st.session_state["main_outputs"]
             ui = st.session_state.get("user_inputs", {})
 
             inputs_sub2 = {
@@ -830,6 +831,7 @@ if sub1_done:
                 "Company_name":           to_str(so.get("Company_name") or ui.get("Company_name")),
                 "Co_short_name":          to_str(so.get("Co_short_name") or ui.get("Co_short_name")),
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
+                "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
             }
 
             status = st.empty()
