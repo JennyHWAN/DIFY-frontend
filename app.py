@@ -562,7 +562,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     # ── Required fields ───────────────────────────────────────────────────────
     st.subheader("Required Fields")
-    req1, req2 = st.columns(2)
+    req1, req2, req3 = st.columns(2)
 
     with req1:
         company_name        = st.text_input("Company Name",         max_chars=256)
@@ -588,22 +588,22 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if len(subservice_org) > 256:
             st.warning("⚠️ Subservice Organization exceeds 256 characters. Please shorten it.")
 
-
-    # ── Optional fields ────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("Optional Fields")
-    opt1, opt2 = st.columns(2)
-
-    with opt1:
+    with req3:
         industry         = st.selectbox("Industry",
             ["Other", "HR", "Cloud Service", "AI", "General"])
         co_website       = st.text_input("Company Website",               max_chars=256)
         system_extra     = st.text_input("Internal Supporting Systems",
                             placeholder="e.g. Feishu Platform, Gitlab Platform, Alibaba Cloud Console",
-                            help="Optional. List the internal systems used to support operations. If left blank, the workflow will auto-extract from the Control Matrix.",   
+                            help="Optional. List the internal systems used to support operations. If left blank, the workflow will auto-extract from the Control Matrix.",
                             max_chars=256)
 
-    with opt2:
+
+    # ── Optional fields ────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("Optional Fields")
+    opt1 = st.columns(2)
+
+    with opt1:
         domain         = st.text_input("Control Domain",                  max_chars=256)
         systems_function = st.text_input("Systems Function",
                         placeholder="e.g. workflow approval, code management, cloud resource management",
