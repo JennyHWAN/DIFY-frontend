@@ -301,8 +301,8 @@ def _set_repeat_header(table):
     trPr.append(tblHeader)
 
 
-def _add_heading(doc, text, level, italic=False, underline=False):
-    """Add a Heading-N paragraph: black, 11 pt, bold; italic/underline only when caller requests it."""
+def _add_heading(doc, text, level, italic=False):
+    """Add a Heading-N paragraph: black, 11 pt, bold; italic only when caller requests it."""
     p = doc.add_paragraph(style=f"Heading {level}")
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after  = Pt(0)
@@ -312,8 +312,6 @@ def _add_heading(doc, text, level, italic=False, underline=False):
     run.font.size = Pt(11)
     if italic:
         run.font.italic = True
-    if underline:
-        run.font.underline = True
     blank = doc.add_paragraph()
     blank.paragraph_format.space_after  = Pt(0)
     blank.paragraph_format.space_before = Pt(0)
@@ -397,14 +395,13 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             continue
 
         # ── Headings ───────────────────────────────────────────────────────
-        # H4 — bold only, no italic
+        # H4 / H3 — bold only, no italic
         if line.startswith("#### "):
             _add_heading(doc, line[5:].strip(), 4, italic=False)
             last_was_blank = True  # _add_heading appends a blank internally
 
-        # H3 — italic + underlined (used for CUEC/subsection domain headers)
         elif line.startswith("### "):
-            _add_heading(doc, line[4:].strip(), 3, italic=True, underline=True)
+            _add_heading(doc, line[4:].strip(), 3, italic=False)
             last_was_blank = True
 
         # H2 — bold-only when:
