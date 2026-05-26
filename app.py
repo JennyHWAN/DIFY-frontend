@@ -572,7 +572,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         scope_of_report = st.selectbox("Subservice Organization Testing Strategy",
             ["None", "All carve out", "Inclusive"])
         industry = st.selectbox("Industry",
-                                ["Other", "HR", "Cloud Service", "AI", "General"])
+                                ["HR", "Cloud Service", "AI"])
 
     with req2:
         report_type     = st.selectbox("Report Type",
