@@ -562,7 +562,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     # ── Required fields ───────────────────────────────────────────────────────
     st.subheader("Required Fields")
-    req1, req2, req3 = st.columns(2)
+    req1, req2, req3 = st.columns(3)
 
     with req1:
         company_name        = st.text_input("Company Name",         max_chars=256)
@@ -601,13 +601,14 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
     # ── Optional fields ────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("Optional Fields")
-    opt1 = st.columns(2)
+    opt1, opt2 = st.columns(2)
 
     with opt1:
         domain         = st.text_input("Control Domain",                  max_chars=256)
+    with opt2:
         systems_function = st.text_input("Systems Function",
                         placeholder="e.g. workflow approval, code management, cloud resource management",
-                        help="Optional. Describe the purpose of the internal supporting systems listed above.",              
+                        help="Optional. Describe the purpose of the internal supporting systems listed above.",
                         max_chars=256)
 
     st.subheader("Trust Service Criteria (SOC2 only)")
