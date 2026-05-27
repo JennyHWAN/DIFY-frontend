@@ -301,8 +301,9 @@ def _set_repeat_header(table):
     trPr.append(tblHeader)
 
 
-def _add_heading(doc, text, level, italic=False):
-    """Add a Heading-N paragraph: black, 11 pt, bold; italic only when caller requests it."""
+def _add_heading(doc, text, level):
+    """Add a Heading-N paragraph with level-specific formatting:
+    H1 = bold only | H2 = bold + italic | H3 = italic + underline | H4+ = bold only"""
     p = doc.add_paragraph(style=f"Heading {level}")
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after  = Pt(0)
@@ -310,48 +311,23 @@ def _add_heading(doc, text, level, italic=False):
     _apply_fonts(run)
     run.font.color.rgb = RGBColor(0, 0, 0)
     run.font.size = Pt(11)
-    if italic:
+    if level == 1:
+        run.font.bold = True
+        run.font.italic = False
+    elif level == 2:
+        run.font.bold = True
         run.font.italic = True
+    elif level == 3:
+        run.font.bold = False
+        run.font.italic = True
+        run.font.underline = True
+    else:
+        run.font.bold = True
+        run.font.italic = False
     blank = doc.add_paragraph()
     blank.paragraph_format.space_after  = Pt(0)
     blank.paragraph_format.space_before = Pt(0)
 
-
-def _next_nonblank_is_heading(lines, i):
-    """Return True if the next non-blank line after index i looks like a heading.
-
-    Used to decide whether the *current* heading is a section header (not italic)
-    or a subsection header (italic): if the next content is itself a heading, the
-    current one is a parent / section-level entry and should not be italicised.
-    """
-    j = i + 1
-    while j < len(lines) and lines[j].strip() == "":
-        j += 1
-    if j >= len(lines):
-        return False
-    nxt = lines[j]
-    if nxt.startswith("#"):
-        return True
-    s = nxt.strip()
-    return bool(s) and len(s) <= 130 and not nxt.rstrip().endswith(('.', '?', '!', ',', ';', ':'))
-
-
-def _section_contains_subheadings(lines, i):
-    """Return True if there is an H3 or H4 heading anywhere between line i+1
-    and the next H1/H2 boundary (i.e. within the body of this H2 section).
-
-    Used to identify section-container H2 headings that should be bold-only even
-    when their immediately following line is body text rather than a heading.
-    """
-    j = i + 1
-    while j < len(lines):
-        ln = lines[j]
-        if ln.startswith("# ") or ln.startswith("## "):
-            break
-        if ln.startswith("### ") or ln.startswith("#### "):
-            return True
-        j += 1
-    return False
 
 
 def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
@@ -395,28 +371,21 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             continue
 
         # ── Headings ───────────────────────────────────────────────────────
-        # H4 / H3 — bold only, no italic
+        # H1=bold | H2=bold+italic | H3=italic+underline | H4+=bold
         if line.startswith("#### "):
-            _add_heading(doc, line[5:].strip(), 4, italic=False)
+            _add_heading(doc, line[5:].strip(), 4)
             last_was_blank = True  # _add_heading appends a blank internally
 
         elif line.startswith("### "):
-            _add_heading(doc, line[4:].strip(), 3, italic=False)
+            _add_heading(doc, line[4:].strip(), 3)
             last_was_blank = True
 
-        # H2 — bold-only when:
-        #   (a) the immediately-next non-blank line is itself a heading, OR
-        #   (b) this section contains H3/H4 sub-headings (section container).
-        # Otherwise italic (content subsection label).
         elif line.startswith("## "):
-            italic = not (_next_nonblank_is_heading(lines, i)
-                          or _section_contains_subheadings(lines, i))
-            _add_heading(doc, line[3:].strip(), 2, italic=italic)
+            _add_heading(doc, line[3:].strip(), 2)
             last_was_blank = True
 
-        # H1 — bold only, never italic
         elif line.startswith("# "):
-            _add_heading(doc, line[2:].strip(), 1, italic=False)
+            _add_heading(doc, line[2:].strip(), 1)
             last_was_blank = True
 
         # ── Bullet lists ───────────────────────────────────────────────────
@@ -484,9 +453,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
 
         # ── Plain-text heading (no # marker: short line, no terminal punct) ─
         elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(('.', '?', '!', ',', ';', ':')):
-            italic = not (_next_nonblank_is_heading(lines, i)
-                          or _section_contains_subheadings(lines, i))
-            _add_heading(doc, line.strip(), 2, italic=italic)
+            _add_heading(doc, line.strip(), 2)
             last_was_blank = True
 
         # ── Normal paragraph ───────────────────────────────────────────────
@@ -548,12 +515,12 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
-        "1. 请上传Excel大表，其中必须包含Control Matrix及组织架构描述相关sheet；"
-        "2. 若有，上传子服务机构及其服务内容Sheet；"
-        "3. 若有，上传CUEC内容清单Sheet；"
-        "4. 若有，上传子服务机构补充控制清单Sheet；"
-        "5. 若有，上传名词解释Sheet；"
-        "6. 若适用，上传控制目标Sheet"
+        "1. 请上传Excel大表，其中必须包含Control Matrix sheet；"
+        # "2. 若有，上传子服务机构及其服务内容Sheet；"
+        # "3. 若有，上传CUEC内容清单Sheet；"
+        # "3. 若有，上传子服务机构补充控制清单Sheet；"
+        "2. 若有，上传名词解释Sheet；"
+        "3. 若适用，上传控制目标Sheet"
     )
     uploaded_files = st.file_uploader(
         "Upload files (Excel, PDF, Word, etc.)",
