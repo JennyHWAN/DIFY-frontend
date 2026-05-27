@@ -76,7 +76,7 @@ a = Analysis(
     ],
     hookspath=[],
     hooksconfig={},
-    runtime_hooks=[],
+    runtime_hooks=["rthook_protobuf.py"],
     excludes=["matplotlib", "scipy", "PIL", "cv2", "tensorflow", "torch"],
     noarchive=False,
 )
