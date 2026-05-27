@@ -452,7 +452,11 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                 last_was_blank = True
 
         # ── Plain-text heading (no # marker: short line, no terminal punct) ─
-        elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(('.', '?', '!', ',', ';', ':')):
+        # Excludes both ASCII and Chinese terminal punctuation so that Chinese
+        # sentences ending with 。？！，；：are not misidentified as headings.
+        elif line.strip() and len(line.strip()) <= 130 and not line.rstrip().endswith(
+            ('.', '?', '!', ',', ';', ':', '。', '？', '！', '，', '；', '：')
+        ):
             _add_heading(doc, line.strip(), 2)
             last_was_blank = True
 
