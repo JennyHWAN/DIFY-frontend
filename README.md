@@ -114,6 +114,7 @@ The app runs as a three-step workflow. Each step must complete before the next b
 | Report Type | SOC1 TYPE1, SOC1 TYPE2, SOC2 TYPE1, or SOC2 TYPE2 |
 | Output Language | English or 中文 |
 | Subservice Organization Testing Strategy | None, All carve out, or Inclusive |
+| Industry | HR, IaaS, AI, SaaS, or Others |
 
 **Optional fields:**
 
@@ -121,7 +122,6 @@ The app runs as a three-step workflow. Each step must complete before the next b
 |---|---|
 | Report Period End | Required for TYPE2; leave blank for TYPE1 |
 | Company Website | Included in the report header |
-| Industry | SaaS, Cloud Service, AI, PaaS, IaaS, General, or Other |
 | Internal Supporting Systems | Auto-extracted from the control matrix if left blank |
 | Systems Function | Describes the purpose of the supporting systems |
 | Control Domain | Only needed if not present in the uploaded document |
