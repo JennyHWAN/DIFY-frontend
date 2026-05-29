@@ -4,14 +4,24 @@ import os
 import io
 import re
 import json
+import zipfile
+import xml.etree.ElementTree as ET
+from copy import deepcopy
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from dotenv import load_dotenv
+import openpyxl
 
 load_dotenv()
+
+_HERE           = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_INDEX  = os.path.join(_HERE, "..", "template_index.xlsx")
+AR_TEMPLATE_DIR = os.path.join(_HERE, "..", "AR_template")
+MA_TEMPLATE_DIR = os.path.join(_HERE, "..", "MA_template")
+EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
 
 API_BASE_URL  = os.getenv("DIFY_API_BASE_URL", "https://api.dify.ai/v1")
 API_KEY_MAIN  = os.getenv("DIFY_API_KEY_MAIN", "")
@@ -33,7 +43,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -58,6 +68,357 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ── Template helpers ───────────────────────────────────────────────────────────
+
+def get_standard_options(report_type):
+    """Return the list of applicable attestation standards for a given report type."""
+    if report_type.startswith("SOC1"):
+        return ["SSAE 18", "ISAE 3402", "SSAE 18 & ISAE 3402 Combined"]
+    else:
+        return ["SSAE 18", "ISAE 3000", "SSAE 18 & ISAE 3000 Combined"]
+
+
+def resolve_template(report_type, standard, sso, language, sheet):
+    """
+    Look up template_index.xlsx for a matching row and return (wp_no, filepath|None).
+    sheet must be 'AR' or 'MA'.
+    """
+    # Map UI values → spreadsheet values
+    if report_type.startswith("SOC1"):
+        category = "SOC 1"
+    else:
+        category = "SOC 2"
+
+    if "TYPE1" in report_type:
+        typ = "Type I"
+    else:
+        typ = "Type II"
+
+    if "Combined" in standard:
+        std_mapped = "Combined"
+    else:
+        std_mapped = standard  # "SSAE 18", "ISAE 3402", "ISAE 3000"
+
+    sso_map = {"None": "none", "All carve out": "all carve out", "Inclusive": "Inclusive"}
+    sso_mapped = sso_map.get(sso, "none")
+
+    lang_map = {"English": "EN", "中文": "CN"}
+    lang_mapped = lang_map.get(language, "EN")
+
+    template_dir = AR_TEMPLATE_DIR if sheet == "AR" else MA_TEMPLATE_DIR
+
+    try:
+        wb = openpyxl.load_workbook(TEMPLATE_INDEX, read_only=True, data_only=True)
+        ws = wb[sheet]
+        # Column layout for AR: SN, Category, Type, Standards, SSO, Language, ..., WP No (last)
+        # Column layout for MA: SN, Category, Type, Standards, SSO, Language, Comments, WP No.
+        header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
+        # Find column indices
+        col_cat  = header.index("Category")
+        col_type = header.index("Type")
+        col_std  = header.index("Standards")
+        col_sso  = header.index("Sub-service Organization (SSO)")
+        col_lang = header.index("Language")
+        # WP No column name differs between sheets
+        col_wp = next(
+            i for i, h in enumerate(header)
+            if h and str(h).strip().upper().startswith("WP")
+        )
+
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            if (str(row[col_cat] or "").strip() == category and
+                    str(row[col_type] or "").strip() == typ and
+                    str(row[col_std] or "").strip() == std_mapped and
+                    str(row[col_sso] or "").strip() == sso_mapped and
+                    str(row[col_lang] or "").strip() == lang_mapped):
+                wp_val = row[col_wp]
+                if wp_val is None:
+                    return (None, None)
+                wp_no = str(wp_val).strip()
+                # Search template dir for a file starting with the WP number
+                try:
+                    for fname in os.listdir(template_dir):
+                        if fname.endswith(".docx") and fname.startswith(wp_no + " "):
+                            return (wp_no, os.path.join(template_dir, fname))
+                except OSError:
+                    pass
+                return (wp_no, None)
+        return (None, None)
+    except Exception:
+        return (None, None)
+
+
+def _normalize_ws(s):
+    """Collapse all whitespace sequences to a single space and strip."""
+    return " ".join(s.split())
+
+
+def _kw_in(comment_text, keyword):
+    """Check if keyword appears in comment_text, ignoring all internal whitespace.
+    Stripping spaces handles XML-inserted spaces between CJK characters."""
+    return keyword.replace(" ", "") in comment_text.replace(" ", "")
+
+
+# Comment keyword sets for deletion logic
+_CUEC_KW     = ["无用户补充", "未识别用户补充", "user entity补充", "无用户实体补充"]
+_SSO_CC_KW   = ["子服务机构补偿", "子服务机构补充"]
+_TRANS_KW    = ["处理transaction", "processing user entity transaction"]
+_SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
+_OTHER_KW    = ["other information"]  # ALWAYS keep — never delete
+
+
+def _build_deletion_indices(template_path, flags):
+    """
+    Parse the docx XML to find which body-level paragraph indices should be
+    deleted based on comment annotations and the supplied flags dict.
+    Returns a set of integer indices into the body's direct children list.
+    """
+    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    p_tag   = f"{{{ns_w}}}p"
+    crs_tag = f"{{{ns_w}}}commentRangeStart"
+    id_attr = f"{{{ns_w}}}id"
+
+    try:
+        with zipfile.ZipFile(template_path, "r") as z:
+            doc_xml = z.read("word/document.xml").decode("utf-8")
+            if "word/comments.xml" in z.namelist():
+                comments_xml = z.read("word/comments.xml").decode("utf-8")
+            else:
+                return set()
+    except Exception:
+        return set()
+
+    # Strip BOM
+    for raw in (doc_xml, comments_xml):
+        pass
+    if doc_xml.startswith("\ufeff"):
+        doc_xml = doc_xml[1:]
+    if comments_xml.startswith("\ufeff"):
+        comments_xml = comments_xml[1:]
+
+    # Build comment text map
+    try:
+        root_c = ET.fromstring(comments_xml)
+    except ET.ParseError:
+        return set()
+    comment_texts = {}
+    for comment in root_c.findall(f"{{{ns_w}}}comment"):
+        cid = comment.get(id_attr)
+        texts = [t.text or "" for t in comment.findall(f".//{{{ns_w}}}t")]
+        comment_texts[cid] = _normalize_ws(" ".join(texts)).lower()
+
+    # Build comment_id → set of body-child indices
+    try:
+        root_d = ET.fromstring(doc_xml)
+    except ET.ParseError:
+        return set()
+    body = root_d.find(f"{{{ns_w}}}body")
+    if body is None:
+        return set()
+
+    comment_to_indices = {}
+    for i, child in enumerate(body):
+        if child.tag != p_tag:
+            continue
+        for crs in child.findall(f".//{{{ns_w}}}commentRangeStart"):
+            cid = crs.get(id_attr)
+            if cid:
+                comment_to_indices.setdefault(cid, set()).add(i)
+
+    # Determine which indices to delete
+    indices_to_delete = set()
+    for cid, text in comment_texts.items():
+        # Other Information paragraphs are ALWAYS kept
+        if any(_kw_in(text, kw.lower()) for kw in _OTHER_KW):
+            continue
+
+        should_delete = False
+
+        if not flags.get("cuec_identified", True):
+            if any(_kw_in(text, kw.lower()) for kw in _CUEC_KW):
+                should_delete = True
+
+        if not flags.get("sso_cc_identified", True):
+            if any(_kw_in(text, kw.lower()) for kw in _SSO_CC_KW):
+                should_delete = True
+
+        if not flags.get("has_transaction_processing", True):
+            if any(_kw_in(text, kw.lower()) for kw in _TRANS_KW):
+                should_delete = True
+
+        if flags.get("single_user_entity", False):
+            if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
+                should_delete = True
+
+        if should_delete:
+            for idx in comment_to_indices.get(cid, set()):
+                indices_to_delete.add(idx)
+
+    return indices_to_delete
+
+
+def fill_and_process_template(template_path, subs, flags):
+    """
+    Fill placeholders and delete conditional paragraphs in a docx template.
+    Returns the modified document as bytes.
+    """
+    # Build set of paragraph indices to delete (based on comment annotations)
+    del_indices = _build_deletion_indices(template_path, flags)
+
+    # Load with python-docx for substitution
+    doc = Document(template_path)
+
+    def _apply_subs_to_para(para):
+        """Apply substitutions to a paragraph's runs.
+
+        We join all run texts into a single string, apply substitutions in dict
+        order (longer/more-specific patterns first, e.g. '[date] to [date]'
+        before '[date]'), then collapse the result back into runs[0].  Sub-run
+        character formatting is intentionally sacrificed for template placeholders
+        — these cells never carry user-styled bold/italic runs.
+        """
+        full_text = "".join(r.text for r in para.runs)
+        if not full_text:
+            return
+        changed = False
+        for placeholder, value in subs.items():
+            if placeholder in full_text:
+                full_text = full_text.replace(placeholder, value)
+                changed = True
+        if changed and para.runs:
+            para.runs[0].text = full_text
+            for run in para.runs[1:]:
+                run.text = ""
+
+    # Apply substitutions to all paragraphs and table cells
+    for para in doc.paragraphs:
+        _apply_subs_to_para(para)
+
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _apply_subs_to_para(para)
+
+    # Delete marked body-level paragraphs (reverse order to preserve indices)
+    body = doc.element.body
+    children = list(body)
+    for idx in sorted(del_indices, reverse=True):
+        if idx < len(children):
+            body.remove(children[idx])
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def merge_docx_sections(*docs_bytes):
+    """Merge multiple docx byte strings into one document with page breaks between sections."""
+    base = Document(io.BytesIO(docs_bytes[0]))
+    body = base.element.body
+    last_sectPr = body.find(qn("w:sectPr"))
+
+    for extra_bytes in docs_bytes[1:]:
+        # Insert a page break before the next section
+        p_br = OxmlElement("w:p")
+        r_br = OxmlElement("w:r")
+        br   = OxmlElement("w:br")
+        br.set(qn("w:type"), "page")
+        r_br.append(br)
+        p_br.append(r_br)
+        if last_sectPr is not None:
+            body.insert(list(body).index(last_sectPr), p_br)
+        else:
+            body.append(p_br)
+
+        extra = Document(io.BytesIO(extra_bytes))
+        for elem in extra.element.body:
+            if elem.tag != qn("w:sectPr"):
+                if last_sectPr is not None:
+                    body.insert(list(body).index(last_sectPr), deepcopy(elem))
+                else:
+                    body.append(deepcopy(elem))
+
+    buf = io.BytesIO()
+    base.save(buf)
+    return buf.getvalue()
+
+
+def build_substitutions(ui, tc):
+    """Build the EN + CN placeholder → value substitution dict."""
+    company_name  = ui.get("Company_name", "")
+    co_short_name = ui.get("Co_short_name", "")
+    system_name   = ui.get("System_or_service_name", "")
+    service_desc  = ui.get("Service_description", "")
+    period_start  = ui.get("Period_start", "")
+    period_end    = ui.get("Period_end", "")
+    report_type   = ui.get("Report_type", "")
+    subservice_org = ui.get("Subservice_org", "")
+    report_date   = tc.get("report_date", "")
+    signing_city  = tc.get("signing_city", "")
+
+    # Determine date placeholders based on report type
+    if "TYPE1" in report_type:
+        single_date = period_start  # Type I: "as of" date
+    else:
+        single_date = period_end    # Type II: period end date
+
+    period_str = f"{period_start} to {period_end}" if period_start and period_end else period_start or period_end
+
+    # Parse first SSO name and services from subservice_org (format: "Name | Services")
+    sso_name = ""
+    sso_services = ""
+    if subservice_org:
+        first_line = subservice_org.strip().splitlines()[0]
+        if "|" in first_line:
+            parts = first_line.split("|", 1)
+            sso_name     = parts[0].strip()
+            sso_services = parts[1].strip()
+        else:
+            sso_name = first_line.strip()
+
+    subs = {
+        # EN placeholders
+        "[Service organization name]":          company_name,
+        "[Service organization short name]":     co_short_name,
+        "[Service organization\u2019s system]":  system_name,   # right single quote
+        "[Service organization's system]":       system_name,   # straight apostrophe
+        "[or identification of the function performed by the System]": service_desc,
+        "[date] to [date]":                      period_str,
+        "[date]":                                single_date,
+        "[Date of the service auditor\u2019s report]": report_date,  # right quote
+        "[Date of the service auditor's report]":      report_date,  # straight quote
+        "[Date of report]":                      report_date,
+        "[Ernst & Young Hua Ming LLP]":          EY_FIRM_NAME,
+        # City: replace the whole "default_city[alternatives]" pattern
+        "Shanghai[Beijing, Shenzhen]":           signing_city,
+        "[Beijing, Shenzhen]":                   signing_city,
+        "[Subservice organization name]":        sso_name,
+        "[identify the function or service provided by the subservice organization]": sso_services,
+        "[V]":                                   "V",
+        # CN placeholders
+        "\u300e\u670d\u52a1\u673a\u6784\u540d\u79f0\u300f": company_name,   # 【服务机构名称】
+        "\u300e\u670d\u52a1\u673a\u6784\u7b80\u79f0\u300f": co_short_name,  # 【服务机构简称】
+        "\u300e\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u300f": system_name,  # 【服务机构体系名称】
+        "\u300e\u65e5\u671f\u300f": single_date,   # 【日期】
+        "\u300e\u62a5\u544a\u65e5\u300f": report_date,  # 【报告日】
+        # City CN: replace the default+alternatives pattern
+        "\u4e2d\u56fd \u4e0a\u6d77\u3010\u6216\u4e2d\u56fd \u5317\u4eac\u6216\u4e2d\u56fd \u6df1\u5733\u3011": f"\u4e2d\u56fd {signing_city}",  # 中国 上海【或中国 北京或中国 深圳】→ 中国 {city}
+        "\u3010\u6216\u5b89\u6c38\u534e\u660e\u4f1a\u8ba1\u5e08\u4e8b\u52a1\u6240\uff08\u7279\u6b8a\u666e\u901a\u5408\u4f19\uff09\u3011": "",  # 【或安永华明...】→ empty (keep branch)
+    }
+    return subs
+
+
+def build_flags(tc):
+    """Build the boolean deletion-flag dict from template_config."""
+    return {
+        "cuec_identified":          tc.get("cuec_identified", True),
+        "sso_cc_identified":        tc.get("sso_cc_identified", True),
+        "has_transaction_processing": tc.get("has_transaction_processing", True),
+        "single_user_entity":       tc.get("single_user_entity", False),
+    }
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -517,6 +878,100 @@ def _inline_bullet(paragraph, text):
 # ══════════════════════════════════════════════════════════════════════════════
 with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=not main_done):
 
+    # ── Complete report option ─────────────────────────────────────────────────
+    generate_complete = st.checkbox(
+        "Generate complete report (MA + AR + main sections)",
+        value=True,
+        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
+    )
+
+    if generate_complete:
+        with st.expander("Complete Report Settings", expanded=True):
+            cr1, cr2 = st.columns(2)
+
+            # Read current Report Type from session_state key (set by the selectbox below).
+            # Falls back to the previous run's saved value, then to default.
+            _cur_rt = (
+                st.session_state.get("form_report_type")
+                or st.session_state.get("user_inputs", {}).get("Report_type", "SOC2 TYPE2")
+            )
+            _cur_sso = (
+                st.session_state.get("form_scope_of_report")
+                or st.session_state.get("user_inputs", {}).get("Scope_of_the_report", "None")
+            )
+            _cur_lang = (
+                st.session_state.get("form_output_language")
+                or st.session_state.get("user_inputs", {}).get("Output_language", "English")
+            )
+
+            with cr1:
+                _std_options = get_standard_options(_cur_rt)
+                standard = st.selectbox("Standard", _std_options, key="cr_standard")
+                report_date  = st.text_input("Report Signing Date", placeholder="e.g. January 30, 2026", key="cr_report_date")
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+
+            with cr2:
+                cuec_choice = st.radio(
+                    "Complementary User Entity Controls (CUEC)",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_cuec",
+                )
+                has_transaction_processing = st.checkbox(
+                    "Includes transaction processing wording",
+                    value=True,
+                    key="cr_transaction",
+                )
+                single_user_entity = st.checkbox(
+                    "Single user entity report",
+                    value=False,
+                    key="cr_single_user",
+                )
+
+            # SSO CC — only shown when SSO != None
+            if _cur_sso != "None":
+                sso_cc_choice = st.radio(
+                    "SSO Complementary Controls",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_sso_cc",
+                )
+            else:
+                sso_cc_choice = "Identified"
+
+            # Template resolution preview (computed every render)
+            st.markdown("---")
+            _ar_wp, _ar_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "AR")
+            _ma_wp, _ma_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "MA")
+
+            if _ar_wp:
+                if _ar_path:
+                    st.info(f"AR template: WP No. {_ar_wp} \u2192 {os.path.basename(_ar_path)}")
+                else:
+                    st.warning(f"AR template: WP No. {_ar_wp} listed but file not found in AR_template/")
+            else:
+                st.warning("AR template: No matching template found for this combination.")
+
+            if _ma_wp:
+                if _ma_path:
+                    st.info(f"MA template: WP No. {_ma_wp} \u2192 {os.path.basename(_ma_path)}")
+                else:
+                    st.warning(f"MA template: WP No. {_ma_wp} listed but file not found in MA_template/")
+            else:
+                st.warning("MA template: No matching template found for this combination.")
+
+    else:
+        standard                  = ""
+        report_date               = ""
+        signing_city              = ""
+        cuec_choice               = "Identified"
+        sso_cc_choice             = "Identified"
+        has_transaction_processing = True
+        single_user_entity        = False
+        _ar_path                  = None
+        _ma_path                  = None
+
+    st.markdown("---")
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
         "1. 请上传Excel大表，其中必须包含Control Matrix sheet；"
@@ -541,15 +996,15 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         system_name         = st.text_input("Service / System Name",max_chars=256)
         period_start    = st.text_input("Report Period Start (as of date if SOC1)", placeholder="e.g. 2025-01-01")
         scope_of_report = st.selectbox("Subservice Organization Testing Strategy",
-            ["None", "All carve out", "Inclusive"])
+            ["None", "All carve out", "Inclusive"], key="form_scope_of_report")
         industry = st.selectbox("Industry",
                                 ["HR", "IaaS", "AI", "SaaS", "Others"])
 
     with req2:
         report_type     = st.selectbox("Report Type",
-            ["SOC1 TYPE1", "SOC1 TYPE2", "SOC2 TYPE1", "SOC2 TYPE2"])
+            ["SOC1 TYPE1", "SOC1 TYPE2", "SOC2 TYPE1", "SOC2 TYPE2"], key="form_report_type")
         output_language = st.selectbox("Output Language",
-            ["English", "中文"])
+            ["English", "中文"], key="form_output_language")
         service_description = st.text_input("Service Description",  max_chars=256)
         period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2024-12-31")
         subservice_org = st.text_area(
@@ -606,10 +1061,28 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if (scope_of_report != "None") and (not subservice_org):
             errors.append("Please input Subservice Organizations and its service provided")
 
+        if generate_complete:
+            if not report_date:
+                errors.append("Report Signing Date is required when generating a complete report.")
+            if not signing_city:
+                errors.append("Signing City is required when generating a complete report.")
+
         if errors:
             for e in errors:
                 st.error(e)
             st.stop()
+
+        # Re-resolve templates using the current form's report_type, sso and language
+        if generate_complete:
+            _ar_wp_final, _ar_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp_final, _ma_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+            if not _ar_path_final:
+                st.warning("AR template file not found for this combination — complete report will omit Section II.")
+            if not _ma_path_final:
+                st.warning("MA template file not found for this combination — complete report will omit Section I.")
+        else:
+            _ar_path_final = None
+            _ma_path_final = None
 
         # Upload files
         with st.spinner("Uploading file(s) to Dify…"):
@@ -646,6 +1119,20 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "Subservice_org": subservice_org,
             "Scope_of_the_report": scope_of_report,
             "Co_website": co_website,
+        }
+
+        # Store template config for download step
+        st.session_state["template_config"] = {
+            "generate_complete":          generate_complete,
+            "standard":                   standard,
+            "report_date":                report_date,
+            "signing_city":               signing_city,
+            "cuec_identified":            cuec_choice == "Identified",
+            "sso_cc_identified":          sso_cc_choice == "Identified",
+            "has_transaction_processing": has_transaction_processing,
+            "single_user_entity":         single_user_entity,
+            "ar_template_path":           _ar_path_final,
+            "ma_template_path":           _ma_path_final,
         }
 
         inputs_main = {
@@ -834,20 +1321,49 @@ if final_done:
     st.success("🎉 Report is ready!")
 
     result_text = st.session_state["final_result"]
-    ui = st.session_state.get("user_inputs", {})
+    ui  = st.session_state.get("user_inputs", {})
+    tc  = st.session_state.get("template_config", {})
 
-    with st.expander("📖 Preview Report", expanded=True):
+    with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    docx_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
-    filename = (
-        f"{ui.get('Co_short_name', 'Report')}_"
-        f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-    )
+    # Always generate the Dify sections docx
+    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+
+    if (tc.get("generate_complete")
+            and tc.get("ar_template_path")
+            and tc.get("ma_template_path")):
+        subs  = build_substitutions(ui, tc)
+        flags = build_flags(tc)
+
+        try:
+            with st.spinner("Generating MA section (Section I)…"):
+                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags)
+            with st.spinner("Generating AR section (Section II)…"):
+                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags)
+            with st.spinner("Merging all sections…"):
+                final_bytes = merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+            filename = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
+            )
+        except Exception as exc:
+            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+            final_bytes = dify_bytes
+            filename = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+            )
+    else:
+        final_bytes = dify_bytes
+        filename = (
+            f"{ui.get('Co_short_name', 'Report')}_"
+            f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+        )
 
     st.download_button(
         label="⬇ Download Report (.docx)",
-        data=docx_bytes,
+        data=final_bytes,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         type="primary",
