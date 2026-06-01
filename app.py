@@ -17,10 +17,18 @@ import openpyxl
 
 load_dotenv()
 
-_HERE           = os.path.dirname(os.path.abspath(__file__))
-TEMPLATE_INDEX  = os.path.join(_HERE, "..", "template_index.xlsx")
-AR_TEMPLATE_DIR = os.path.join(_HERE, "..", "AR_template")
-MA_TEMPLATE_DIR = os.path.join(_HERE, "..", "MA_template")
+import sys as _sys
+
+if getattr(_sys, "frozen", False):
+    # Running as a PyInstaller exe — templates sit next to the .exe
+    _TEMPLATE_BASE = os.path.dirname(_sys.executable)
+else:
+    # Development — templates are in the same folder as app.py (DIFY-frontend/)
+    _TEMPLATE_BASE = os.path.dirname(os.path.abspath(__file__))
+
+TEMPLATE_INDEX  = os.path.join(_TEMPLATE_BASE, "template_index.xlsx")
+AR_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
+MA_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
 EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
 
 API_BASE_URL  = os.getenv("DIFY_API_BASE_URL", "https://api.dify.ai/v1")
