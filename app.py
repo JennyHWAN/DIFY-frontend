@@ -90,6 +90,7 @@ def get_standard_options(report_type):
 def resolve_template(report_type, standard, sso, language, sheet):
     """
     Look up template_index.xlsx for a matching row and return (wp_no, filepath|None).
+    On error returns (None, error_message_string) so callers can surface the problem.
     sheet must be 'AR' or 'MA'.
     """
     # Map UI values → spreadsheet values
@@ -117,44 +118,53 @@ def resolve_template(report_type, standard, sso, language, sheet):
     template_dir = AR_TEMPLATE_DIR if sheet == "AR" else MA_TEMPLATE_DIR
 
     try:
-        wb = openpyxl.load_workbook(TEMPLATE_INDEX, read_only=True, data_only=True)
+        # Do NOT use read_only=True — it can silently fail to iterate rows in
+        # some environments.
+        wb = openpyxl.load_workbook(TEMPLATE_INDEX, data_only=True)
         ws = wb[sheet]
-        # Column layout for AR: SN, Category, Type, Standards, SSO, Language, ..., WP No (last)
-        # Column layout for MA: SN, Category, Type, Standards, SSO, Language, Comments, WP No.
-        header = [c.value for c in next(ws.iter_rows(min_row=1, max_row=1))]
-        # Find column indices
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+    except Exception as e:
+        return (None, f"Cannot load template index: {e}")
+
+    if not rows:
+        return (None, "Template index sheet is empty")
+
+    header = list(rows[0])
+    try:
         col_cat  = header.index("Category")
         col_type = header.index("Type")
         col_std  = header.index("Standards")
         col_sso  = header.index("Sub-service Organization (SSO)")
         col_lang = header.index("Language")
-        # WP No column name differs between sheets
-        col_wp = next(
+        col_wp   = next(
             i for i, h in enumerate(header)
             if h and str(h).strip().upper().startswith("WP")
         )
+    except (ValueError, StopIteration) as e:
+        return (None, f"Template index column not found: {e}")
 
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            if (str(row[col_cat] or "").strip() == category and
-                    str(row[col_type] or "").strip() == typ and
-                    str(row[col_std] or "").strip() == std_mapped and
-                    str(row[col_sso] or "").strip() == sso_mapped and
-                    str(row[col_lang] or "").strip() == lang_mapped):
-                wp_val = row[col_wp]
-                if wp_val is None:
-                    return (None, None)
-                wp_no = str(wp_val).strip()
-                # Search template dir for a file starting with the WP number
-                try:
-                    for fname in os.listdir(template_dir):
-                        if fname.endswith(".docx") and fname.startswith(wp_no + " "):
-                            return (wp_no, os.path.join(template_dir, fname))
-                except OSError:
-                    pass
-                return (wp_no, None)
-        return (None, None)
-    except Exception:
-        return (None, None)
+    for row in rows[1:]:
+        if (str(row[col_cat]  or "").strip() == category  and
+                str(row[col_type] or "").strip() == typ       and
+                str(row[col_std]  or "").strip() == std_mapped and
+                str(row[col_sso]  or "").strip() == sso_mapped and
+                str(row[col_lang] or "").strip() == lang_mapped):
+            wp_val = row[col_wp]
+            if wp_val is None:
+                # This combination has no template — keep iterating in case
+                # another row matches (shouldn't happen, but safe).
+                continue
+            wp_no = str(wp_val).strip()
+            try:
+                for fname in sorted(os.listdir(template_dir)):
+                    if fname.endswith(".docx") and fname.startswith(wp_no + " "):
+                        return (wp_no, os.path.join(template_dir, fname))
+            except OSError as e:
+                return (wp_no, f"Cannot list template directory: {e}")
+            return (wp_no, None)
+
+    return (None, None)
 
 
 def _normalize_ws(s):
@@ -1127,21 +1137,21 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             _ar_wp, _ar_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "AR")
             _ma_wp, _ma_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "MA")
 
-            if _ar_wp:
-                if _ar_path:
-                    st.info(f"AR template: WP No. {_ar_wp} \u2192 {os.path.basename(_ar_path)}")
+            def _show_template_status(label, wp, path, dir_name):
+                if wp is None and isinstance(path, str):
+                    # path carries the error message when wp is None
+                    st.error(f"{label}: {path}")
+                elif wp is None:
+                    st.warning(f"{label}: No matching template found for this combination.")
+                elif path and os.path.isfile(path):
+                    st.info(f"{label}: WP No. {wp} \u2192 {os.path.basename(path)}")
+                elif isinstance(path, str) and path.startswith("Cannot"):
+                    st.error(f"{label}: WP No. {wp} — {path}")
                 else:
-                    st.warning(f"AR template: WP No. {_ar_wp} listed but file not found in AR_template/")
-            else:
-                st.warning("AR template: No matching template found for this combination.")
+                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
 
-            if _ma_wp:
-                if _ma_path:
-                    st.info(f"MA template: WP No. {_ma_wp} \u2192 {os.path.basename(_ma_path)}")
-                else:
-                    st.warning(f"MA template: WP No. {_ma_wp} listed but file not found in MA_template/")
-            else:
-                st.warning("MA template: No matching template found for this combination.")
+            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
+            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
 
     else:
         standard                  = ""
@@ -1260,9 +1270,16 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if generate_complete:
             _ar_wp_final, _ar_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_final, _ma_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
-            if not _ar_path_final:
+            # Treat error strings (non-file paths) as missing
+            if _ar_path_final and not os.path.isfile(_ar_path_final):
+                st.warning(f"AR template issue: {_ar_path_final} — complete report will omit Section II.")
+                _ar_path_final = None
+            elif not _ar_path_final:
                 st.warning("AR template file not found for this combination — complete report will omit Section II.")
-            if not _ma_path_final:
+            if _ma_path_final and not os.path.isfile(_ma_path_final):
+                st.warning(f"MA template issue: {_ma_path_final} — complete report will omit Section I.")
+                _ma_path_final = None
+            elif not _ma_path_final:
                 st.warning("MA template file not found for this combination — complete report will omit Section I.")
         else:
             _ar_path_final = None
