@@ -347,6 +347,12 @@ def _clean_docx_bytes(docx_bytes):
                         r"<w:del\b[^>]*(?<!/)>.*?</w:del>", "",
                         xml_str, flags=re.DOTALL,
                     )
+                    # Accept run-property format changes: remove <w:rPrChange>
+                    # (keeps current/accepted formatting, discards old-format record)
+                    xml_str = re.sub(
+                        r"<w:rPrChange\b[^>]*>.*?</w:rPrChange>", "",
+                        xml_str, flags=re.DOTALL,
+                    )
                     # Remove comment range markers
                     xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
                     xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
@@ -470,8 +476,30 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     # ── Step 6: font standardisation ───────────────────────────────────────
     cjk_font = "华文楷体" if language == "中文" else "Times New Roman"
 
-    def _std_run(run):
-        run.bold      = False           # strip bold; italic is left untouched
+    # Paragraphs whose text matches these patterns keep their bold intact.
+    # Checked against the paragraph's full text AFTER substitution.
+    _BOLD_KEEP_PATTERNS = [
+        "Independent Service Auditor",   # AR section title
+        "Management Assertion",          # MA section title (after co-name sub)
+    ]
+    # Date paragraph in MA: formatted date string is the entire paragraph text
+    _DATE_RE = re.compile(
+        r"^(?:[A-Z][a-z]+ \d{1,2}, \d{4}|\d{4}年\d{1,2}月\d{1,2}日)$"
+    )
+
+    def _para_keep_bold(para):
+        full = "".join(r.text for r in para.runs).strip()
+        if any(pat in full for pat in _BOLD_KEEP_PATTERNS):
+            return True
+        if _DATE_RE.match(full):
+            return True
+        return False
+
+    def _std_run(run, keep_bold=False):
+        if not keep_bold:
+            run.bold = False            # strip bold; italic is left untouched
+        else:
+            run.bold = True             # ensure bold is explicitly set
         run.font.size = Pt(11)
         rPr    = run._r.get_or_add_rPr()
         rFonts = rPr.find(qn("w:rFonts"))
@@ -484,14 +512,16 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         rFonts.set(qn("w:cs"),       "Times New Roman")
 
     for para in doc.paragraphs:
+        kb = _para_keep_bold(para)
         for run in para.runs:
-            _std_run(run)
+            _std_run(run, keep_bold=kb)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
+                    kb = _para_keep_bold(para)
                     for run in para.runs:
-                        _std_run(run)
+                        _std_run(run, keep_bold=kb)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -569,7 +599,17 @@ def build_substitutions(ui, tc):
         else:
             sso_name = first_line.strip()
 
+    # Addressee line: replace the combined "Management of/Board of Directors of"
+    # placeholder before the generic [Service organization name] sub runs.
+    addressee = tc.get("addressee_choice", "Management")
+    if addressee == "Board of Directors":
+        addr_label = "Board of Directors"
+    else:
+        addr_label = "Management"
     subs = {
+        # Addressee line — must come BEFORE the generic [Service organization name] sub
+        "To the Management of/Board of Directors of [Service organization name]":
+            f"To the {addr_label} of {company_name}",
         # EN placeholders
         "[Service organization name]":          company_name,
         "[Service organization short name]":     co_short_name,
@@ -610,6 +650,7 @@ def build_flags(tc):
         "has_transaction_processing": tc.get("has_transaction_processing", True),
         "single_user_entity":         tc.get("single_user_entity", False),
         "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
+        "addressee_choice":           tc.get("addressee_choice", "Management"),
     }
 
 
@@ -1104,6 +1145,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                 signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
 
             with cr2:
+                addressee_choice = st.radio(
+                    "AR Addressee",
+                    ["Management", "Board of Directors"],
+                    index=0,
+                    key="cr_addressee",
+                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
+                )
                 cuec_choice = st.radio(
                     "Complementary User Entity Controls (CUEC)",
                     ["Identified", "Not Identified"],
@@ -1200,6 +1248,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "has_transaction_processing": has_transaction_processing,
                             "single_user_entity":         single_user_entity,
                             "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                            "addressee_choice":           addressee_choice,
                         }
                         try:
                             with st.spinner("Generating test MA + AR sections…"):
@@ -1230,6 +1279,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         has_transaction_processing = True
         single_user_entity         = False
         has_ai_scope_exclusion     = False
+        addressee_choice           = "Management"
         _ar_path                   = None
         _ma_path                   = None
 
@@ -1401,6 +1451,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "has_transaction_processing": has_transaction_processing,
             "single_user_entity":         single_user_entity,
             "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+            "addressee_choice":           addressee_choice,
             "ar_template_path":           _ar_path_final,
             "ma_template_path":           _ma_path_final,
         }
