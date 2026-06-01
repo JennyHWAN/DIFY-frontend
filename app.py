@@ -162,6 +162,27 @@ def _normalize_ws(s):
     return " ".join(s.split())
 
 
+_MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _format_date(s, language="English"):
+    """Convert YYYY-MM-DD to 'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
+    Strings that do not match YYYY-MM-DD are returned unchanged."""
+    if not s:
+        return s
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s.strip())
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12:
+            if language == "中文":
+                return f"{y}年{mo}月{d}日"
+            return f"{_MONTHS[mo - 1]} {d}, {y}"
+    return s
+
+
 def _kw_in(comment_text, keyword):
     """Check if keyword appears in comment_text, ignoring all internal whitespace.
     Stripping spaces handles XML-inserted spaces between CJK characters."""
@@ -174,56 +195,56 @@ _SSO_CC_KW   = ["子服务机构补偿", "子服务机构补充"]
 _TRANS_KW    = ["处理transaction", "processing user entity transaction"]
 _SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
 _OTHER_KW    = ["other information"]  # ALWAYS keep — never delete
+_AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
 
 
-def _build_deletion_indices(template_path, flags):
+def _build_annotation_maps(docx_bytes, flags):
     """
-    Parse the docx XML to find which body-level paragraph indices should be
-    deleted based on comment annotations and the supplied flags dict.
-    Returns a set of integer indices into the body's direct children list.
+    Parse the docx XML (from raw bytes) to determine per-paragraph actions.
+
+    Returns:
+        del_indices     — set of body-child indices to remove entirely
+        single_ue_indices — set of body-child indices where [..] bracket
+                            content is conditionally deleted (single user entity)
     """
-    ns_w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    ns_w    = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     p_tag   = f"{{{ns_w}}}p"
-    crs_tag = f"{{{ns_w}}}commentRangeStart"
     id_attr = f"{{{ns_w}}}id"
 
     try:
-        with zipfile.ZipFile(template_path, "r") as z:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as z:
             doc_xml = z.read("word/document.xml").decode("utf-8")
             if "word/comments.xml" in z.namelist():
                 comments_xml = z.read("word/comments.xml").decode("utf-8")
             else:
-                return set()
+                return set(), set()
     except Exception:
-        return set()
+        return set(), set()
 
-    # Strip BOM
-    for raw in (doc_xml, comments_xml):
-        pass
     if doc_xml.startswith("\ufeff"):
         doc_xml = doc_xml[1:]
     if comments_xml.startswith("\ufeff"):
         comments_xml = comments_xml[1:]
 
-    # Build comment text map
+    # Build comment id → normalised lower-case text map
     try:
         root_c = ET.fromstring(comments_xml)
     except ET.ParseError:
-        return set()
+        return set(), set()
     comment_texts = {}
     for comment in root_c.findall(f"{{{ns_w}}}comment"):
         cid = comment.get(id_attr)
         texts = [t.text or "" for t in comment.findall(f".//{{{ns_w}}}t")]
         comment_texts[cid] = _normalize_ws(" ".join(texts)).lower()
 
-    # Build comment_id → set of body-child indices
+    # Build comment id → set of body-child indices (paragraphs only)
     try:
         root_d = ET.fromstring(doc_xml)
     except ET.ParseError:
-        return set()
+        return set(), set()
     body = root_d.find(f"{{{ns_w}}}body")
     if body is None:
-        return set()
+        return set(), set()
 
     comment_to_indices = {}
     for i, child in enumerate(body):
@@ -234,58 +255,131 @@ def _build_deletion_indices(template_path, flags):
             if cid:
                 comment_to_indices.setdefault(cid, set()).add(i)
 
-    # Determine which indices to delete
-    indices_to_delete = set()
+    del_indices      = set()
+    single_ue_indices = set()
+
     for cid, text in comment_texts.items():
-        # Other Information paragraphs are ALWAYS kept
+        # "Other Information" paragraphs are ALWAYS kept
         if any(_kw_in(text, kw.lower()) for kw in _OTHER_KW):
             continue
 
-        should_delete = False
+        indices = comment_to_indices.get(cid, set())
+        if not indices:
+            continue
 
+        # Single-UE: handle via inline bracket deletion, not whole-para removal
+        if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
+            single_ue_indices |= indices
+            continue
+
+        # AI scope-exclusion paragraph
+        if any(_kw_in(text, kw.lower()) for kw in _AI_KW):
+            if not flags.get("has_ai_scope_exclusion", False):
+                del_indices |= indices
+            continue
+
+        should_delete = False
         if not flags.get("cuec_identified", True):
             if any(_kw_in(text, kw.lower()) for kw in _CUEC_KW):
                 should_delete = True
-
         if not flags.get("sso_cc_identified", True):
             if any(_kw_in(text, kw.lower()) for kw in _SSO_CC_KW):
                 should_delete = True
-
         if not flags.get("has_transaction_processing", True):
             if any(_kw_in(text, kw.lower()) for kw in _TRANS_KW):
                 should_delete = True
 
-        if flags.get("single_user_entity", False):
-            if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
-                should_delete = True
-
         if should_delete:
-            for idx in comment_to_indices.get(cid, set()):
-                indices_to_delete.add(idx)
+            del_indices |= indices
 
-    return indices_to_delete
+    return del_indices, single_ue_indices
 
 
-def fill_and_process_template(template_path, subs, flags):
+def _clean_docx_bytes(docx_bytes):
     """
-    Fill placeholders and delete conditional paragraphs in a docx template.
+    Accept all tracked changes and clear all comments in a docx file.
+
+    Operations performed on word/document.xml via regex (safe for well-formed
+    OOXML generated by Word):
+      - <w:ins>…</w:ins>  →  unwrapped  (content kept, wrapper removed)
+      - <w:del>…</w:del>  →  removed entirely
+      - <w:commentRangeStart/> and <w:commentRangeEnd/> self-closing tags → removed
+      - <w:r> runs whose only non-rPr child is <w:commentReference/>  → removed
+
+    word/comments.xml is replaced with an empty comments document so that Word
+    opens the file without any comment balloons.
+    """
+    _EMPTY_COMMENTS = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main"></w:comments>'
+    ).encode("utf-8")
+
+    buf_in  = io.BytesIO(docx_bytes)
+    buf_out = io.BytesIO()
+
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/document.xml":
+                    xml_str = data.decode("utf-8").lstrip("\ufeff")
+                    # Unwrap <w:ins>…</w:ins>
+                    xml_str = re.sub(
+                        r"<w:ins\b[^>]*>(.*?)</w:ins>", r"\1",
+                        xml_str, flags=re.DOTALL,
+                    )
+                    # Remove <w:del>…</w:del>
+                    xml_str = re.sub(
+                        r"<w:del\b[^>]*>.*?</w:del>", "",
+                        xml_str, flags=re.DOTALL,
+                    )
+                    # Remove comment range markers
+                    xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
+                    xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
+                    # Remove runs that only anchor a comment reference
+                    xml_str = re.sub(
+                        r"<w:r\b[^>]*>\s*(?:<w:rPr>.*?</w:rPr>\s*)?<w:commentReference[^>]*/>\s*</w:r>",
+                        "", xml_str, flags=re.DOTALL,
+                    )
+                    data = xml_str.encode("utf-8")
+                elif info.filename == "word/comments.xml":
+                    data = _EMPTY_COMMENTS
+                zout.writestr(info, data)
+
+    buf_out.seek(0)
+    return buf_out.read()
+
+
+def fill_and_process_template(template_path, subs, flags, language="English"):
+    """
+    Process an EY MA/AR docx template:
+      1. Compute comment-based annotation maps from the original file.
+      2. Accept tracked changes and clear comments (regex on raw XML).
+      3. Apply placeholder substitutions.
+      4. Handle inline square brackets:
+           - single-user-entity annotated paras: delete [..] when flag set,
+             otherwise strip the brackets and keep the content.
+           - [or ..] alternative phrases: always removed.
+           - remaining [..] brackets: brackets stripped, content kept.
+      5. Delete wholly-conditional paragraphs (CUEC / SSO CC / transaction /
+         AI-scope when not applicable).
+      6. Standardise fonts: Times New Roman (EN) or 华文楷体 (CN), 11 pt,
+         bold removed, italic preserved.
+
     Returns the modified document as bytes.
     """
-    # Build set of paragraph indices to delete (based on comment annotations)
-    del_indices = _build_deletion_indices(template_path, flags)
+    # ── Step 1: annotation maps from the original (comments still present) ──
+    with open(template_path, "rb") as fh:
+        raw_bytes = fh.read()
+    del_indices, single_ue_indices = _build_annotation_maps(raw_bytes, flags)
 
-    # Load with python-docx for substitution
-    doc = Document(template_path)
+    # ── Step 2: accept track changes + clear comments ──────────────────────
+    cleaned_bytes = _clean_docx_bytes(raw_bytes)
+    doc = Document(io.BytesIO(cleaned_bytes))
 
+    # ── Step 3: placeholder substitutions ──────────────────────────────────
     def _apply_subs_to_para(para):
-        """Apply substitutions to a paragraph's runs.
-
-        We join all run texts into a single string, apply substitutions in dict
-        order (longer/more-specific patterns first, e.g. '[date] to [date]'
-        before '[date]'), then collapse the result back into runs[0].  Sub-run
-        character formatting is intentionally sacrificed for template placeholders
-        — these cells never carry user-styled bold/italic runs.
-        """
         full_text = "".join(r.text for r in para.runs)
         if not full_text:
             return
@@ -299,22 +393,89 @@ def fill_and_process_template(template_path, subs, flags):
             for run in para.runs[1:]:
                 run.text = ""
 
-    # Apply substitutions to all paragraphs and table cells
     for para in doc.paragraphs:
         _apply_subs_to_para(para)
-
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
                 for para in cell.paragraphs:
                     _apply_subs_to_para(para)
 
-    # Delete marked body-level paragraphs (reverse order to preserve indices)
-    body = doc.element.body
-    children = list(body)
+    # ── Step 4: inline bracket handling ────────────────────────────────────
+    body_children  = list(doc.element.body)
+    body_child_map = {child: i for i, child in enumerate(body_children)}
+    _p_tag         = qn("w:p")
+    _single_ue_flag = flags.get("single_user_entity", False)
+
+    def _apply_brackets(para, is_single_ue):
+        full_text = "".join(r.text for r in para.runs)
+        if not full_text or "[" not in full_text:
+            return
+        original = full_text
+
+        # a) single-user-entity paragraphs
+        if is_single_ue:
+            if _single_ue_flag:
+                # delete the bracketed content entirely
+                full_text = re.sub(r"\[[^\]]*\]", "", full_text)
+            else:
+                # strip the brackets, keep the content
+                full_text = re.sub(r"\[([^\]]*)\]", r"\1", full_text)
+
+        # b) [or …] alternative phrases — always remove
+        full_text = re.sub(r"\s*\[or [^\]]+\]", "", full_text, flags=re.IGNORECASE)
+
+        # c) strip any remaining brackets, keep content
+        full_text = re.sub(r"\[([^\]]*)\]", r"\1", full_text)
+
+        if full_text != original and para.runs:
+            para.runs[0].text = full_text
+            for run in para.runs[1:]:
+                run.text = ""
+
+    # Body-level paragraphs (doc.paragraphs = direct children of <w:body>)
+    for para in doc.paragraphs:
+        idx        = body_child_map.get(para._element, -1)
+        is_sue_para = idx in single_ue_indices
+        _apply_brackets(para, is_sue_para)
+
+    # Table-cell paragraphs (never single-UE annotated at body level)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _apply_brackets(para, False)
+
+    # ── Step 5: delete conditionally-excluded paragraphs ───────────────────
     for idx in sorted(del_indices, reverse=True):
-        if idx < len(children):
-            body.remove(children[idx])
+        if idx < len(body_children):
+            doc.element.body.remove(body_children[idx])
+
+    # ── Step 6: font standardisation ───────────────────────────────────────
+    cjk_font = "华文楷体" if language == "中文" else "Times New Roman"
+
+    def _std_run(run):
+        run.bold      = False           # strip bold; italic is left untouched
+        run.font.size = Pt(11)
+        rPr    = run._r.get_or_add_rPr()
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), cjk_font)
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+
+    for para in doc.paragraphs:
+        for run in para.runs:
+            _std_run(run)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    for run in para.runs:
+                        _std_run(run)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -355,16 +516,18 @@ def merge_docx_sections(*docs_bytes):
 
 def build_substitutions(ui, tc):
     """Build the EN + CN placeholder → value substitution dict."""
+    language      = ui.get("Output_language", "English")
     company_name  = ui.get("Company_name", "")
     co_short_name = ui.get("Co_short_name", "")
     system_name   = ui.get("System_or_service_name", "")
-    service_desc  = ui.get("Service_description", "")
-    period_start  = ui.get("Period_start", "")
-    period_end    = ui.get("Period_end", "")
     report_type   = ui.get("Report_type", "")
     subservice_org = ui.get("Subservice_org", "")
-    report_date   = tc.get("report_date", "")
     signing_city  = tc.get("signing_city", "")
+
+    # Format raw YYYY-MM-DD dates to "Month D, YYYY" / "YYYY年M月D日"
+    period_start = _format_date(ui.get("Period_start", ""), language)
+    period_end   = _format_date(ui.get("Period_end",   ""), language)
+    report_date  = _format_date(tc.get("report_date",  ""), language)
 
     # Determine date placeholders based on report type
     if "TYPE1" in report_type:
@@ -372,7 +535,11 @@ def build_substitutions(ui, tc):
     else:
         single_date = period_end    # Type II: period end date
 
-    period_str = f"{period_start} to {period_end}" if period_start and period_end else period_start or period_end
+    period_str = (
+        f"{period_start} to {period_end}"
+        if period_start and period_end
+        else period_start or period_end
+    )
 
     # Parse first SSO name and services from subservice_org (format: "Name | Services")
     sso_name = ""
@@ -392,7 +559,8 @@ def build_substitutions(ui, tc):
         "[Service organization short name]":     co_short_name,
         "[Service organization\u2019s system]":  system_name,   # right single quote
         "[Service organization's system]":       system_name,   # straight apostrophe
-        "[or identification of the function performed by the System]": service_desc,
+        # Note: [or identification of the function performed by the System] is
+        # handled by the [or ..] regex removal in fill_and_process_template.
         "[date] to [date]":                      period_str,
         "[date]":                                single_date,
         "[Date of the service auditor\u2019s report]": report_date,  # right quote
@@ -421,10 +589,11 @@ def build_substitutions(ui, tc):
 def build_flags(tc):
     """Build the boolean deletion-flag dict from template_config."""
     return {
-        "cuec_identified":          tc.get("cuec_identified", True),
-        "sso_cc_identified":        tc.get("sso_cc_identified", True),
+        "cuec_identified":            tc.get("cuec_identified", True),
+        "sso_cc_identified":          tc.get("sso_cc_identified", True),
         "has_transaction_processing": tc.get("has_transaction_processing", True),
-        "single_user_entity":       tc.get("single_user_entity", False),
+        "single_user_entity":         tc.get("single_user_entity", False),
+        "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
     }
 
 
@@ -935,6 +1104,12 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                     value=False,
                     key="cr_single_user",
                 )
+                has_ai_scope_exclusion = st.checkbox(
+                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
+                    value=False,
+                    key="cr_ai_scope",
+                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
+                )
 
             # SSO CC — only shown when SSO != None
             if _cur_sso != "None":
@@ -975,9 +1150,10 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         cuec_choice               = "Identified"
         sso_cc_choice             = "Identified"
         has_transaction_processing = True
-        single_user_entity        = False
-        _ar_path                  = None
-        _ma_path                  = None
+        single_user_entity         = False
+        has_ai_scope_exclusion     = False
+        _ar_path                   = None
+        _ma_path                   = None
 
     st.markdown("---")
     st.subheader("Upload Control Matrix File(s)")
@@ -1139,6 +1315,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "sso_cc_identified":          sso_cc_choice == "Identified",
             "has_transaction_processing": has_transaction_processing,
             "single_user_entity":         single_user_entity,
+            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
             "ar_template_path":           _ar_path_final,
             "ma_template_path":           _ma_path_final,
         }
@@ -1344,11 +1521,12 @@ if final_done:
         subs  = build_substitutions(ui, tc)
         flags = build_flags(tc)
 
+        _lang = ui.get("Output_language", "English")
         try:
             with st.spinner("Generating MA section (Section I)…"):
-                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags)
+                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
             with st.spinner("Generating AR section (Section II)…"):
-                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags)
+                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
             with st.spinner("Merging all sections…"):
                 final_bytes = merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
             filename = (
