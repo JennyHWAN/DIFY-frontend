@@ -334,22 +334,28 @@ def _clean_docx_bytes(docx_bytes):
                 data = zin.read(info.filename)
                 if info.filename == "word/document.xml":
                     xml_str = data.decode("utf-8").lstrip("\ufeff")
-                    # Unwrap <w:ins>…</w:ins>
+                    # Unwrap <w:ins>…</w:ins>  (skip self-closing <w:ins/>).
+                    # (?<!/)> ensures we only match open tags, not self-closing
+                    # ones like <w:ins w:id="N" .../> which are paragraph-property
+                    # change markers that must be left in place.
                     xml_str = re.sub(
-                        r"<w:ins\b[^>]*>(.*?)</w:ins>", r"\1",
+                        r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
                         xml_str, flags=re.DOTALL,
                     )
-                    # Remove <w:del>…</w:del>
+                    # Remove <w:del>…</w:del>  (skip self-closing <w:del/>)
                     xml_str = re.sub(
-                        r"<w:del\b[^>]*>.*?</w:del>", "",
+                        r"<w:del\b[^>]*(?<!/)>.*?</w:del>", "",
                         xml_str, flags=re.DOTALL,
                     )
                     # Remove comment range markers
                     xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
                     xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
-                    # Remove runs that only anchor a comment reference
+                    # Remove runs that only anchor a comment reference.
+                    # (?:(?!</w:r>).)* prevents the match from crossing run
+                    # boundaries, avoiding catastrophic backtracking that
+                    # would otherwise delete regular text runs.
                     xml_str = re.sub(
-                        r"<w:r\b[^>]*>\s*(?:<w:rPr>.*?</w:rPr>\s*)?<w:commentReference[^>]*/>\s*</w:r>",
+                        r"<w:r\b[^>]*>(?:(?!</w:r>).)*?<w:commentReference[^>]*/>\s*</w:r>",
                         "", xml_str, flags=re.DOTALL,
                     )
                     data = xml_str.encode("utf-8")
@@ -1152,6 +1158,68 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
             _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
             _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
+
+            # ── Test mode: generate MA+AR without running the Dify workflow ──────
+            _ar_ok = _ar_path and os.path.isfile(_ar_path)
+            _ma_ok = _ma_path and os.path.isfile(_ma_path)
+            if _ar_ok and _ma_ok:
+                st.markdown("---")
+                st.caption(
+                    "Use the button below to test Section I + II template generation "
+                    "without running the full Dify workflow. "
+                    "Fill in the company fields below first, then click the button."
+                )
+                with st.expander("Test Template Generation (no Dify needed)", expanded=False):
+                    t1, t2 = st.columns(2)
+                    with t1:
+                        _t_company   = st.text_input("Company Name",       key="test_company",   placeholder="e.g. ABC Fintech Co., Ltd.")
+                        _t_short     = st.text_input("Short Name",          key="test_short",     placeholder="e.g. ABC")
+                        _t_system    = st.text_input("System Name",         key="test_system",    placeholder="e.g. Payment Processing System")
+                        _t_svc_desc  = st.text_input("Service Description", key="test_svc_desc",  placeholder="e.g. payment processing services")
+                    with t2:
+                        _t_period_s  = st.text_input("Period Start (YYYY-MM-DD)", key="test_period_s", placeholder="e.g. 2024-01-01")
+                        _t_period_e  = st.text_input("Period End   (YYYY-MM-DD)", key="test_period_e", placeholder="e.g. 2024-12-31")
+                        _t_sso_name  = st.text_input("SSO Name (if any)",    key="test_sso_name",  placeholder="leave blank if none")
+                    if st.button("Generate test MA + AR sections", key="test_template_btn"):
+                        _test_ui = {
+                            "Company_name":          _t_company or "Test Organization",
+                            "Co_short_name":         _t_short   or "TestOrg",
+                            "System_or_service_name": _t_system or "Test System",
+                            "Service_description":   _t_svc_desc or "test services",
+                            "Period_start":          _t_period_s or "2024-01-01",
+                            "Period_end":            _t_period_e or "2024-12-31",
+                            "Report_type":           _cur_rt,
+                            "Output_language":       _cur_lang,
+                            "Subservice_org":        _t_sso_name or "None",
+                        }
+                        _test_tc = {
+                            "report_date":                report_date  or "January 1, 2025",
+                            "signing_city":               signing_city or "Shanghai",
+                            "cuec_identified":            cuec_choice == "Identified",
+                            "sso_cc_identified":          sso_cc_choice == "Identified",
+                            "has_transaction_processing": has_transaction_processing,
+                            "single_user_entity":         single_user_entity,
+                            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                        }
+                        try:
+                            with st.spinner("Generating test MA + AR sections…"):
+                                _t_subs  = build_substitutions(_test_ui, _test_tc)
+                                _t_flags = build_flags(_test_tc)
+                                _t_ma    = fill_and_process_template(_ma_path, _t_subs, _t_flags, _cur_lang)
+                                _t_ar    = fill_and_process_template(_ar_path, _t_subs, _t_flags, _cur_lang)
+                                _t_merged = merge_docx_sections(_t_ma, _t_ar)
+                            _t_fname = (
+                                f"{(_t_short or 'Test')}_{_cur_rt.replace(' ','_')}"
+                                f"_MA_AR_test.docx"
+                            )
+                            st.download_button(
+                                label="⬇ Download test MA + AR (.docx)",
+                                data=_t_merged,
+                                file_name=_t_fname,
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
+                        except Exception as _exc:
+                            st.error(f"Test generation failed: {_exc}")
 
     else:
         standard                  = ""
