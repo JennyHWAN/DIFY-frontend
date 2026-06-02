@@ -334,10 +334,10 @@ def _clean_docx_bytes(docx_bytes):
                 data = zin.read(info.filename)
                 if info.filename == "word/document.xml":
                     xml_str = data.decode("utf-8").lstrip("\ufeff")
-                    # Unwrap <w:ins>…</w:ins>  (skip self-closing <w:ins/>).
-                    # (?<!/)> ensures we only match open tags, not self-closing
-                    # ones like <w:ins w:id="N" .../> which are paragraph-property
-                    # change markers that must be left in place.
+                    # Unwrap <w:ins>…</w:ins> (content kept, wrapper removed).
+                    # (?<!/)> ensures we only match paired open/close tags and
+                    # skip self-closing <w:ins .../> markers — those are removed
+                    # separately below after all paired tags are processed.
                     xml_str = re.sub(
                         r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
                         xml_str, flags=re.DOTALL,
@@ -353,6 +353,16 @@ def _clean_docx_bytes(docx_bytes):
                         r"<w:rPrChange\b[^>]*>.*?</w:rPrChange>", "",
                         xml_str, flags=re.DOTALL,
                     )
+                    # Accept paragraph-property format changes: remove <w:pPrChange>
+                    xml_str = re.sub(
+                        r"<w:pPrChange\b[^>]*>.*?</w:pPrChange>", "",
+                        xml_str, flags=re.DOTALL,
+                    )
+                    # Remove self-closing <w:ins .../> paragraph-/run-property
+                    # insertion markers (e.g. <w:ins w:id="17" .../>).
+                    # These are NOT content — they are residual change-tracking
+                    # annotations in pPr/rPr blocks that must be stripped.
+                    xml_str = re.sub(r"<w:ins\b[^>]*/>", "", xml_str)
                     # Remove comment range markers
                     xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
                     xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
@@ -481,6 +491,8 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     _BOLD_KEEP_PATTERNS = [
         "Independent Service Auditor",   # AR section title
         "Management Assertion",          # MA section title (after co-name sub)
+        "Ernst & Young",                 # AR signature block (firm name)
+        "Hua Ming",                      # AR signature block (firm name variant)
     ]
     # Date paragraph in MA: formatted date string is the entire paragraph text
     _DATE_RE = re.compile(
@@ -493,15 +505,27 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             return True
         if _DATE_RE.match(full):
             return True
+        # Short city / country line in the AR signature block
+        # e.g. "Shanghai, China" or "中国 上海" (≤50 chars to avoid body text)
+        if len(full) <= 50 and ("China" in full or "中国" in full):
+            return True
         return False
 
     def _std_run(run, keep_bold=False):
+        rPr = run._r.get_or_add_rPr()
         if not keep_bold:
             run.bold = False            # strip bold; italic is left untouched
+            # Also explicitly disable complex-script bold (bCs) so that CJK
+            # characters do not inherit bold from a heading paragraph style
+            # after the document sections are merged.
+            bCs = rPr.find(qn("w:bCs"))
+            if bCs is None:
+                bCs = OxmlElement("w:bCs")
+                rPr.append(bCs)
+            bCs.set(qn("w:val"), "0")
         else:
             run.bold = True             # ensure bold is explicitly set
         run.font.size = Pt(11)
-        rPr    = run._r.get_or_add_rPr()
         rFonts = rPr.find(qn("w:rFonts"))
         if rFonts is None:
             rFonts = OxmlElement("w:rFonts")
@@ -528,13 +552,164 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     return buf.getvalue()
 
 
+def _remap_extra_numbering(base_bytes, extra_bytes):
+    """
+    Remap abstractNumId and numId values in extra_bytes so they do not clash
+    with numbering definitions already present in base_bytes.
+
+    Both documents' numbering.xml are inspected to find the highest IDs in
+    the base; every ID in the extra is offset by that amount so no two
+    definitions share an ID after the merge.
+
+    Returns modified extra_bytes, or the original if either document has no
+    numbering.xml or the extra has no numbered lists.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(base_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return extra_bytes
+            base_num_xml = z.read("word/numbering.xml").decode("utf-8")
+    except Exception:
+        return extra_bytes
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(extra_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return extra_bytes
+            extra_num_xml = z.read("word/numbering.xml").decode("utf-8")
+            extra_doc_xml = z.read("word/document.xml").decode("utf-8")
+    except Exception:
+        return extra_bytes
+
+    # Determine maximum IDs in base
+    base_abs  = [int(x) for x in re.findall(r'w:abstractNumId="(\d+)"', base_num_xml)]
+    base_nums = [int(x) for x in re.findall(r'<w:num\b[^>]*w:numId="(\d+)"', base_num_xml)]
+    base_max_abs = max(base_abs)  if base_abs  else -1
+    base_max_num = max(base_nums) if base_nums else  0
+
+    # Collect IDs present in extra (process largest first to avoid partial hits)
+    extra_abs  = sorted(
+        set(int(x) for x in re.findall(r'<w:abstractNum\b[^>]*w:abstractNumId="(\d+)"', extra_num_xml)),
+        reverse=True,
+    )
+    extra_nums = sorted(
+        set(int(x) for x in re.findall(r'<w:num\b[^>]*w:numId="(\d+)"', extra_num_xml)),
+        reverse=True,
+    )
+
+    if not extra_nums:
+        return extra_bytes  # nothing numbered in extra
+
+    abs_offset = base_max_abs + 1
+    num_offset = base_max_num
+
+    new_num_xml = extra_num_xml
+    new_doc_xml = extra_doc_xml
+
+    # Remap abstractNumId in numbering.xml (definition + cross-references)
+    for old in extra_abs:
+        new = old + abs_offset
+        # <w:abstractNum w:abstractNumId="N"> — definition attribute
+        new_num_xml = new_num_xml.replace(
+            f'w:abstractNumId="{old}"', f'w:abstractNumId="{new}"'
+        )
+        # <w:abstractNumId w:val="N"/> — reference inside <w:num>
+        new_num_xml = new_num_xml.replace(
+            f'<w:abstractNumId w:val="{old}"', f'<w:abstractNumId w:val="{new}"'
+        )
+
+    # Remap numId in numbering.xml (definition) and in document.xml (references)
+    for old in extra_nums:
+        new = old + num_offset
+        # <w:num w:numId="N"> — definition attribute
+        new_num_xml = new_num_xml.replace(f'w:numId="{old}"', f'w:numId="{new}"')
+        # <w:numId w:val="N"/> — paragraph numPr reference
+        new_doc_xml = re.sub(
+            rf'(<w:numId\s+w:val="){old}(")',
+            rf'\g<1>{new}\g<2>',
+            new_doc_xml,
+        )
+
+    # Write modified extra docx
+    buf_in  = io.BytesIO(extra_bytes)
+    buf_out = io.BytesIO()
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/numbering.xml":
+                    data = new_num_xml.encode("utf-8")
+                elif info.filename == "word/document.xml":
+                    data = new_doc_xml.encode("utf-8")
+                zout.writestr(info, data)
+    buf_out.seek(0)
+    return buf_out.read()
+
+
+def _inject_numbering(merged_bytes, extra_bytes):
+    """
+    Append all abstractNum and num definitions from extra_bytes into the
+    word/numbering.xml of merged_bytes.
+
+    This is called after the document bodies have been merged so that the
+    remapped numId values in the extra's paragraphs resolve to actual
+    definitions in the merged file.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(extra_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return merged_bytes
+            extra_num_xml = z.read("word/numbering.xml").decode("utf-8")
+    except Exception:
+        return merged_bytes
+
+    abs_blocks = re.findall(r"<w:abstractNum\b.*?</w:abstractNum>", extra_num_xml, re.DOTALL)
+    num_blocks  = re.findall(r"<w:num\b.*?</w:num>",                extra_num_xml, re.DOTALL)
+
+    if not abs_blocks and not num_blocks:
+        return merged_bytes
+
+    inject = "\n".join(abs_blocks) + "\n" + "\n".join(num_blocks)
+
+    buf_in  = io.BytesIO(merged_bytes)
+    buf_out = io.BytesIO()
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/numbering.xml":
+                    num_xml = data.decode("utf-8")
+                    num_xml = num_xml.replace("</w:numbering>", inject + "\n</w:numbering>")
+                    data = num_xml.encode("utf-8")
+                zout.writestr(info, data)
+    buf_out.seek(0)
+    return buf_out.read()
+
+
 def merge_docx_sections(*docs_bytes):
-    """Merge multiple docx byte strings into one document with page breaks between sections."""
-    base = Document(io.BytesIO(docs_bytes[0]))
+    """
+    Merge multiple docx byte strings into one document with page breaks between
+    sections.
+
+    Numbering IDs (abstractNumId / numId) in each extra document are remapped
+    to avoid conflicts with the base document's numbering definitions, then the
+    extra definitions are injected into the merged file's numbering.xml.  This
+    preserves the original list styles (bullets stay bullets, alpha lists stay
+    alpha lists) across section boundaries.
+    """
+    base_bytes = docs_bytes[0]
+
+    # Remap numbering in each extra so its IDs don't clash with the base
+    extras_remapped = [
+        _remap_extra_numbering(base_bytes, eb) for eb in docs_bytes[1:]
+    ]
+
+    # Merge document bodies with python-docx
+    base = Document(io.BytesIO(base_bytes))
     body = base.element.body
     last_sectPr = body.find(qn("w:sectPr"))
 
-    for extra_bytes in docs_bytes[1:]:
+    for extra_bytes in extras_remapped:
         # Insert a page break before the next section
         p_br = OxmlElement("w:p")
         r_br = OxmlElement("w:r")
@@ -557,7 +732,13 @@ def merge_docx_sections(*docs_bytes):
 
     buf = io.BytesIO()
     base.save(buf)
-    return buf.getvalue()
+    merged_bytes = buf.getvalue()
+
+    # Inject remapped numbering definitions from each extra into the merged doc
+    for extra_bytes in extras_remapped:
+        merged_bytes = _inject_numbering(merged_bytes, extra_bytes)
+
+    return merged_bytes
 
 
 def build_substitutions(ui, tc):
