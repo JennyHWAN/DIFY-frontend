@@ -277,9 +277,14 @@ def _build_annotation_maps(docx_bytes, flags):
         if not indices:
             continue
 
-        # Single-UE: handle via inline bracket deletion, not whole-para removal
+        # Single-UE: if comment says "delete" → delete whole para when flag set;
+        # otherwise → bracket-replacement path
         if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
-            single_ue_indices |= indices
+            is_delete_cmd = "删除" in text or "delete" in text.lower()
+            if is_delete_cmd and flags.get("single_user_entity", False):
+                del_indices |= indices
+            else:
+                single_ue_indices |= indices
             continue
 
         # AI scope-exclusion paragraph
@@ -297,7 +302,20 @@ def _build_annotation_maps(docx_bytes, flags):
                 should_delete = True
         if not flags.get("has_transaction_processing", True):
             if any(_kw_in(text, kw.lower()) for kw in _TRANS_KW):
-                should_delete = True
+                # Only delete SHORT standalone paragraphs (≤200 chars after
+                # stripping whitespace). Long paragraphs containing the
+                # transaction phrase as just one embedded clause are handled
+                # by inline text substitution in build_substitutions instead.
+                body_list = list(body)
+                for idx in indices:
+                    if idx < len(body_list) and body_list[idx].tag == p_tag:
+                        para_txt = "".join(
+                            t.text or ""
+                            for t in body_list[idx].findall(f".//{{{ns_w}}}t")
+                        ).strip()
+                        if len(para_txt) <= 200:
+                            del_indices.add(idx)
+                # (do not set should_delete — individual indices already handled)
 
         if should_delete:
             del_indices |= indices
@@ -305,19 +323,123 @@ def _build_annotation_maps(docx_bytes, flags):
     return del_indices, single_ue_indices
 
 
+def _reject_format_changes(xml_str):
+    """
+    Reject tracked formatting changes by restoring the OLD formatting:
+    - w:pPrChange: replace the parent w:pPr with the OLD w:pPr inside pPrChange
+    - w:rPrChange: replace the parent w:rPr with the OLD w:rPr inside rPrChange
+
+    In EY templates, pPrChange/rPrChange record authoring edits that should
+    NOT be accepted into the final output — rejecting restores the intended
+    original formatting (e.g., list style a. instead of Wingdings bullet l,
+    non-bold run instead of bold run).
+    """
+    def _reject_one(xml_s, change_tag, parent_tag):
+        change_re = re.compile(
+            rf"<{re.escape(change_tag)}\b[^>]*>(.*?)</{re.escape(change_tag)}>",
+            re.DOTALL,
+        )
+        result = xml_s
+        for m in reversed(list(change_re.finditer(result))):
+            chg_start, chg_end = m.start(), m.end()
+
+            # Extract old parent element from inside the change block
+            old_m = re.search(
+                rf"<{re.escape(parent_tag)}\b[^>]*>.*?</{re.escape(parent_tag)}>",
+                m.group(1), re.DOTALL,
+            )
+
+            # The outer closing tag immediately follows the change block
+            rest = result[chg_end:]
+            close_m = re.match(rf"\s*</{re.escape(parent_tag)}>", rest)
+            if not close_m:
+                # Unexpected structure — just drop the change block
+                result = result[:chg_start] + result[chg_end:]
+                continue
+            outer_end = chg_end + close_m.end()
+
+            # The LAST opening parent tag before the change block
+            before = result[:chg_start]
+            opens = list(re.finditer(rf"<{re.escape(parent_tag)}\b[^>]*>", before))
+            if not opens:
+                result = result[:chg_start] + result[chg_end:]
+                continue
+            outer_start = opens[-1].start()
+
+            replacement = old_m.group(0) if old_m else ""
+            result = result[:outer_start] + replacement + result[outer_end:]
+
+        return result
+
+    xml_str = _reject_one(xml_str, "w:pPrChange", "w:pPr")
+    xml_str = _reject_one(xml_str, "w:rPrChange", "w:rPr")
+    return xml_str
+
+
+def _apply_xml_cleaning(xml_str):
+    """
+    Apply all tracked-change cleaning to a raw XML string.
+
+    Strategy (matches EY template authoring conventions):
+      - w:ins  → ACCEPT:  unwrap, keep content
+      - w:del  → REJECT:  unwrap, keep content (converts delText→t first)
+      - pPrChange / rPrChange → REJECT:  restore OLD formatting
+      - Table / section format-change markers → removed
+      - Comment markers → removed
+    """
+    xml_str = xml_str.lstrip("\ufeff")
+
+    # 1. Prepare del rejection: convert <w:delText> → <w:t>
+    xml_str = re.sub(r"<w:delText\b([^>]*)>", r"<w:t\1>", xml_str)
+    xml_str = xml_str.replace("</w:delText>", "</w:t>")
+
+    # 2. Remove self-closing tracked-change markers
+    xml_str = re.sub(r"<w:del\b[^>]*/>",  "", xml_str)
+    xml_str = re.sub(r"<w:ins\b[^>]*/>",  "", xml_str)
+
+    # 3. Accept insertions: unwrap <w:ins>…</w:ins>
+    xml_str = re.sub(
+        r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
+        xml_str, flags=re.DOTALL,
+    )
+
+    # 4. Reject deletions: unwrap <w:del>…</w:del> (content kept as <w:t>)
+    xml_str = re.sub(
+        r"<w:del\b[^>]*(?<!/)>(.*?)</w:del>", r"\1",
+        xml_str, flags=re.DOTALL,
+    )
+
+    # 5. Reject format changes: restore OLD pPr / rPr
+    xml_str = _reject_format_changes(xml_str)
+
+    # 6. Remove table / section format-change tracking elements
+    for _ftag in ("w:tblPrChange", "w:trPrChange", "w:tcPrChange", "w:sectPrChange",
+                  "w:numChange"):
+        xml_str = re.sub(
+            rf"<{_ftag}\b[^>]*>.*?</{_ftag}>", "",
+            xml_str, flags=re.DOTALL,
+        )
+
+    # 7. Remove comment range markers
+    xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
+    xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
+
+    # 8. Remove runs whose only non-rPr child is a comment reference
+    xml_str = re.sub(
+        r"<w:r\b[^>]*>(?:(?!</w:r>).)*?<w:commentReference[^>]*/>\s*</w:r>",
+        "", xml_str, flags=re.DOTALL,
+    )
+
+    return xml_str
+
+
 def _clean_docx_bytes(docx_bytes):
     """
-    Accept all tracked changes and clear all comments in a docx file.
+    Accept/reject tracked changes and clear comments in a docx file.
 
-    Operations performed on word/document.xml via regex (safe for well-formed
-    OOXML generated by Word):
-      - <w:ins>…</w:ins>  →  unwrapped  (content kept, wrapper removed)
-      - <w:del>…</w:del>  →  removed entirely
-      - <w:commentRangeStart/> and <w:commentRangeEnd/> self-closing tags → removed
-      - <w:r> runs whose only non-rPr child is <w:commentReference/>  → removed
-
-    word/comments.xml is replaced with an empty comments document so that Word
-    opens the file without any comment balloons.
+    Uses _apply_xml_cleaning() on word/document.xml and related XML parts
+    (headers, footers, footnotes, endnotes).  word/comments.xml is replaced
+    with an empty comments document so Word opens without comment balloons.
     """
     _EMPTY_COMMENTS = (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
@@ -331,52 +453,16 @@ def _clean_docx_bytes(docx_bytes):
     with zipfile.ZipFile(buf_in, "r") as zin:
         with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
             for info in zin.infolist():
-                data = zin.read(info.filename)
-                if info.filename == "word/document.xml":
-                    xml_str = data.decode("utf-8").lstrip("\ufeff")
-                    # Unwrap <w:ins>…</w:ins> (content kept, wrapper removed).
-                    # (?<!/)> ensures we only match paired open/close tags and
-                    # skip self-closing <w:ins .../> markers — those are removed
-                    # separately below after all paired tags are processed.
-                    xml_str = re.sub(
-                        r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
-                        xml_str, flags=re.DOTALL,
-                    )
-                    # Remove <w:del>…</w:del>  (skip self-closing <w:del/>)
-                    xml_str = re.sub(
-                        r"<w:del\b[^>]*(?<!/)>.*?</w:del>", "",
-                        xml_str, flags=re.DOTALL,
-                    )
-                    # Accept run-property format changes: remove <w:rPrChange>
-                    # (keeps current/accepted formatting, discards old-format record)
-                    xml_str = re.sub(
-                        r"<w:rPrChange\b[^>]*>.*?</w:rPrChange>", "",
-                        xml_str, flags=re.DOTALL,
-                    )
-                    # Accept paragraph-property format changes: remove <w:pPrChange>
-                    xml_str = re.sub(
-                        r"<w:pPrChange\b[^>]*>.*?</w:pPrChange>", "",
-                        xml_str, flags=re.DOTALL,
-                    )
-                    # Remove self-closing <w:ins .../> paragraph-/run-property
-                    # insertion markers (e.g. <w:ins w:id="17" .../>).
-                    # These are NOT content — they are residual change-tracking
-                    # annotations in pPr/rPr blocks that must be stripped.
-                    xml_str = re.sub(r"<w:ins\b[^>]*/>", "", xml_str)
-                    # Remove comment range markers
-                    xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
-                    xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
-                    # Remove runs that only anchor a comment reference.
-                    # (?:(?!</w:r>).)* prevents the match from crossing run
-                    # boundaries, avoiding catastrophic backtracking that
-                    # would otherwise delete regular text runs.
-                    xml_str = re.sub(
-                        r"<w:r\b[^>]*>(?:(?!</w:r>).)*?<w:commentReference[^>]*/>\s*</w:r>",
-                        "", xml_str, flags=re.DOTALL,
-                    )
-                    data = xml_str.encode("utf-8")
-                elif info.filename == "word/comments.xml":
+                data  = zin.read(info.filename)
+                fname = info.filename
+                if fname == "word/comments.xml":
                     data = _EMPTY_COMMENTS
+                elif (
+                    fname == "word/document.xml"
+                    or re.match(r"word/(header|footer)\d+\.xml$", fname)
+                    or fname in ("word/footnotes.xml", "word/endnotes.xml")
+                ):
+                    data = _apply_xml_cleaning(data.decode("utf-8")).encode("utf-8")
                 zout.writestr(info, data)
 
     buf_out.seek(0)
@@ -412,6 +498,17 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
 
     # ── Step 3: placeholder substitutions ──────────────────────────────────
     def _apply_subs_to_para(para):
+        if not para.runs:
+            return
+        # Phase 1: per-run substitution — preserves individual run formatting
+        # (bold, italic, etc.) when the placeholder is entirely within one run.
+        for run in para.runs:
+            for placeholder, value in subs.items():
+                if placeholder in run.text:
+                    run.text = run.text.replace(placeholder, value)
+        # Phase 2: collapse for any placeholder that still spans multiple runs.
+        # (Formatting of runs[1:] is lost in this fallback path, but only
+        # when the placeholder is genuinely split across run boundaries.)
         full_text = "".join(r.text for r in para.runs)
         if not full_text:
             return
@@ -420,7 +517,7 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             if placeholder in full_text:
                 full_text = full_text.replace(placeholder, value)
                 changed = True
-        if changed and para.runs:
+        if changed:
             para.runs[0].text = full_text
             for run in para.runs[1:]:
                 run.text = ""
@@ -535,10 +632,27 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         rFonts.set(qn("w:eastAsia"), cjk_font)
         rFonts.set(qn("w:cs"),       "Times New Roman")
 
+    def _clear_para_mark_bold(para):
+        """Also strip bold from the paragraph-mark rPr (pPr/rPr)."""
+        _pPr = para._p.find(qn("w:pPr"))
+        if _pPr is None:
+            return
+        _pRPr = _pPr.find(qn("w:rPr"))
+        if _pRPr is None:
+            return
+        for _btag in (qn("w:b"), qn("w:bCs")):
+            _bel = _pRPr.find(_btag)
+            if _bel is None:
+                _bel = OxmlElement(_btag)
+                _pRPr.append(_bel)
+            _bel.set(qn("w:val"), "0")
+
     for para in doc.paragraphs:
         kb = _para_keep_bold(para)
         for run in para.runs:
             _std_run(run, keep_bold=kb)
+        if not kb:
+            _clear_para_mark_bold(para)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -546,6 +660,8 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                     kb = _para_keep_bold(para)
                     for run in para.runs:
                         _std_run(run, keep_bold=kb)
+                    if not kb:
+                        _clear_para_mark_bold(para)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -820,6 +936,20 @@ def build_substitutions(ui, tc):
         "\u4e2d\u56fd \u4e0a\u6d77\u3010\u6216\u4e2d\u56fd \u5317\u4eac\u6216\u4e2d\u56fd \u6df1\u5733\u3011": f"\u4e2d\u56fd {signing_city}",  # 中国 上海【或中国 北京或中国 深圳】→ 中国 {city}
         "\u3010\u6216\u5b89\u6c38\u534e\u660e\u4f1a\u8ba1\u5e08\u4e8b\u52a1\u6240\uff08\u7279\u6b8a\u666e\u901a\u5408\u4f19\uff09\u3011": "",  # 【或安永华明...】→ empty (keep branch)
     }
+    # When transaction-processing wording is excluded, remove the inline
+    # transaction phrases and substitute "[or identification of the function
+    # performed by the System]" with the user-supplied system function description.
+    if not tc.get("has_transaction_processing", True):
+        sys_fn = ui.get("Systems_function", "")
+        # EN variants
+        subs["for processing user entities\u2019 transactions"] = ""   # right-quote
+        subs["for processing user entities' transactions"] = ""        # straight-quote
+        subs["for processing their transactions"] = ""
+        subs["in processing or reporting transactions"] = (
+            "in processing or reporting"
+        )
+        subs["[or identification of the function performed by the System]"] = sys_fn
+        subs["[or identification of the function performed by the system]"] = sys_fn
     return subs
 
 
@@ -1344,6 +1474,12 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                     value=True,
                     key="cr_transaction",
                 )
+                if not has_transaction_processing:
+                    st.caption(
+                        "⚠️ When unchecked, the 'Systems Function' field below "
+                        "(Required Fields section) is used to describe the system's "
+                        "function in place of transaction-processing wording."
+                    )
                 single_user_entity = st.checkbox(
                     "Single user entity report",
                     value=False,
@@ -1559,6 +1695,11 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                 errors.append("Report Signing Date is required when generating a complete report.")
             if not signing_city:
                 errors.append("Signing City is required when generating a complete report.")
+            if not has_transaction_processing and not systems_function:
+                errors.append(
+                    "Systems Function is required when 'Includes transaction processing wording' "
+                    "is unchecked — please fill in the Systems Function field."
+                )
 
         if errors:
             for e in errors:
