@@ -469,6 +469,41 @@ def _clean_docx_bytes(docx_bytes):
     return buf_out.read()
 
 
+def _smart_replace_in_para(para, old, new):
+    """Replace one occurrence of *old* with *new* in the paragraph, modifying
+    only the minimal run span that contains the match.  Per-run formatting
+    (italic, bold, size, etc.) on runs outside that span is fully preserved.
+    Returns True if a replacement was made, False otherwise."""
+    if not old or not para.runs:
+        return False
+    texts = [r.text for r in para.runs]
+    full  = "".join(texts)
+    if old not in full:
+        return False
+    pos     = full.index(old)
+    end_pos = pos + len(old)
+    # Cumulative start offset of each run within full
+    cum = 0
+    starts = []
+    for t in texts:
+        starts.append(cum)
+        cum += len(t)
+    # First run whose text overlaps the match
+    fi = next((i for i in range(len(texts)) if starts[i] + len(texts[i]) > pos), None)
+    if fi is None:
+        return False
+    # Last run whose text overlaps the match
+    li = next((i for i in range(len(texts) - 1, -1, -1) if starts[i] < end_pos), None)
+    if li is None:
+        return False
+    prefix = texts[fi][: pos - starts[fi]]
+    suffix = texts[li][end_pos - starts[li] :]
+    para.runs[fi].text = prefix + new + suffix
+    for k in range(fi + 1, li + 1):
+        para.runs[k].text = ""
+    return True
+
+
 def fill_and_process_template(template_path, subs, flags, language="English"):
     """
     Process an EY MA/AR docx template:
@@ -506,21 +541,21 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             for placeholder, value in subs.items():
                 if placeholder in run.text:
                     run.text = run.text.replace(placeholder, value)
-        # Phase 2: collapse for any placeholder that still spans multiple runs.
-        # (Formatting of runs[1:] is lost in this fallback path, but only
-        # when the placeholder is genuinely split across run boundaries.)
-        full_text = "".join(r.text for r in para.runs)
-        if not full_text:
-            return
-        changed = False
+        # Phase 2: smart span replacement for cross-run placeholders.
+        # _smart_replace_in_para modifies only the minimal run span that
+        # contains the match, preserving formatting of all other runs.
         for placeholder, value in subs.items():
-            if placeholder in full_text:
-                full_text = full_text.replace(placeholder, value)
-                changed = True
-        if changed:
-            para.runs[0].text = full_text
-            for run in para.runs[1:]:
-                run.text = ""
+            _smart_replace_in_para(para, placeholder, value)
+        # Phase 3: normalize consecutive spaces that may arise from empty
+        # substitutions, both within a run and across run boundaries.
+        prev_ended_space = False
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r"  +", " ", run.text)
+                if prev_ended_space and run.text.startswith(" "):
+                    run.text = run.text.lstrip(" ")
+                prev_ended_space = run.text.endswith(" ")
+            # empty run: prev_ended_space unchanged (gap is invisible)
 
     for para in doc.paragraphs:
         _apply_subs_to_para(para)
@@ -537,30 +572,54 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     _single_ue_flag = flags.get("single_user_entity", False)
 
     def _apply_brackets(para, is_single_ue):
-        full_text = "".join(r.text for r in para.runs)
-        if not full_text or "[" not in full_text:
-            return
-        original = full_text
+        # Process one bracket match per loop iteration using smart replacement so
+        # that per-run italic/bold formatting outside the matched span is preserved.
+        changed = True
+        while changed:
+            changed = False
+            full_text = "".join(r.text for r in para.runs)
+            if not full_text or "[" not in full_text:
+                break
 
-        # a) single-user-entity paragraphs
-        if is_single_ue:
-            if _single_ue_flag:
-                # delete the bracketed content entirely
-                full_text = re.sub(r"\[[^\]]*\]", "", full_text)
-            else:
-                # strip the brackets, keep the content
-                full_text = re.sub(r"\[([^\]]*)\]", r"\1", full_text)
+            # a) [or …] alternative phrases — always remove (with any leading space)
+            m = re.search(r" ?\[or [^\]]+\]", full_text, flags=re.IGNORECASE)
+            if m:
+                _smart_replace_in_para(para, m.group(0), "")
+                changed = True
+                continue
 
-        # b) [or …] alternative phrases — always remove
-        full_text = re.sub(r"\s*\[or [^\]]+\]", "", full_text, flags=re.IGNORECASE)
+            # b) single-user-entity annotated paragraphs
+            if is_single_ue:
+                if _single_ue_flag:
+                    # delete bracketed content entirely
+                    m = re.search(r"\[[^\]]*\]", full_text)
+                    if m:
+                        _smart_replace_in_para(para, m.group(0), "")
+                        changed = True
+                        continue
+                else:
+                    # strip brackets, keep content
+                    m = re.search(r"\[([^\]]*)\]", full_text)
+                    if m:
+                        _smart_replace_in_para(para, m.group(0), m.group(1))
+                        changed = True
+                        continue
 
-        # c) strip any remaining brackets, keep content
-        full_text = re.sub(r"\[([^\]]*)\]", r"\1", full_text)
+            # c) any remaining [..] — strip brackets, keep content
+            m = re.search(r"\[([^\]]*)\]", full_text)
+            if m:
+                _smart_replace_in_para(para, m.group(0), m.group(1))
+                changed = True
+                continue
 
-        if full_text != original and para.runs:
-            para.runs[0].text = full_text
-            for run in para.runs[1:]:
-                run.text = ""
+        # Normalize spaces introduced by empty removals
+        prev_ended_space = False
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r"  +", " ", run.text)
+                if prev_ended_space and run.text.startswith(" "):
+                    run.text = run.text.lstrip(" ")
+                prev_ended_space = run.text.endswith(" ")
 
     # Body-level paragraphs (doc.paragraphs = direct children of <w:body>)
     for para in doc.paragraphs:
@@ -595,12 +654,22 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     _DATE_RE = re.compile(
         r"^(?:[A-Z][a-z]+ \d{1,2}, \d{4}|\d{4}年\d{1,2}月\d{1,2}日)$"
     )
+    # Company name used to detect the MA signature line (a short standalone para)
+    _company_name_bold = subs.get("[Service organization name]", "")
 
     def _para_keep_bold(para):
         full = "".join(r.text for r in para.runs).strip()
-        if any(pat in full for pat in _BOLD_KEEP_PATTERNS):
+        # Apply pattern matching only to short paragraphs (section titles,
+        # signature-block lines). Without this guard the 10 000-char "We have
+        # examined…" AR paragraph — which contains "Management Assertion" in
+        # running body text — would be incorrectly made bold in its entirety.
+        if len(full) <= 120 and any(pat in full for pat in _BOLD_KEEP_PATTERNS):
             return True
         if _DATE_RE.match(full):
+            return True
+        # MA signature line: standalone paragraph whose text is exactly the
+        # service-organization name (e.g. "ABC Fintech Co., Ltd.")
+        if _company_name_bold and full == _company_name_bold:
             return True
         # Short city / country line in the AR signature block
         # e.g. "Shanghai, China" or "中国 上海" (≤50 chars to avoid body text)
@@ -665,7 +734,30 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
 
     buf = io.BytesIO()
     doc.save(buf)
-    return buf.getvalue()
+    saved_bytes = buf.getvalue()
+
+    # python-docx may silently drop <w:lvlOverride>/<w:startOverride> elements
+    # when serialising the NumberingPart, which breaks lowerLetter list counters
+    # (e.g. "a." / "b." become "l" / "l").  Re-inject the original numbering.xml
+    # from the template to guarantee the counter-restart overrides are preserved.
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as _z_orig:
+            if "word/numbering.xml" in _z_orig.namelist():
+                _orig_num = _z_orig.read("word/numbering.xml")
+                _buf_in  = io.BytesIO(saved_bytes)
+                _buf_out = io.BytesIO()
+                with zipfile.ZipFile(_buf_in, "r") as _z_in:
+                    with zipfile.ZipFile(_buf_out, "w", zipfile.ZIP_DEFLATED) as _z_out:
+                        for _info in _z_in.infolist():
+                            _data = _z_in.read(_info.filename)
+                            if _info.filename == "word/numbering.xml":
+                                _data = _orig_num
+                            _z_out.writestr(_info, _data)
+                _buf_out.seek(0)
+                return _buf_out.read()
+    except Exception:
+        pass
+    return saved_bytes
 
 
 def _remap_extra_numbering(base_bytes, extra_bytes):
@@ -941,15 +1033,27 @@ def build_substitutions(ui, tc):
     # performed by the System]" with the user-supplied system function description.
     if not tc.get("has_transaction_processing", True):
         sys_fn = ui.get("Systems_function", "")
-        # EN variants
+        # EN variants — remove transaction-processing phrases
         subs["for processing user entities\u2019 transactions"] = ""   # right-quote
         subs["for processing user entities' transactions"] = ""        # straight-quote
         subs["for processing their transactions"] = ""
-        subs["in processing or reporting transactions"] = (
-            "in processing or reporting"
-        )
+        # "in processing or reporting transactions" → "in" so that the following
+        # [or identification...] substitution produces "in <system function>"
+        # rather than "in processing or reporting <system function>" (issue 8)
+        subs["in processing or reporting transactions"] = "in"
         subs["[or identification of the function performed by the System]"] = sys_fn
         subs["[or identification of the function performed by the system]"] = sys_fn
+        # Remove the "auditors" clause from the "intended solely for…" paragraph.
+        # That clause only applies when the system processes user-entity transactions.
+        # Both right-quote (U+2019) and straight-apostrophe variants are covered.
+        subs[
+            ", and their auditors who audit and report on such user entities\u2019 "
+            "financial statements or internal control over financial reporting"
+        ] = ""
+        subs[
+            ", and their auditors who audit and report on such user entities' "
+            "financial statements or internal control over financial reporting"
+        ] = ""
     return subs
 
 
@@ -1545,6 +1649,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                         _t_period_s  = st.text_input("Period Start (YYYY-MM-DD)", key="test_period_s", placeholder="e.g. 2024-01-01")
                         _t_period_e  = st.text_input("Period End   (YYYY-MM-DD)", key="test_period_e", placeholder="e.g. 2024-12-31")
                         _t_sso_name  = st.text_input("SSO Name (if any)",    key="test_sso_name",  placeholder="leave blank if none")
+                        _t_sys_fn    = st.text_input("System Function (if no transaction processing)", key="test_sys_fn", placeholder="e.g. providing cloud-based payment infrastructure")
                     if st.button("Generate test MA + AR sections", key="test_template_btn"):
                         _test_ui = {
                             "Company_name":          _t_company or "Test Organization",
@@ -1556,6 +1661,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "Report_type":           _cur_rt,
                             "Output_language":       _cur_lang,
                             "Subservice_org":        _t_sso_name or "None",
+                            "Systems_function":      _t_sys_fn or "",
                         }
                         _test_tc = {
                             "report_date":                report_date  or "January 1, 2025",
