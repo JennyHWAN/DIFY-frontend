@@ -640,10 +640,10 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         _pRPr = _pPr.find(qn("w:rPr"))
         if _pRPr is None:
             return
-        for _btag in (qn("w:b"), qn("w:bCs")):
-            _bel = _pRPr.find(_btag)
+        for _bname in ("w:b", "w:bCs"):
+            _bel = _pRPr.find(qn(_bname))
             if _bel is None:
-                _bel = OxmlElement(_btag)
+                _bel = OxmlElement(_bname)
                 _pRPr.append(_bel)
             _bel.set(qn("w:val"), "0")
 
