@@ -542,10 +542,12 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                 if placeholder in run.text:
                     run.text = run.text.replace(placeholder, value)
         # Phase 2: smart span replacement for cross-run placeholders.
-        # _smart_replace_in_para modifies only the minimal run span that
-        # contains the match, preserving formatting of all other runs.
+        # Loop each placeholder until no occurrences remain — a single paragraph
+        # may contain the same placeholder more than once (e.g. [Service
+        # organization short name] appears multiple times in the MA description).
         for placeholder, value in subs.items():
-            _smart_replace_in_para(para, placeholder, value)
+            while _smart_replace_in_para(para, placeholder, value):
+                pass
         # Phase 3: normalize consecutive spaces that may arise from empty
         # substitutions, both within a run and across run boundaries.
         prev_ended_space = False
@@ -700,6 +702,10 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         rFonts.set(qn("w:hAnsi"),    "Times New Roman")
         rFonts.set(qn("w:eastAsia"), cjk_font)
         rFonts.set(qn("w:cs"),       "Times New Roman")
+        # Strip explicit underline (used in templates as authoring aids)
+        u_el = rPr.find(qn("w:u"))
+        if u_el is not None:
+            rPr.remove(u_el)
 
     def _clear_para_mark_bold(para):
         """Also strip bold from the paragraph-mark rPr (pPr/rPr)."""
