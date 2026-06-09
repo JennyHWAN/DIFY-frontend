@@ -382,16 +382,18 @@ def _apply_xml_cleaning(xml_str):
 
     Strategy (matches EY template authoring conventions):
       - w:ins  → ACCEPT:  unwrap, keep content
-      - w:del  → REJECT:  unwrap, keep content (converts delText→t first)
+      - w:del  → ACCEPT:  remove deleted content entirely
       - pPrChange / rPrChange → REJECT:  restore OLD formatting
       - Table / section format-change markers → removed
       - Comment markers → removed
     """
     xml_str = xml_str.lstrip("\ufeff")
 
-    # 1. Prepare del rejection: convert <w:delText> → <w:t>
-    xml_str = re.sub(r"<w:delText\b([^>]*)>", r"<w:t\1>", xml_str)
-    xml_str = xml_str.replace("</w:delText>", "</w:t>")
+    # 1. Accept deletions: remove <w:del>…</w:del> blocks entirely
+    xml_str = re.sub(
+        r"<w:del\b[^>]*>.*?</w:del>", "",
+        xml_str, flags=re.DOTALL,
+    )
 
     # 2. Remove self-closing tracked-change markers
     xml_str = re.sub(r"<w:del\b[^>]*/>",  "", xml_str)
@@ -400,12 +402,6 @@ def _apply_xml_cleaning(xml_str):
     # 3. Accept insertions: unwrap <w:ins>…</w:ins>
     xml_str = re.sub(
         r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
-        xml_str, flags=re.DOTALL,
-    )
-
-    # 4. Reject deletions: unwrap <w:del>…</w:del> (content kept as <w:t>)
-    xml_str = re.sub(
-        r"<w:del\b[^>]*(?<!/)>(.*?)</w:del>", r"\1",
         xml_str, flags=re.DOTALL,
     )
 
@@ -702,10 +698,12 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         rFonts.set(qn("w:hAnsi"),    "Times New Roman")
         rFonts.set(qn("w:eastAsia"), cjk_font)
         rFonts.set(qn("w:cs"),       "Times New Roman")
-        # Strip explicit underline (used in templates as authoring aids)
+        # Explicitly disable underline (overrides any inherited style underline)
         u_el = rPr.find(qn("w:u"))
-        if u_el is not None:
-            rPr.remove(u_el)
+        if u_el is None:
+            u_el = OxmlElement("w:u")
+            rPr.append(u_el)
+        u_el.set(qn("w:val"), "none")
 
     def _clear_para_mark_bold(para):
         """Also strip bold from the paragraph-mark rPr (pPr/rPr)."""
@@ -737,6 +735,26 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                         _std_run(run, keep_bold=kb)
                     if not kb:
                         _clear_para_mark_bold(para)
+
+    # ── Step 7: strip spaces before punctuation ────────────────────────
+    _PUNCT = '.,;:!?，。；：！？'
+
+    def _strip_spaces_before_punct(para):
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r' +([' + re.escape(_PUNCT) + r'])', r'\1', run.text)
+        active = [r for r in para.runs if r.text]
+        for i in range(len(active) - 1):
+            if active[i].text.endswith(' ') and active[i + 1].text[0] in _PUNCT:
+                active[i].text = active[i].text.rstrip(' ')
+
+    for para in doc.paragraphs:
+        _strip_spaces_before_punct(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _strip_spaces_before_punct(para)
 
     buf = io.BytesIO()
     doc.save(buf)
