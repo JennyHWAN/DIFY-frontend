@@ -935,10 +935,16 @@ def merge_docx_sections(*docs_bytes):
     """
     base_bytes = docs_bytes[0]
 
-    # Remap numbering in each extra so its IDs don't clash with the base
-    extras_remapped = [
-        _remap_extra_numbering(base_bytes, eb) for eb in docs_bytes[1:]
-    ]
+    # Remap numbering in each extra so its IDs don't clash with the base.
+    # Use a rolling base: after remapping each extra, inject its definitions
+    # into the running base so the next extra gets offsets that account for
+    # all previously added abstractNum/num blocks, preventing duplicate IDs.
+    extras_remapped = []
+    running_base = base_bytes
+    for eb in docs_bytes[1:]:
+        remapped = _remap_extra_numbering(running_base, eb)
+        extras_remapped.append(remapped)
+        running_base = _inject_numbering(running_base, remapped)
 
     # Merge document bodies with python-docx
     base = Document(io.BytesIO(base_bytes))
