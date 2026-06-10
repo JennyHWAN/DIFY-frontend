@@ -389,9 +389,13 @@ def _apply_xml_cleaning(xml_str):
     """
     xml_str = xml_str.lstrip("\ufeff")
 
-    # 1. Accept deletions: remove <w:del>…</w:del> blocks entirely
+    # 1. Accept deletions: remove <w:del>…</w:del> blocks entirely.
+    # (?<!/) ensures self-closing <w:del/> markers are NOT matched here
+    # (they are handled by step 2); without this guard the regex consumes
+    # from <w:del/> all the way to the next unrelated </w:del>, deleting
+    # large valid content spans.
     xml_str = re.sub(
-        r"<w:del\b[^>]*>.*?</w:del>", "",
+        r"<w:del\b[^>]*(?<!/)>.*?</w:del>", "",
         xml_str, flags=re.DOTALL,
     )
 
