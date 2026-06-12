@@ -194,6 +194,25 @@ def _format_date(s, language="English"):
     return s
 
 
+def _capitalize_name(s):
+    """Normalise a name typed in ALL lowercase or ALL UPPERCASE to
+    word-initial capitals ('acme tech co., ltd.' / 'ACME TECH CO., LTD.'
+    → 'Acme Tech Co., Ltd.'). Mixed-case input is kept exactly as typed,
+    and names containing CJK characters are never changed."""
+    if not s:
+        return s
+    letters = [c for c in s if c.isalpha()]
+    if not letters or not all(c.isascii() for c in letters):
+        return s
+    if all(c.islower() for c in letters) or all(c.isupper() for c in letters):
+        return re.sub(
+            r"[A-Za-z][A-Za-z'’]*",
+            lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
+            s,
+        )
+    return s
+
+
 def _kw_in(comment_text, keyword):
     """Check if keyword appears in comment_text, ignoring all internal whitespace.
     Stripping spaces handles XML-inserted spaces between CJK characters."""
@@ -1103,7 +1122,10 @@ def merge_docx_sections(*docs_bytes):
 def enforce_line_spacing(docx_bytes, spacing=1.15):
     """
     Final pass over the finished document: set every paragraph (body and
-    table cells, including nested tables) to the given multiple line spacing.
+    table cells, including nested tables) to the given multiple line spacing,
+    and normalise every run to Times New Roman Latin/complex-script fonts and
+    black text. The CJK (eastAsia) font is left untouched so the per-language
+    choice made earlier (华文楷体 / 黑体) survives.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -1120,6 +1142,24 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
                     _walk(cell.paragraphs, cell.tables)
 
     _walk(doc.paragraphs, doc.tables)
+
+    # Iterate raw <w:r> elements so runs inside hyperlinks, text boxes and
+    # nested tables — which para.runs does not expose — are covered too.
+    # get_or_add_* keeps rPr children in schema order (avoids Word repair).
+    for r_el in doc.element.body.iter(qn("w:r")):
+        rPr = r_el.get_or_add_rPr()
+        rFonts = rPr.get_or_add_rFonts()
+        rFonts.set(qn("w:ascii"), "Times New Roman")
+        rFonts.set(qn("w:hAnsi"), "Times New Roman")
+        rFonts.set(qn("w:cs"),    "Times New Roman")
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+            if rFonts.get(qn(theme_attr)) is not None:
+                del rFonts.attrib[qn(theme_attr)]
+        color = rPr.get_or_add_color()
+        color.set(qn("w:val"), "000000")
+        for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
+            if color.get(qn(theme_attr)) is not None:
+                del color.attrib[qn(theme_attr)]
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1150,6 +1190,11 @@ def build_substitutions(ui, tc):
     company_name  = ui.get("Company_name", "")
     co_short_name = ui.get("Co_short_name", "")
     system_name   = ui.get("System_or_service_name", "")
+    # EN reports: fix names typed in all-lowercase / ALL-CAPS (mixed case kept)
+    if language != "中文":
+        company_name  = _capitalize_name(company_name)
+        co_short_name = _capitalize_name(co_short_name)
+        system_name   = _capitalize_name(system_name)
     report_type   = ui.get("Report_type", "")
     subservice_org = ui.get("Subservice_org", "")
     signing_city  = tc.get("signing_city", "")
@@ -2136,6 +2181,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             except Exception as e:
                 st.error(f"File upload error: {e}")
                 st.stop()
+
+        # EN reports: fix names typed in all-lowercase / ALL-CAPS so the Dify
+        # sections use the same normalised names as the MA/AR templates.
+        if output_language != "中文":
+            company_name  = _capitalize_name(company_name)
+            co_short_name = _capitalize_name(co_short_name)
+            system_name   = _capitalize_name(system_name)
 
         # Store user inputs for later steps
         st.session_state["user_inputs"] = {
