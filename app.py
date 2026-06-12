@@ -208,6 +208,23 @@ _OTHER_KW    = ["other information"]  # ALWAYS keep — never delete
 _AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
 
 
+def _comment_span_text(para_el, cid, ns_w, id_attr):
+    """Return the run text covered by comment *cid* inside one paragraph
+    element, i.e. the text between its commentRangeStart/End markers.
+    Deleted text (w:delText) is naturally excluded and inserted text
+    (w:t inside w:ins) included, matching accept-tracked-changes cleaning."""
+    inside = False
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeStart" and el.get(id_attr) == cid:
+            inside = True
+        elif el.tag == f"{{{ns_w}}}commentRangeEnd" and el.get(id_attr) == cid:
+            inside = False
+        elif inside and el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
 def _build_annotation_maps(docx_bytes, flags):
     """
     Parse the docx XML (from raw bytes) to determine per-paragraph actions.
@@ -216,6 +233,10 @@ def _build_annotation_maps(docx_bytes, flags):
         del_indices     — set of body-child indices to remove entirely
         single_ue_indices — set of body-child indices where [..] bracket
                             content is conditionally deleted (single user entity)
+        span_del_texts  — list of (body-child index, text) pairs: the exact
+                          commented sentence span to remove from inside a
+                          paragraph that otherwise stays (single-UE comments
+                          anchored to one sentence of a longer paragraph)
     """
     ns_w    = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
     p_tag   = f"{{{ns_w}}}p"
@@ -227,9 +248,9 @@ def _build_annotation_maps(docx_bytes, flags):
             if "word/comments.xml" in z.namelist():
                 comments_xml = z.read("word/comments.xml").decode("utf-8")
             else:
-                return set(), set()
+                return set(), set(), []
     except Exception:
-        return set(), set()
+        return set(), set(), []
 
     if doc_xml.startswith("\ufeff"):
         doc_xml = doc_xml[1:]
@@ -240,7 +261,7 @@ def _build_annotation_maps(docx_bytes, flags):
     try:
         root_c = ET.fromstring(comments_xml)
     except ET.ParseError:
-        return set(), set()
+        return set(), set(), []
     comment_texts = {}
     for comment in root_c.findall(f"{{{ns_w}}}comment"):
         cid = comment.get(id_attr)
@@ -251,10 +272,10 @@ def _build_annotation_maps(docx_bytes, flags):
     try:
         root_d = ET.fromstring(doc_xml)
     except ET.ParseError:
-        return set(), set()
+        return set(), set(), []
     body = root_d.find(f"{{{ns_w}}}body")
     if body is None:
-        return set(), set()
+        return set(), set(), []
 
     comment_to_indices = {}
     for i, child in enumerate(body):
@@ -267,6 +288,9 @@ def _build_annotation_maps(docx_bytes, flags):
 
     del_indices      = set()
     single_ue_indices = set()
+    span_del_texts   = []
+
+    body_list = list(body)
 
     for cid, text in comment_texts.items():
         # "Other Information" paragraphs are ALWAYS kept
@@ -277,12 +301,29 @@ def _build_annotation_maps(docx_bytes, flags):
         if not indices:
             continue
 
-        # Single-UE: if comment says "delete" → delete whole para when flag set;
-        # otherwise → bracket-replacement path
+        # Single-UE: if comment says "delete" → when the flag is set, delete
+        # only the commented sentence span if the comment covers part of a
+        # longer paragraph, or the whole paragraph when it covers all of it
+        # (or explicitly says 本段). Otherwise → bracket-replacement path.
         if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
             is_delete_cmd = "删除" in text or "delete" in text.lower()
             if is_delete_cmd and flags.get("single_user_entity", False):
-                del_indices |= indices
+                for idx in indices:
+                    child = body_list[idx]
+                    span = _comment_span_text(child, cid, ns_w, id_attr)
+                    span_n = _normalize_ws(span)
+                    para_n = _normalize_ws("".join(
+                        t.text or "" for t in child.findall(f".//{{{ns_w}}}t")
+                    ))
+                    # Partial-paragraph sentence deletion only when the span is
+                    # a substantial fragment (≥30 chars guards against ranges
+                    # degenerately anchored to a single word like "The"/"描述")
+                    # and the comment does not explicitly target the paragraph.
+                    if (span_n and span_n != para_n and len(span_n) >= 30
+                            and not _kw_in(text, "本段")):
+                        span_del_texts.append((idx, span))
+                    else:
+                        del_indices.add(idx)
             else:
                 single_ue_indices |= indices
             continue
@@ -306,7 +347,6 @@ def _build_annotation_maps(docx_bytes, flags):
                 # stripping whitespace). Long paragraphs containing the
                 # transaction phrase as just one embedded clause are handled
                 # by inline text substitution in build_substitutions instead.
-                body_list = list(body)
                 for idx in indices:
                     if idx < len(body_list) and body_list[idx].tag == p_tag:
                         para_txt = "".join(
@@ -320,7 +360,7 @@ def _build_annotation_maps(docx_bytes, flags):
         if should_delete:
             del_indices |= indices
 
-    return del_indices, single_ue_indices
+    return del_indices, single_ue_indices, span_del_texts
 
 
 def _reject_format_changes(xml_str):
@@ -525,11 +565,34 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     # ── Step 1: annotation maps from the original (comments still present) ──
     with open(template_path, "rb") as fh:
         raw_bytes = fh.read()
-    del_indices, single_ue_indices = _build_annotation_maps(raw_bytes, flags)
+    del_indices, single_ue_indices, span_del_texts = _build_annotation_maps(
+        raw_bytes, flags
+    )
 
     # ── Step 2: accept track changes + clear comments ──────────────────────
     cleaned_bytes = _clean_docx_bytes(raw_bytes)
     doc = Document(io.BytesIO(cleaned_bytes))
+
+    # ── Step 2b: delete single-UE commented sentence spans ─────────────────
+    # Runs BEFORE placeholder substitution because the extracted span text is
+    # the raw template wording, which may still contain placeholders.
+    if span_del_texts:
+        _body_kids = list(doc.element.body)
+        _para_by_el = {p._element: p for p in doc.paragraphs}
+        for _idx, _span in span_del_texts:
+            if _idx >= len(_body_kids):
+                continue
+            _para = _para_by_el.get(_body_kids[_idx])
+            if _para is None:
+                continue
+            if not _smart_replace_in_para(_para, _span, ""):
+                _smart_replace_in_para(_para, _span.strip(), "")
+            # Drop any leading whitespace left when the deleted sentence was
+            # at the start of the paragraph.
+            for _r in _para.runs:
+                if _r.text:
+                    _r.text = _r.text.lstrip()
+                    break
 
     # ── Step 3: placeholder substitutions ──────────────────────────────────
     def _apply_subs_to_para(para):
