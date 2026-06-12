@@ -179,17 +179,37 @@ _MONTHS = [
 
 
 def _format_date(s, language="English"):
-    """Convert YYYY-MM-DD to 'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
-    Strings that do not match YYYY-MM-DD are returned unchanged."""
+    """Convert YYYY-MM-DD (also YYYY/M/D, YYYY.M.D, 1-digit month/day) to
+    'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
+    Strings that do not match a recognised date pattern are returned unchanged."""
     if not s:
         return s
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s.strip())
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$", s.strip())
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1 <= mo <= 12:
+        if 1 <= mo <= 12 and 1 <= d <= 31:
             if language == "中文":
                 return f"{y}年{mo}月{d}日"
             return f"{_MONTHS[mo - 1]} {d}, {y}"
+    return s
+
+
+def _capitalize_name(s):
+    """Normalise a name typed in ALL lowercase or ALL UPPERCASE to
+    word-initial capitals ('acme tech co., ltd.' / 'ACME TECH CO., LTD.'
+    → 'Acme Tech Co., Ltd.'). Mixed-case input is kept exactly as typed,
+    and names containing CJK characters are never changed."""
+    if not s:
+        return s
+    letters = [c for c in s if c.isalpha()]
+    if not letters or not all(c.isascii() for c in letters):
+        return s
+    if all(c.islower() for c in letters) or all(c.isupper() for c in letters):
+        return re.sub(
+            r"[A-Za-z][A-Za-z'’]*",
+            lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
+            s,
+        )
     return s
 
 
@@ -603,6 +623,15 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     def _apply_subs_to_para(para):
         if not para.runs:
             return
+        # Phase 0: compound date-range placeholders contain the single 【日期】/
+        # [date] placeholder — consume them first with cross-run replacement,
+        # otherwise phase 1 could fill one half with the single date when the
+        # range spans multiple runs.
+        for placeholder in ("[date] to [date]", "【日期】至【日期】"):
+            value = subs.get(placeholder)
+            if value is not None:
+                while _smart_replace_in_para(para, placeholder, value):
+                    pass
         # Phase 1: per-run substitution — preserves individual run formatting
         # (bold, italic, etc.) when the placeholder is entirely within one run.
         for run in para.runs:
@@ -648,11 +677,17 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         while changed:
             changed = False
             full_text = "".join(r.text for r in para.runs)
-            if not full_text or "[" not in full_text:
+            if not full_text or ("[" not in full_text and "【" not in full_text):
                 break
 
-            # a) [or …] alternative phrases — always remove (with any leading space)
+            # a) [or …] / 【或…】 alternative phrases — always remove
+            #    (with any leading space for the EN variant)
             m = re.search(r" ?\[or [^\]]+\]", full_text, flags=re.IGNORECASE)
+            if m:
+                _smart_replace_in_para(para, m.group(0), "")
+                changed = True
+                continue
+            m = re.search(r"【或[^】]*】", full_text)
             if m:
                 _smart_replace_in_para(para, m.group(0), "")
                 changed = True
@@ -662,23 +697,23 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             if is_single_ue:
                 if _single_ue_flag:
                     # delete bracketed content entirely
-                    m = re.search(r"\[[^\]]*\]", full_text)
+                    m = re.search(r"\[[^\]]*\]|【[^】]*】", full_text)
                     if m:
                         _smart_replace_in_para(para, m.group(0), "")
                         changed = True
                         continue
                 else:
                     # strip brackets, keep content
-                    m = re.search(r"\[([^\]]*)\]", full_text)
+                    m = re.search(r"\[([^\]]*)\]|【([^】]*)】", full_text)
                     if m:
-                        _smart_replace_in_para(para, m.group(0), m.group(1))
+                        _smart_replace_in_para(para, m.group(0), m.group(1) or m.group(2) or "")
                         changed = True
                         continue
 
-            # c) any remaining [..] — strip brackets, keep content
-            m = re.search(r"\[([^\]]*)\]", full_text)
+            # c) any remaining [..] / 【..】 — strip brackets, keep content
+            m = re.search(r"\[([^\]]*)\]|【([^】]*)】", full_text)
             if m:
-                _smart_replace_in_para(para, m.group(0), m.group(1))
+                _smart_replace_in_para(para, m.group(0), m.group(1) or m.group(2) or "")
                 changed = True
                 continue
 
@@ -738,6 +773,9 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         "Management Assertion",          # MA section title (after co-name sub)
         "Ernst & Young",                 # AR signature block (firm name)
         "Hua Ming",                      # AR signature block (firm name variant)
+        "管理层认定",                     # CN MA section title (after co-name sub)
+        "独立服务审计师",                 # CN AR title (…报告 / …鉴证报告)
+        "安永华明",                       # CN AR signature block (firm name)
     ]
     # Date paragraph in MA: formatted date string is the entire paragraph text
     _DATE_RE = re.compile(
@@ -1084,7 +1122,10 @@ def merge_docx_sections(*docs_bytes):
 def enforce_line_spacing(docx_bytes, spacing=1.15):
     """
     Final pass over the finished document: set every paragraph (body and
-    table cells, including nested tables) to the given multiple line spacing.
+    table cells, including nested tables) to the given multiple line spacing,
+    and normalise every run to Times New Roman Latin/complex-script fonts and
+    black text. The CJK (eastAsia) font is left untouched so the per-language
+    choice made earlier (华文楷体 / 黑体) survives.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -1101,6 +1142,62 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
                     _walk(cell.paragraphs, cell.tables)
 
     _walk(doc.paragraphs, doc.tables)
+
+    # Iterate raw <w:r> elements so runs inside hyperlinks, text boxes and
+    # nested tables — which para.runs does not expose — are covered too.
+    # get_or_add_* keeps rPr children in schema order (avoids Word repair).
+    for r_el in doc.element.body.iter(qn("w:r")):
+        rPr = r_el.get_or_add_rPr()
+        rFonts = rPr.get_or_add_rFonts()
+        rFonts.set(qn("w:ascii"), "Times New Roman")
+        rFonts.set(qn("w:hAnsi"), "Times New Roman")
+        rFonts.set(qn("w:cs"),    "Times New Roman")
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+            if rFonts.get(qn(theme_attr)) is not None:
+                del rFonts.attrib[qn(theme_attr)]
+        color = rPr.get_or_add_color()
+        color.set(qn("w:val"), "000000")
+        for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
+            if color.get(qn(theme_attr)) is not None:
+                del color.attrib[qn(theme_attr)]
+
+    # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
+    # rendered when the numbering level itself names no font — e.g. the CN AR
+    # "a." items showed in 黑体 because the mark carried eastAsia=黑体 and no
+    # ascii font. Force Times New Roman Latin + black there as well; the
+    # eastAsia font is again left untouched.
+    _mark_tail_tags = (qn("w:sectPr"), qn("w:pPrChange"))
+    for pPr in doc.element.body.iter(qn("w:pPr")):
+        rPr = pPr.find(qn("w:rPr"))
+        if rPr is None:
+            rPr = OxmlElement("w:rPr")
+            tail = next((ch for ch in pPr if ch.tag in _mark_tail_tags), None)
+            if tail is not None:
+                tail.addprevious(rPr)
+            else:
+                pPr.append(rPr)
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rStyle = rPr.find(qn("w:rStyle"))
+            if rStyle is not None:
+                rStyle.addnext(rFonts)
+            else:
+                rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"), "Times New Roman")
+        rFonts.set(qn("w:hAnsi"), "Times New Roman")
+        rFonts.set(qn("w:cs"),    "Times New Roman")
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+            if rFonts.get(qn(theme_attr)) is not None:
+                del rFonts.attrib[qn(theme_attr)]
+        color = rPr.find(qn("w:color"))
+        if color is None:
+            color = OxmlElement("w:color")
+            rFonts.addnext(color)
+        color.set(qn("w:val"), "000000")
+        for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
+            if color.get(qn(theme_attr)) is not None:
+                del color.attrib[qn(theme_attr)]
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1131,6 +1228,11 @@ def build_substitutions(ui, tc):
     company_name  = ui.get("Company_name", "")
     co_short_name = ui.get("Co_short_name", "")
     system_name   = ui.get("System_or_service_name", "")
+    # EN reports: fix names typed in all-lowercase / ALL-CAPS (mixed case kept)
+    if language != "中文":
+        company_name  = _capitalize_name(company_name)
+        co_short_name = _capitalize_name(co_short_name)
+        system_name   = _capitalize_name(system_name)
     report_type   = ui.get("Report_type", "")
     subservice_org = ui.get("Subservice_org", "")
     signing_city  = tc.get("signing_city", "")
@@ -1148,6 +1250,11 @@ def build_substitutions(ui, tc):
 
     period_str = (
         f"{period_start} to {period_end}"
+        if period_start and period_end
+        else period_start or period_end
+    )
+    period_str_cn = (
+        f"{period_start}至{period_end}"
         if period_start and period_end
         else period_start or period_end
     )
@@ -1210,6 +1317,9 @@ def build_substitutions(ui, tc):
         "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
         "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
         "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        # CN period range — must come BEFORE the single 【日期】 sub below
+        # (templates write Type II periods as 自【日期】至【日期】止).
+        "【日期】至【日期】": period_str_cn,
         "\u3010\u65e5\u671f\u3011": single_date,   # 【日期】
         "\u3010\u62a5\u544a\u65e5\u3011": report_date,  # 【报告日】
         # City CN: replace the default+alternatives pattern
@@ -1278,6 +1388,9 @@ def build_substitutions(ui, tc):
         subs["in processing or reporting transactions"] = "in"
         subs["[or identification of the function performed by the System]"] = sys_fn
         subs["[or identification of the function performed by the system]"] = sys_fn
+        # CN counterpart — without this sub the generic 【或…】 removal would
+        # delete the alternative instead of filling in the system function.
+        subs["【或确定体系执行的功能】"] = sys_fn
         # Remove the "auditors" clause from the "intended solely for…" paragraph.
         # That clause only applies when the system processes user-entity transactions.
         # Both right-quote (U+2019) and straight-apostrophe variants are covered.
@@ -1792,7 +1905,14 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             with cr1:
                 _std_options = get_standard_options(_cur_rt)
                 standard = st.selectbox("Standard", _std_options, key="cr_standard")
-                report_date  = st.text_input("Report Signing Date", placeholder="e.g. January 30, 2026", key="cr_report_date")
+                report_date  = st.text_input(
+                    "Report Signing Date (YYYY-MM-DD)",
+                    placeholder="e.g. 2026-01-30",
+                    key="cr_report_date",
+                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
+                         "\"2026年1月30日\" in Chinese reports. "
+                         "Other text is inserted into the report as-is.",
+                )
                 signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
 
             with cr2:
@@ -1913,7 +2033,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
                         }
                         _test_tc = {
-                            "report_date":                report_date  or "January 1, 2025",
+                            "report_date":                report_date  or "2025-01-01",
                             "signing_city":               signing_city or "Shanghai",
                             "cuec_identified":            cuec_choice == "Identified",
                             "sso_cc_identified":          sso_cc_choice == "Identified",
@@ -2099,6 +2219,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             except Exception as e:
                 st.error(f"File upload error: {e}")
                 st.stop()
+
+        # EN reports: fix names typed in all-lowercase / ALL-CAPS so the Dify
+        # sections use the same normalised names as the MA/AR templates.
+        if output_language != "中文":
+            company_name  = _capitalize_name(company_name)
+            co_short_name = _capitalize_name(co_short_name)
+            system_name   = _capitalize_name(system_name)
 
         # Store user inputs for later steps
         st.session_state["user_inputs"] = {
