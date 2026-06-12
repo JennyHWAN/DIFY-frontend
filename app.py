@@ -51,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -1990,79 +1990,6 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
             _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
 
-            # ── Test mode: generate MA+AR without running the Dify workflow ──────
-            _ar_ok = _ar_path and os.path.isfile(_ar_path)
-            _ma_ok = _ma_path and os.path.isfile(_ma_path)
-            if _ar_ok and _ma_ok:
-                st.markdown("---")
-                st.caption(
-                    "Use the button below to test Section I + II template generation "
-                    "without running the full Dify workflow. "
-                    "Fill in the company fields below first, then click the button."
-                )
-                with st.expander("Test Template Generation (no Dify needed)", expanded=False):
-                    t1, t2 = st.columns(2)
-                    with t1:
-                        _t_company   = st.text_input("Company Name",       key="test_company",   placeholder="e.g. ABC Fintech Co., Ltd.")
-                        _t_short     = st.text_input("Short Name",          key="test_short",     placeholder="e.g. ABC")
-                        _t_system    = st.text_input("System Name",         key="test_system",    placeholder="e.g. Payment Processing System")
-                        _t_svc_desc  = st.text_input("Service Description", key="test_svc_desc",  placeholder="e.g. payment processing services")
-                    with t2:
-                        _t_period_s  = st.text_input("Period Start (YYYY-MM-DD)", key="test_period_s", placeholder="e.g. 2024-01-01")
-                        _t_period_e  = st.text_input("Period End   (YYYY-MM-DD)", key="test_period_e", placeholder="e.g. 2024-12-31")
-                        _t_sso_name  = st.text_input("SSO Name (if any)",    key="test_sso_name",  placeholder="leave blank if none")
-                        _t_sys_fn    = st.text_input("System Function (if no transaction processing)", key="test_sys_fn", placeholder="e.g. providing cloud-based payment infrastructure")
-                    if st.button("Generate test MA + AR sections", key="test_template_btn"):
-                        _test_ui = {
-                            "Company_name":          _t_company or "Test Organization",
-                            "Co_short_name":         _t_short   or "TestOrg",
-                            "System_or_service_name": _t_system or "Test System",
-                            "Service_description":   _t_svc_desc or "test services",
-                            "Period_start":          _t_period_s or "2024-01-01",
-                            "Period_end":            _t_period_e or "2024-12-31",
-                            "Report_type":           _cur_rt,
-                            "Output_language":       _cur_lang,
-                            "Subservice_org":        _t_sso_name or "None",
-                            "Systems_function":      _t_sys_fn or "",
-                            # TSC checkboxes live lower in the form; read their
-                            # persisted widget state from the previous rerun.
-                            "is_Security":             st.session_state.get("form_tsc_security", False),
-                            "is_Availability":         st.session_state.get("form_tsc_availability", False),
-                            "is_Processing_Integrity": st.session_state.get("form_tsc_processing", False),
-                            "is_Confidentiality":      st.session_state.get("form_tsc_confidentiality", False),
-                            "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
-                        }
-                        _test_tc = {
-                            "report_date":                report_date  or "2025-01-01",
-                            "signing_city":               signing_city or "Shanghai",
-                            "cuec_identified":            cuec_choice == "Identified",
-                            "sso_cc_identified":          sso_cc_choice == "Identified",
-                            "has_transaction_processing": has_transaction_processing,
-                            "single_user_entity":         single_user_entity,
-                            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
-                            "has_other_information":      has_other_information,
-                            "addressee_choice":           addressee_choice,
-                        }
-                        try:
-                            with st.spinner("Generating test MA + AR sections…"):
-                                _t_subs  = build_substitutions(_test_ui, _test_tc)
-                                _t_flags = build_flags(_test_tc)
-                                _t_ma    = fill_and_process_template(_ma_path, _t_subs, _t_flags, _cur_lang)
-                                _t_ar    = fill_and_process_template(_ar_path, _t_subs, _t_flags, _cur_lang)
-                                _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
-                            _t_fname = (
-                                f"{(_t_short or 'Test')}_{_cur_rt.replace(' ','_')}"
-                                f"_MA_AR_test.docx"
-                            )
-                            st.download_button(
-                                label="⬇ Download test MA + AR (.docx)",
-                                data=_t_merged,
-                                file_name=_t_fname,
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            )
-                        except Exception as _exc:
-                            st.error(f"Test generation failed: {_exc}")
-
     else:
         standard                  = ""
         report_date               = ""
@@ -2152,6 +2079,77 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     st.markdown("---")
     run_main = st.button("▶ Run Step 1 — MAIN Workflow", type="primary", use_container_width=True)
+
+    # ── MA + AR only: fill the templates from the fields above, no Dify run ────
+    if generate_complete:
+        run_ma_ar_only = st.button(
+            "🧪 Generate MA + AR only (templates, no Dify)",
+            use_container_width=True,
+            help="Fills the Section I + II templates using the fields above without "
+                 "running the Dify workflow. Blank fields fall back to placeholder "
+                 "test values.",
+        )
+        if run_ma_ar_only:
+            _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+            if not (_ar_path_t and os.path.isfile(_ar_path_t)):
+                st.error(f"AR template not available: {_ar_path_t or 'no matching template found'}")
+            elif not (_ma_path_t and os.path.isfile(_ma_path_t)):
+                st.error(f"MA template not available: {_ma_path_t or 'no matching template found'}")
+            else:
+                _test_ui = {
+                    "Company_name":           company_name        or "Test Organization",
+                    "Co_short_name":          co_short_name       or "TestOrg",
+                    "System_or_service_name": system_name         or "Test System",
+                    "Service_description":    service_description or "test services",
+                    "Period_start":           period_start        or "2024-01-01",
+                    "Period_end":             period_end          or "2024-12-31",
+                    "Report_type":            report_type,
+                    "Output_language":        output_language,
+                    "Subservice_org":         subservice_org      or "None",
+                    "Systems_function":       systems_function    or "",
+                    "is_Security":             is_security,
+                    "is_Availability":         is_availability,
+                    "is_Processing_Integrity": is_processing_integrity,
+                    "is_Confidentiality":      is_confidentiality,
+                    "is_Privacy":              is_privacy,
+                }
+                _test_tc = {
+                    "report_date":                report_date  or "2025-01-01",
+                    "signing_city":               signing_city or "Shanghai",
+                    "cuec_identified":            cuec_choice == "Identified",
+                    "sso_cc_identified":          sso_cc_choice == "Identified",
+                    "has_transaction_processing": has_transaction_processing,
+                    "single_user_entity":         single_user_entity,
+                    "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                    "has_other_information":      has_other_information,
+                    "addressee_choice":           addressee_choice,
+                }
+                try:
+                    with st.spinner("Generating MA + AR sections…"):
+                        _t_subs  = build_substitutions(_test_ui, _test_tc)
+                        _t_flags = build_flags(_test_tc)
+                        _t_ma    = fill_and_process_template(_ma_path_t, _t_subs, _t_flags, output_language)
+                        _t_ar    = fill_and_process_template(_ar_path_t, _t_subs, _t_flags, output_language)
+                        _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
+                    st.session_state["ma_ar_only"] = {
+                        "bytes": _t_merged,
+                        "filename": (
+                            f"{(co_short_name or 'Test')}_{report_type.replace(' ', '_')}"
+                            f"_MA_AR.docx"
+                        ),
+                    }
+                except Exception as _exc:
+                    st.session_state.pop("ma_ar_only", None)
+                    st.error(f"MA + AR generation failed: {_exc}")
+
+        if st.session_state.get("ma_ar_only"):
+            st.download_button(
+                label="⬇ Download MA + AR (.docx)",
+                data=st.session_state["ma_ar_only"]["bytes"],
+                file_name=st.session_state["ma_ar_only"]["filename"],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
     if run_main:
         errors = []
