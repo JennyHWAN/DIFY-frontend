@@ -195,22 +195,34 @@ def _format_date(s, language="English"):
 
 
 def _capitalize_name(s):
-    """Normalise a name typed in ALL lowercase or ALL UPPERCASE to
-    word-initial capitals ('acme tech co., ltd.' / 'ACME TECH CO., LTD.'
-    → 'Acme Tech Co., Ltd.'). Mixed-case input is kept exactly as typed,
-    and names containing CJK characters are never changed."""
+    """Normalise a typed name to word-initial capitals.
+
+    - ALL UPPERCASE input is title-cased ('ACME TECH CO., LTD.'
+      → 'Acme Tech Co., Ltd.').
+    - Otherwise each word starting with a lowercase letter is capitalised,
+      keeping the rest of the word as typed ('fgde information Technology'
+      → 'Fgde Information Technology'). Words with internal capitals
+      ('iPhone') and words already capitalised are left unchanged.
+    - Names containing CJK characters are never changed."""
     if not s:
         return s
     letters = [c for c in s if c.isalpha()]
     if not letters or not all(c.isascii() for c in letters):
         return s
-    if all(c.islower() for c in letters) or all(c.isupper() for c in letters):
+    if all(c.isupper() for c in letters):
         return re.sub(
             r"[A-Za-z][A-Za-z'’]*",
             lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
             s,
         )
-    return s
+
+    def _fix_word(m):
+        w = m.group(0)
+        if w[0].islower() and not any(c.isupper() for c in w[1:]):
+            return w[0].upper() + w[1:]
+        return w
+
+    return re.sub(r"[A-Za-z][A-Za-z'’]*", _fix_word, s)
 
 
 def _kw_in(comment_text, keyword):
@@ -1160,6 +1172,24 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # EY template styles define Normal as BOLD; the Dify-generated sections
+        # merged into the template document inherit it and render whole-bold.
+        # Pin bold/underline OFF wherever the run does not set them itself, so
+        # explicit bold (titles, **bold** markdown, table headers) and explicit
+        # underline (H3 headings) are preserved.
+        b_el = rPr.find(qn("w:b"))
+        if b_el is None:
+            b_el = OxmlElement("w:b")
+            b_el.set(qn("w:val"), "0")
+            rFonts.addnext(b_el)
+        if rPr.find(qn("w:bCs")) is None:
+            bcs_el = OxmlElement("w:bCs")
+            bcs_el.set(qn("w:val"), "0")
+            b_el.addnext(bcs_el)
+        if rPr.find(qn("w:u")) is None:
+            u_el = OxmlElement("w:u")
+            u_el.set(qn("w:val"), "none")
+            rPr.append(u_el)
 
     # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
     # rendered when the numbering level itself names no font — e.g. the CN AR
@@ -1198,6 +1228,17 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # Keep list number glyphs non-bold unless the mark sets bold itself
+        # (the bold Normal style would otherwise bleed into them).
+        mb_el = rPr.find(qn("w:b"))
+        if mb_el is None:
+            mb_el = OxmlElement("w:b")
+            mb_el.set(qn("w:val"), "0")
+            rFonts.addnext(mb_el)
+        if rPr.find(qn("w:bCs")) is None:
+            mbcs_el = OxmlElement("w:bCs")
+            mbcs_el.set(qn("w:val"), "0")
+            mb_el.addnext(mbcs_el)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1235,7 +1276,8 @@ def build_substitutions(ui, tc):
         system_name   = _capitalize_name(system_name)
     report_type   = ui.get("Report_type", "")
     subservice_org = ui.get("Subservice_org", "")
-    signing_city  = tc.get("signing_city", "")
+    # City typed in lowercase ('shanghai') → 'Shanghai'; CJK ('上海') untouched
+    signing_city  = _capitalize_name(tc.get("signing_city", ""))
 
     # Format raw YYYY-MM-DD dates to "Month D, YYYY" / "YYYY年M月D日"
     period_start = _format_date(ui.get("Period_start", ""), language)
