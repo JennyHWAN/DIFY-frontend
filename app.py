@@ -905,8 +905,6 @@ def _inject_numbering(merged_bytes, extra_bytes):
     if not abs_blocks and not num_blocks:
         return merged_bytes
 
-    inject = "\n".join(abs_blocks) + "\n" + "\n".join(num_blocks)
-
     buf_in  = io.BytesIO(merged_bytes)
     buf_out = io.BytesIO()
     with zipfile.ZipFile(buf_in, "r") as zin:
@@ -915,7 +913,20 @@ def _inject_numbering(merged_bytes, extra_bytes):
                 data = zin.read(info.filename)
                 if info.filename == "word/numbering.xml":
                     num_xml = data.decode("utf-8")
-                    num_xml = num_xml.replace("</w:numbering>", inject + "\n</w:numbering>")
+                    # CT_Numbering requires all <w:abstractNum> elements to
+                    # precede all <w:num> elements; appending both at the end
+                    # interleaves them and Word flags the part as corrupt
+                    # (its "repair" then scrambles the list definitions).
+                    abs_inject = "\n".join(abs_blocks)
+                    if abs_inject:
+                        m = re.search(r"<w:num\b", num_xml)
+                        pos = m.start() if m else num_xml.rfind("</w:numbering>")
+                        num_xml = num_xml[:pos] + abs_inject + "\n" + num_xml[pos:]
+                    num_inject = "\n".join(num_blocks)
+                    if num_inject:
+                        m = re.search(r"<w:numIdMacAtCleanup\b", num_xml)
+                        pos = m.start() if m else num_xml.rfind("</w:numbering>")
+                        num_xml = num_xml[:pos] + num_inject + "\n" + num_xml[pos:]
                     data = num_xml.encode("utf-8")
                 zout.writestr(info, data)
     buf_out.seek(0)
