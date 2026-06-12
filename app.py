@@ -4,14 +4,32 @@ import os
 import io
 import re
 import json
+import zipfile
+import xml.etree.ElementTree as ET
+from copy import deepcopy
 from docx import Document
 from docx.shared import Pt, RGBColor, Cm
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from dotenv import load_dotenv
+import openpyxl
 
 load_dotenv()
+
+import sys as _sys
+
+if getattr(_sys, "frozen", False):
+    # Running as a PyInstaller exe — templates sit next to the .exe
+    _TEMPLATE_BASE = os.path.dirname(_sys.executable)
+else:
+    # Development — templates are in the same folder as app.py (DIFY-frontend/)
+    _TEMPLATE_BASE = os.path.dirname(os.path.abspath(__file__))
+
+TEMPLATE_INDEX  = os.path.join(_TEMPLATE_BASE, "template_index.xlsx")
+AR_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
+MA_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
+EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
 
 API_BASE_URL  = os.getenv("DIFY_API_BASE_URL", "https://api.dify.ai/v1")
 API_KEY_MAIN  = os.getenv("DIFY_API_KEY_MAIN", "")
@@ -33,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -58,6 +76,1234 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+# ── Template helpers ───────────────────────────────────────────────────────────
+
+def get_standard_options(report_type):
+    """Return the list of applicable attestation standards for a given report type."""
+    if report_type.startswith("SOC1"):
+        return ["SSAE 18", "ISAE 3402", "SSAE 18 & ISAE 3402 Combined"]
+    else:
+        return ["SSAE 18", "ISAE 3000", "SSAE 18 & ISAE 3000 Combined"]
+
+
+def resolve_template(report_type, standard, sso, language, sheet):
+    """
+    Look up template_index.xlsx for a matching row and return (wp_no, filepath|None).
+    On error returns (None, error_message_string) so callers can surface the problem.
+    sheet must be 'AR' or 'MA'.
+    """
+    # Map UI values → spreadsheet values
+    if report_type.startswith("SOC1"):
+        category = "SOC 1"
+    else:
+        category = "SOC 2"
+
+    if "TYPE1" in report_type:
+        typ = "Type I"
+    else:
+        typ = "Type II"
+
+    if "Combined" in standard:
+        std_mapped = "Combined"
+    else:
+        std_mapped = standard  # "SSAE 18", "ISAE 3402", "ISAE 3000"
+
+    sso_map = {"None": "none", "All carve out": "all carve out", "Inclusive": "Inclusive"}
+    sso_mapped = sso_map.get(sso, "none")
+
+    lang_map = {"English": "EN", "中文": "CN"}
+    lang_mapped = lang_map.get(language, "EN")
+
+    template_dir = AR_TEMPLATE_DIR if sheet == "AR" else MA_TEMPLATE_DIR
+
+    try:
+        # Do NOT use read_only=True — it can silently fail to iterate rows in
+        # some environments.
+        wb = openpyxl.load_workbook(TEMPLATE_INDEX, data_only=True)
+        ws = wb[sheet]
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+    except Exception as e:
+        return (None, f"Cannot load template index: {e}")
+
+    if not rows:
+        return (None, "Template index sheet is empty")
+
+    header = list(rows[0])
+    try:
+        col_cat  = header.index("Category")
+        col_type = header.index("Type")
+        col_std  = header.index("Standards")
+        col_sso  = header.index("Sub-service Organization (SSO)")
+        col_lang = header.index("Language")
+        col_wp   = next(
+            i for i, h in enumerate(header)
+            if h and str(h).strip().upper().startswith("WP")
+        )
+    except (ValueError, StopIteration) as e:
+        return (None, f"Template index column not found: {e}")
+
+    for row in rows[1:]:
+        if (str(row[col_cat]  or "").strip() == category  and
+                str(row[col_type] or "").strip() == typ       and
+                str(row[col_std]  or "").strip() == std_mapped and
+                str(row[col_sso]  or "").strip() == sso_mapped and
+                str(row[col_lang] or "").strip() == lang_mapped):
+            wp_val = row[col_wp]
+            if wp_val is None:
+                # This combination has no template — keep iterating in case
+                # another row matches (shouldn't happen, but safe).
+                continue
+            wp_no = str(wp_val).strip()
+            try:
+                for fname in sorted(os.listdir(template_dir)):
+                    if fname.endswith(".docx") and fname.startswith(wp_no + " "):
+                        return (wp_no, os.path.join(template_dir, fname))
+            except OSError as e:
+                return (wp_no, f"Cannot list template directory: {e}")
+            return (wp_no, None)
+
+    return (None, None)
+
+
+def _normalize_ws(s):
+    """Collapse all whitespace sequences to a single space and strip."""
+    return " ".join(s.split())
+
+
+_MONTHS = [
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+]
+
+
+def _format_date(s, language="English"):
+    """Convert YYYY-MM-DD to 'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
+    Strings that do not match YYYY-MM-DD are returned unchanged."""
+    if not s:
+        return s
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s.strip())
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1 <= mo <= 12:
+            if language == "中文":
+                return f"{y}年{mo}月{d}日"
+            return f"{_MONTHS[mo - 1]} {d}, {y}"
+    return s
+
+
+def _kw_in(comment_text, keyword):
+    """Check if keyword appears in comment_text, ignoring all internal whitespace.
+    Stripping spaces handles XML-inserted spaces between CJK characters."""
+    return keyword.replace(" ", "") in comment_text.replace(" ", "")
+
+
+# Comment keyword sets for deletion logic
+_CUEC_KW     = ["无用户补充", "未识别用户补充", "user entity补充", "无用户实体补充"]
+_SSO_CC_KW   = ["子服务机构补偿", "子服务机构补充"]
+_TRANS_KW    = ["处理transaction", "processing user entity transaction"]
+_SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
+_OTHER_KW    = ["other information"]  # kept unless user says no Other Information section
+_AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
+
+
+def _comment_span_text(para_el, cid, ns_w, id_attr):
+    """Return the run text covered by comment *cid* inside one paragraph
+    element, i.e. the text between its commentRangeStart/End markers.
+    Deleted text (w:delText) is naturally excluded and inserted text
+    (w:t inside w:ins) included, matching accept-tracked-changes cleaning."""
+    inside = False
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeStart" and el.get(id_attr) == cid:
+            inside = True
+        elif el.tag == f"{{{ns_w}}}commentRangeEnd" and el.get(id_attr) == cid:
+            inside = False
+        elif inside and el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def _build_annotation_maps(docx_bytes, flags):
+    """
+    Parse the docx XML (from raw bytes) to determine per-paragraph actions.
+
+    Returns:
+        del_indices     — set of body-child indices to remove entirely
+        single_ue_indices — set of body-child indices where [..] bracket
+                            content is conditionally deleted (single user entity)
+        span_del_texts  — list of (body-child index, text) pairs: the exact
+                          commented sentence span to remove from inside a
+                          paragraph that otherwise stays (single-UE comments
+                          anchored to one sentence of a longer paragraph)
+    """
+    ns_w    = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    p_tag   = f"{{{ns_w}}}p"
+    id_attr = f"{{{ns_w}}}id"
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as z:
+            doc_xml = z.read("word/document.xml").decode("utf-8")
+            if "word/comments.xml" in z.namelist():
+                comments_xml = z.read("word/comments.xml").decode("utf-8")
+            else:
+                return set(), set(), []
+    except Exception:
+        return set(), set(), []
+
+    if doc_xml.startswith("\ufeff"):
+        doc_xml = doc_xml[1:]
+    if comments_xml.startswith("\ufeff"):
+        comments_xml = comments_xml[1:]
+
+    # Build comment id → normalised lower-case text map
+    try:
+        root_c = ET.fromstring(comments_xml)
+    except ET.ParseError:
+        return set(), set(), []
+    comment_texts = {}
+    for comment in root_c.findall(f"{{{ns_w}}}comment"):
+        cid = comment.get(id_attr)
+        texts = [t.text or "" for t in comment.findall(f".//{{{ns_w}}}t")]
+        comment_texts[cid] = _normalize_ws(" ".join(texts)).lower()
+
+    # Build comment id → set of body-child indices (paragraphs only)
+    try:
+        root_d = ET.fromstring(doc_xml)
+    except ET.ParseError:
+        return set(), set(), []
+    body = root_d.find(f"{{{ns_w}}}body")
+    if body is None:
+        return set(), set(), []
+
+    comment_to_indices = {}
+    for i, child in enumerate(body):
+        if child.tag != p_tag:
+            continue
+        for crs in child.findall(f".//{{{ns_w}}}commentRangeStart"):
+            cid = crs.get(id_attr)
+            if cid:
+                comment_to_indices.setdefault(cid, set()).add(i)
+
+    del_indices      = set()
+    single_ue_indices = set()
+    span_del_texts   = []
+
+    body_list = list(body)
+
+    for cid, text in comment_texts.items():
+        # "Other Information" paragraphs (注：若无Other Information这一章节，则删除…):
+        # kept by default; deleted only when the user indicated the report has
+        # no Other Information section and the comment is a delete instruction.
+        if any(_kw_in(text, kw.lower()) for kw in _OTHER_KW):
+            if (not flags.get("has_other_information", True)
+                    and ("删除" in text or "delete" in text.lower())):
+                del_indices |= comment_to_indices.get(cid, set())
+            continue
+
+        indices = comment_to_indices.get(cid, set())
+        if not indices:
+            continue
+
+        # Single-UE: if comment says "delete" → when the flag is set, delete
+        # only the commented sentence span if the comment covers part of a
+        # longer paragraph, or the whole paragraph when it covers all of it
+        # (or explicitly says 本段). Otherwise → bracket-replacement path.
+        if any(_kw_in(text, kw.lower()) for kw in _SINGLE_KW):
+            is_delete_cmd = "删除" in text or "delete" in text.lower()
+            if is_delete_cmd and flags.get("single_user_entity", False):
+                for idx in indices:
+                    child = body_list[idx]
+                    span = _comment_span_text(child, cid, ns_w, id_attr)
+                    span_n = _normalize_ws(span)
+                    para_n = _normalize_ws("".join(
+                        t.text or "" for t in child.findall(f".//{{{ns_w}}}t")
+                    ))
+                    # Partial-paragraph sentence deletion only when the span is
+                    # a substantial fragment (≥30 chars guards against ranges
+                    # degenerately anchored to a single word like "The"/"描述")
+                    # and the comment does not explicitly target the paragraph.
+                    if (span_n and span_n != para_n and len(span_n) >= 30
+                            and not _kw_in(text, "本段")):
+                        span_del_texts.append((idx, span))
+                    else:
+                        del_indices.add(idx)
+            else:
+                single_ue_indices |= indices
+            continue
+
+        # AI scope-exclusion paragraph
+        if any(_kw_in(text, kw.lower()) for kw in _AI_KW):
+            if not flags.get("has_ai_scope_exclusion", False):
+                del_indices |= indices
+            continue
+
+        should_delete = False
+        if not flags.get("cuec_identified", True):
+            if any(_kw_in(text, kw.lower()) for kw in _CUEC_KW):
+                should_delete = True
+        if not flags.get("sso_cc_identified", True):
+            if any(_kw_in(text, kw.lower()) for kw in _SSO_CC_KW):
+                should_delete = True
+        if not flags.get("has_transaction_processing", True):
+            if any(_kw_in(text, kw.lower()) for kw in _TRANS_KW):
+                # Only delete SHORT standalone paragraphs (≤200 chars after
+                # stripping whitespace). Long paragraphs containing the
+                # transaction phrase as just one embedded clause are handled
+                # by inline text substitution in build_substitutions instead.
+                for idx in indices:
+                    if idx < len(body_list) and body_list[idx].tag == p_tag:
+                        para_txt = "".join(
+                            t.text or ""
+                            for t in body_list[idx].findall(f".//{{{ns_w}}}t")
+                        ).strip()
+                        if len(para_txt) <= 200:
+                            del_indices.add(idx)
+                # (do not set should_delete — individual indices already handled)
+
+        if should_delete:
+            del_indices |= indices
+
+    return del_indices, single_ue_indices, span_del_texts
+
+
+def _reject_format_changes(xml_str):
+    """
+    Reject tracked formatting changes by restoring the OLD formatting:
+    - w:pPrChange: replace the parent w:pPr with the OLD w:pPr inside pPrChange
+    - w:rPrChange: replace the parent w:rPr with the OLD w:rPr inside rPrChange
+
+    In EY templates, pPrChange/rPrChange record authoring edits that should
+    NOT be accepted into the final output — rejecting restores the intended
+    original formatting (e.g., list style a. instead of Wingdings bullet l,
+    non-bold run instead of bold run).
+    """
+    def _reject_one(xml_s, change_tag, parent_tag):
+        change_re = re.compile(
+            rf"<{re.escape(change_tag)}\b[^>]*>(.*?)</{re.escape(change_tag)}>",
+            re.DOTALL,
+        )
+        result = xml_s
+        for m in reversed(list(change_re.finditer(result))):
+            chg_start, chg_end = m.start(), m.end()
+
+            # Extract old parent element from inside the change block
+            old_m = re.search(
+                rf"<{re.escape(parent_tag)}\b[^>]*>.*?</{re.escape(parent_tag)}>",
+                m.group(1), re.DOTALL,
+            )
+
+            # The outer closing tag immediately follows the change block
+            rest = result[chg_end:]
+            close_m = re.match(rf"\s*</{re.escape(parent_tag)}>", rest)
+            if not close_m:
+                # Unexpected structure — just drop the change block
+                result = result[:chg_start] + result[chg_end:]
+                continue
+            outer_end = chg_end + close_m.end()
+
+            # The LAST opening parent tag before the change block
+            before = result[:chg_start]
+            opens = list(re.finditer(rf"<{re.escape(parent_tag)}\b[^>]*>", before))
+            if not opens:
+                result = result[:chg_start] + result[chg_end:]
+                continue
+            outer_start = opens[-1].start()
+
+            replacement = old_m.group(0) if old_m else ""
+            result = result[:outer_start] + replacement + result[outer_end:]
+
+        return result
+
+    xml_str = _reject_one(xml_str, "w:pPrChange", "w:pPr")
+    xml_str = _reject_one(xml_str, "w:rPrChange", "w:rPr")
+    return xml_str
+
+
+def _apply_xml_cleaning(xml_str):
+    """
+    Apply all tracked-change cleaning to a raw XML string.
+
+    Strategy (matches EY template authoring conventions):
+      - w:ins  → ACCEPT:  unwrap, keep content
+      - w:del  → ACCEPT:  remove deleted content entirely
+      - pPrChange / rPrChange → REJECT:  restore OLD formatting
+      - Table / section format-change markers → removed
+      - Comment markers → removed
+    """
+    xml_str = xml_str.lstrip("\ufeff")
+
+    # 1. Accept deletions: remove <w:del>…</w:del> blocks entirely.
+    # (?<!/) ensures self-closing <w:del/> markers are NOT matched here
+    # (they are handled by step 2); without this guard the regex consumes
+    # from <w:del/> all the way to the next unrelated </w:del>, deleting
+    # large valid content spans.
+    xml_str = re.sub(
+        r"<w:del\b[^>]*(?<!/)>.*?</w:del>", "",
+        xml_str, flags=re.DOTALL,
+    )
+
+    # 2. Remove self-closing tracked-change markers
+    xml_str = re.sub(r"<w:del\b[^>]*/>",  "", xml_str)
+    xml_str = re.sub(r"<w:ins\b[^>]*/>",  "", xml_str)
+
+    # 3. Accept insertions: unwrap <w:ins>…</w:ins>
+    xml_str = re.sub(
+        r"<w:ins\b[^>]*(?<!/)>(.*?)</w:ins>", r"\1",
+        xml_str, flags=re.DOTALL,
+    )
+
+    # 5. Reject format changes: restore OLD pPr / rPr
+    xml_str = _reject_format_changes(xml_str)
+
+    # 6. Remove table / section format-change tracking elements
+    for _ftag in ("w:tblPrChange", "w:trPrChange", "w:tcPrChange", "w:sectPrChange",
+                  "w:numChange"):
+        xml_str = re.sub(
+            rf"<{_ftag}\b[^>]*>.*?</{_ftag}>", "",
+            xml_str, flags=re.DOTALL,
+        )
+
+    # 7. Remove comment range markers
+    xml_str = re.sub(r"<w:commentRangeStart[^>]*/>", "", xml_str)
+    xml_str = re.sub(r"<w:commentRangeEnd[^>]*/>",   "", xml_str)
+
+    # 8. Remove runs whose only non-rPr child is a comment reference
+    xml_str = re.sub(
+        r"<w:r\b[^>]*>(?:(?!</w:r>).)*?<w:commentReference[^>]*/>\s*</w:r>",
+        "", xml_str, flags=re.DOTALL,
+    )
+
+    return xml_str
+
+
+def _clean_docx_bytes(docx_bytes):
+    """
+    Accept/reject tracked changes and clear comments in a docx file.
+
+    Uses _apply_xml_cleaning() on word/document.xml and related XML parts
+    (headers, footers, footnotes, endnotes).  word/comments.xml is replaced
+    with an empty comments document so Word opens without comment balloons.
+    """
+    _EMPTY_COMMENTS = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:comments xmlns:w="http://schemas.openxmlformats.org/'
+        'wordprocessingml/2006/main"></w:comments>'
+    ).encode("utf-8")
+
+    buf_in  = io.BytesIO(docx_bytes)
+    buf_out = io.BytesIO()
+
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data  = zin.read(info.filename)
+                fname = info.filename
+                if fname == "word/comments.xml":
+                    data = _EMPTY_COMMENTS
+                elif (
+                    fname == "word/document.xml"
+                    or re.match(r"word/(header|footer)\d+\.xml$", fname)
+                    or fname in ("word/footnotes.xml", "word/endnotes.xml")
+                ):
+                    data = _apply_xml_cleaning(data.decode("utf-8")).encode("utf-8")
+                zout.writestr(info, data)
+
+    buf_out.seek(0)
+    return buf_out.read()
+
+
+def _smart_replace_in_para(para, old, new):
+    """Replace one occurrence of *old* with *new* in the paragraph, modifying
+    only the minimal run span that contains the match.  Per-run formatting
+    (italic, bold, size, etc.) on runs outside that span is fully preserved.
+    Returns True if a replacement was made, False otherwise."""
+    if not old or not para.runs:
+        return False
+    texts = [r.text for r in para.runs]
+    full  = "".join(texts)
+    if old not in full:
+        return False
+    pos     = full.index(old)
+    end_pos = pos + len(old)
+    # Cumulative start offset of each run within full
+    cum = 0
+    starts = []
+    for t in texts:
+        starts.append(cum)
+        cum += len(t)
+    # First run whose text overlaps the match
+    fi = next((i for i in range(len(texts)) if starts[i] + len(texts[i]) > pos), None)
+    if fi is None:
+        return False
+    # Last run whose text overlaps the match
+    li = next((i for i in range(len(texts) - 1, -1, -1) if starts[i] < end_pos), None)
+    if li is None:
+        return False
+    prefix = texts[fi][: pos - starts[fi]]
+    suffix = texts[li][end_pos - starts[li] :]
+    para.runs[fi].text = prefix + new + suffix
+    for k in range(fi + 1, li + 1):
+        para.runs[k].text = ""
+    return True
+
+
+def fill_and_process_template(template_path, subs, flags, language="English"):
+    """
+    Process an EY MA/AR docx template:
+      1. Compute comment-based annotation maps from the original file.
+      2. Accept tracked changes and clear comments (regex on raw XML).
+      3. Apply placeholder substitutions.
+      4. Handle inline square brackets:
+           - single-user-entity annotated paras: delete [..] when flag set,
+             otherwise strip the brackets and keep the content.
+           - [or ..] alternative phrases: always removed.
+           - remaining [..] brackets: brackets stripped, content kept.
+      5. Delete wholly-conditional paragraphs (CUEC / SSO CC / transaction /
+         AI-scope when not applicable).
+      6. Standardise fonts: Times New Roman (EN) or 华文楷体 (CN), 11 pt,
+         bold removed, italic preserved.
+
+    Returns the modified document as bytes.
+    """
+    # ── Step 1: annotation maps from the original (comments still present) ──
+    with open(template_path, "rb") as fh:
+        raw_bytes = fh.read()
+    del_indices, single_ue_indices, span_del_texts = _build_annotation_maps(
+        raw_bytes, flags
+    )
+
+    # ── Step 2: accept track changes + clear comments ──────────────────────
+    cleaned_bytes = _clean_docx_bytes(raw_bytes)
+    doc = Document(io.BytesIO(cleaned_bytes))
+
+    # ── Step 2b: delete single-UE commented sentence spans ─────────────────
+    # Runs BEFORE placeholder substitution because the extracted span text is
+    # the raw template wording, which may still contain placeholders.
+    if span_del_texts:
+        _body_kids = list(doc.element.body)
+        _para_by_el = {p._element: p for p in doc.paragraphs}
+        for _idx, _span in span_del_texts:
+            if _idx >= len(_body_kids):
+                continue
+            _para = _para_by_el.get(_body_kids[_idx])
+            if _para is None:
+                continue
+            if not _smart_replace_in_para(_para, _span, ""):
+                _smart_replace_in_para(_para, _span.strip(), "")
+            # Drop any leading whitespace left when the deleted sentence was
+            # at the start of the paragraph.
+            for _r in _para.runs:
+                if _r.text:
+                    _r.text = _r.text.lstrip()
+                    break
+
+    # ── Step 3: placeholder substitutions ──────────────────────────────────
+    def _apply_subs_to_para(para):
+        if not para.runs:
+            return
+        # Phase 1: per-run substitution — preserves individual run formatting
+        # (bold, italic, etc.) when the placeholder is entirely within one run.
+        for run in para.runs:
+            for placeholder, value in subs.items():
+                if placeholder in run.text:
+                    run.text = run.text.replace(placeholder, value)
+        # Phase 2: smart span replacement for cross-run placeholders.
+        # Loop each placeholder until no occurrences remain — a single paragraph
+        # may contain the same placeholder more than once (e.g. [Service
+        # organization short name] appears multiple times in the MA description).
+        for placeholder, value in subs.items():
+            while _smart_replace_in_para(para, placeholder, value):
+                pass
+        # Phase 3: normalize consecutive spaces that may arise from empty
+        # substitutions, both within a run and across run boundaries.
+        prev_ended_space = False
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r"  +", " ", run.text)
+                if prev_ended_space and run.text.startswith(" "):
+                    run.text = run.text.lstrip(" ")
+                prev_ended_space = run.text.endswith(" ")
+            # empty run: prev_ended_space unchanged (gap is invisible)
+
+    for para in doc.paragraphs:
+        _apply_subs_to_para(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _apply_subs_to_para(para)
+
+    # ── Step 4: inline bracket handling ────────────────────────────────────
+    body_children  = list(doc.element.body)
+    body_child_map = {child: i for i, child in enumerate(body_children)}
+    _p_tag         = qn("w:p")
+    _single_ue_flag = flags.get("single_user_entity", False)
+
+    def _apply_brackets(para, is_single_ue):
+        # Process one bracket match per loop iteration using smart replacement so
+        # that per-run italic/bold formatting outside the matched span is preserved.
+        changed = True
+        while changed:
+            changed = False
+            full_text = "".join(r.text for r in para.runs)
+            if not full_text or "[" not in full_text:
+                break
+
+            # a) [or …] alternative phrases — always remove (with any leading space)
+            m = re.search(r" ?\[or [^\]]+\]", full_text, flags=re.IGNORECASE)
+            if m:
+                _smart_replace_in_para(para, m.group(0), "")
+                changed = True
+                continue
+
+            # b) single-user-entity annotated paragraphs
+            if is_single_ue:
+                if _single_ue_flag:
+                    # delete bracketed content entirely
+                    m = re.search(r"\[[^\]]*\]", full_text)
+                    if m:
+                        _smart_replace_in_para(para, m.group(0), "")
+                        changed = True
+                        continue
+                else:
+                    # strip brackets, keep content
+                    m = re.search(r"\[([^\]]*)\]", full_text)
+                    if m:
+                        _smart_replace_in_para(para, m.group(0), m.group(1))
+                        changed = True
+                        continue
+
+            # c) any remaining [..] — strip brackets, keep content
+            m = re.search(r"\[([^\]]*)\]", full_text)
+            if m:
+                _smart_replace_in_para(para, m.group(0), m.group(1))
+                changed = True
+                continue
+
+        # Normalize spaces introduced by empty removals
+        prev_ended_space = False
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r"  +", " ", run.text)
+                if prev_ended_space and run.text.startswith(" "):
+                    run.text = run.text.lstrip(" ")
+                prev_ended_space = run.text.endswith(" ")
+
+    # Body-level paragraphs (doc.paragraphs = direct children of <w:body>)
+    for para in doc.paragraphs:
+        idx        = body_child_map.get(para._element, -1)
+        is_sue_para = idx in single_ue_indices
+        _apply_brackets(para, is_sue_para)
+
+    # Table-cell paragraphs (never single-UE annotated at body level)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _apply_brackets(para, False)
+
+    # ── Step 5: delete conditionally-excluded paragraphs ───────────────────
+    # Each deleted paragraph also takes ONE adjacent empty spacer paragraph
+    # with it (preferring the following one) so the blank-line separation
+    # between the surviving neighbours stays single, not doubled.
+    def _is_empty_para_el(el):
+        if el.tag != _p_tag:
+            return False
+        return not "".join(
+            t.text or "" for t in el.findall(f".//{qn('w:t')}")
+        ).strip()
+
+    _del_expanded = set(del_indices)
+    for idx in sorted(del_indices):
+        for adj in (idx + 1, idx - 1):
+            if adj in _del_expanded:
+                continue
+            if 0 <= adj < len(body_children) and _is_empty_para_el(body_children[adj]):
+                _del_expanded.add(adj)
+                break
+
+    for idx in sorted(_del_expanded, reverse=True):
+        if idx < len(body_children):
+            doc.element.body.remove(body_children[idx])
+
+    # ── Step 6: font standardisation ───────────────────────────────────────
+    cjk_font = "华文楷体" if language == "中文" else "Times New Roman"
+
+    # Paragraphs whose text matches these patterns keep their bold intact.
+    # Checked against the paragraph's full text AFTER substitution.
+    _BOLD_KEEP_PATTERNS = [
+        "Independent Service Auditor",   # AR section title
+        "Management Assertion",          # MA section title (after co-name sub)
+        "Ernst & Young",                 # AR signature block (firm name)
+        "Hua Ming",                      # AR signature block (firm name variant)
+    ]
+    # Date paragraph in MA: formatted date string is the entire paragraph text
+    _DATE_RE = re.compile(
+        r"^(?:[A-Z][a-z]+ \d{1,2}, \d{4}|\d{4}年\d{1,2}月\d{1,2}日)$"
+    )
+    # Company name used to detect the MA signature line (a short standalone para)
+    _company_name_bold = subs.get("[Service organization name]", "")
+
+    def _para_keep_bold(para):
+        full = "".join(r.text for r in para.runs).strip()
+        # Apply pattern matching only to short paragraphs (section titles,
+        # signature-block lines). Without this guard the 10 000-char "We have
+        # examined…" AR paragraph — which contains "Management Assertion" in
+        # running body text — would be incorrectly made bold in its entirety.
+        if len(full) <= 120 and any(pat in full for pat in _BOLD_KEEP_PATTERNS):
+            return True
+        if _DATE_RE.match(full):
+            return True
+        # MA signature line: standalone paragraph whose text is exactly the
+        # service-organization name (e.g. "ABC Fintech Co., Ltd.")
+        if _company_name_bold and full == _company_name_bold:
+            return True
+        # Short city / country line in the AR signature block
+        # e.g. "Shanghai, China" or "中国 上海" (≤50 chars to avoid body text)
+        if len(full) <= 50 and ("China" in full or "中国" in full):
+            return True
+        return False
+
+    def _std_run(run, keep_bold=False):
+        rPr = run._r.get_or_add_rPr()
+        if not keep_bold:
+            run.bold = False            # strip bold; italic is left untouched
+            # Also explicitly disable complex-script bold (bCs) so that CJK
+            # characters do not inherit bold from a heading paragraph style
+            # after the document sections are merged.
+            bCs = rPr.find(qn("w:bCs"))
+            if bCs is None:
+                bCs = OxmlElement("w:bCs")
+                rPr.append(bCs)
+            bCs.set(qn("w:val"), "0")
+        else:
+            run.bold = True             # ensure bold is explicitly set
+        run.font.size = Pt(11)
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), cjk_font)
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+        # Explicitly disable underline (overrides any inherited style underline)
+        u_el = rPr.find(qn("w:u"))
+        if u_el is None:
+            u_el = OxmlElement("w:u")
+            rPr.append(u_el)
+        u_el.set(qn("w:val"), "none")
+
+    def _clear_para_mark_bold(para):
+        """Also strip bold from the paragraph-mark rPr (pPr/rPr)."""
+        _pPr = para._p.find(qn("w:pPr"))
+        if _pPr is None:
+            return
+        _pRPr = _pPr.find(qn("w:rPr"))
+        if _pRPr is None:
+            return
+        for _bname in ("w:b", "w:bCs"):
+            _bel = _pRPr.find(qn(_bname))
+            if _bel is None:
+                _bel = OxmlElement(_bname)
+                _pRPr.append(_bel)
+            _bel.set(qn("w:val"), "0")
+
+    for para in doc.paragraphs:
+        kb = _para_keep_bold(para)
+        for run in para.runs:
+            _std_run(run, keep_bold=kb)
+        if not kb:
+            _clear_para_mark_bold(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    kb = _para_keep_bold(para)
+                    for run in para.runs:
+                        _std_run(run, keep_bold=kb)
+                    if not kb:
+                        _clear_para_mark_bold(para)
+
+    # ── Step 7: strip spaces before punctuation ────────────────────────
+    _PUNCT = '.,;:!?，。；：！？'
+
+    def _strip_spaces_before_punct(para):
+        for run in para.runs:
+            if run.text:
+                run.text = re.sub(r' +([' + re.escape(_PUNCT) + r'])', r'\1', run.text)
+        active = [r for r in para.runs if r.text]
+        for i in range(len(active) - 1):
+            if active[i].text.endswith(' ') and active[i + 1].text[0] in _PUNCT:
+                active[i].text = active[i].text.rstrip(' ')
+
+    for para in doc.paragraphs:
+        _strip_spaces_before_punct(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _strip_spaces_before_punct(para)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    saved_bytes = buf.getvalue()
+
+    # python-docx may silently drop <w:lvlOverride>/<w:startOverride> elements
+    # when serialising the NumberingPart, which breaks lowerLetter list counters
+    # (e.g. "a." / "b." become "l" / "l").  Re-inject the original numbering.xml
+    # from the template to guarantee the counter-restart overrides are preserved.
+    try:
+        with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as _z_orig:
+            if "word/numbering.xml" in _z_orig.namelist():
+                _orig_num = _z_orig.read("word/numbering.xml")
+                _buf_in  = io.BytesIO(saved_bytes)
+                _buf_out = io.BytesIO()
+                with zipfile.ZipFile(_buf_in, "r") as _z_in:
+                    with zipfile.ZipFile(_buf_out, "w", zipfile.ZIP_DEFLATED) as _z_out:
+                        for _info in _z_in.infolist():
+                            _data = _z_in.read(_info.filename)
+                            if _info.filename == "word/numbering.xml":
+                                _data = _orig_num
+                            _z_out.writestr(_info, _data)
+                _buf_out.seek(0)
+                return _buf_out.read()
+    except Exception:
+        pass
+    return saved_bytes
+
+
+def _remap_extra_numbering(base_bytes, extra_bytes):
+    """
+    Remap abstractNumId and numId values in extra_bytes so they do not clash
+    with numbering definitions already present in base_bytes.
+
+    Both documents' numbering.xml are inspected to find the highest IDs in
+    the base; every ID in the extra is offset by that amount so no two
+    definitions share an ID after the merge.
+
+    Returns modified extra_bytes, or the original if either document has no
+    numbering.xml or the extra has no numbered lists.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(base_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return extra_bytes
+            base_num_xml = z.read("word/numbering.xml").decode("utf-8")
+    except Exception:
+        return extra_bytes
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(extra_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return extra_bytes
+            extra_num_xml = z.read("word/numbering.xml").decode("utf-8")
+            extra_doc_xml = z.read("word/document.xml").decode("utf-8")
+    except Exception:
+        return extra_bytes
+
+    # Determine maximum IDs in base
+    base_abs  = [int(x) for x in re.findall(r'w:abstractNumId="(\d+)"', base_num_xml)]
+    base_nums = [int(x) for x in re.findall(r'<w:num\b[^>]*w:numId="(\d+)"', base_num_xml)]
+    base_max_abs = max(base_abs)  if base_abs  else -1
+    base_max_num = max(base_nums) if base_nums else  0
+
+    # Collect IDs present in extra (process largest first to avoid partial hits)
+    extra_abs  = sorted(
+        set(int(x) for x in re.findall(r'<w:abstractNum\b[^>]*w:abstractNumId="(\d+)"', extra_num_xml)),
+        reverse=True,
+    )
+    extra_nums = sorted(
+        set(int(x) for x in re.findall(r'<w:num\b[^>]*w:numId="(\d+)"', extra_num_xml)),
+        reverse=True,
+    )
+
+    if not extra_nums:
+        return extra_bytes  # nothing numbered in extra
+
+    abs_offset = base_max_abs + 1
+    num_offset = base_max_num
+
+    new_num_xml = extra_num_xml
+    new_doc_xml = extra_doc_xml
+
+    # Remap abstractNumId in numbering.xml (definition + cross-references)
+    for old in extra_abs:
+        new = old + abs_offset
+        # <w:abstractNum w:abstractNumId="N"> — definition attribute
+        new_num_xml = new_num_xml.replace(
+            f'w:abstractNumId="{old}"', f'w:abstractNumId="{new}"'
+        )
+        # <w:abstractNumId w:val="N"/> — reference inside <w:num>
+        new_num_xml = new_num_xml.replace(
+            f'<w:abstractNumId w:val="{old}"', f'<w:abstractNumId w:val="{new}"'
+        )
+
+    # Remap numId in numbering.xml (definition) and in document.xml (references)
+    for old in extra_nums:
+        new = old + num_offset
+        # <w:num w:numId="N"> — definition attribute
+        new_num_xml = new_num_xml.replace(f'w:numId="{old}"', f'w:numId="{new}"')
+        # <w:numId w:val="N"/> — paragraph numPr reference
+        new_doc_xml = re.sub(
+            rf'(<w:numId\s+w:val="){old}(")',
+            rf'\g<1>{new}\g<2>',
+            new_doc_xml,
+        )
+
+    # Write modified extra docx
+    buf_in  = io.BytesIO(extra_bytes)
+    buf_out = io.BytesIO()
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/numbering.xml":
+                    data = new_num_xml.encode("utf-8")
+                elif info.filename == "word/document.xml":
+                    data = new_doc_xml.encode("utf-8")
+                zout.writestr(info, data)
+    buf_out.seek(0)
+    return buf_out.read()
+
+
+def _inject_numbering(merged_bytes, extra_bytes):
+    """
+    Append all abstractNum and num definitions from extra_bytes into the
+    word/numbering.xml of merged_bytes.
+
+    This is called after the document bodies have been merged so that the
+    remapped numId values in the extra's paragraphs resolve to actual
+    definitions in the merged file.
+    """
+    try:
+        with zipfile.ZipFile(io.BytesIO(extra_bytes), "r") as z:
+            if "word/numbering.xml" not in z.namelist():
+                return merged_bytes
+            extra_num_xml = z.read("word/numbering.xml").decode("utf-8")
+    except Exception:
+        return merged_bytes
+
+    abs_blocks = re.findall(r"<w:abstractNum\b.*?</w:abstractNum>", extra_num_xml, re.DOTALL)
+    num_blocks  = re.findall(r"<w:num\b.*?</w:num>",                extra_num_xml, re.DOTALL)
+
+    if not abs_blocks and not num_blocks:
+        return merged_bytes
+
+    buf_in  = io.BytesIO(merged_bytes)
+    buf_out = io.BytesIO()
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                data = zin.read(info.filename)
+                if info.filename == "word/numbering.xml":
+                    num_xml = data.decode("utf-8")
+                    # CT_Numbering requires all <w:abstractNum> elements to
+                    # precede all <w:num> elements; appending both at the end
+                    # interleaves them and Word flags the part as corrupt
+                    # (its "repair" then scrambles the list definitions).
+                    abs_inject = "\n".join(abs_blocks)
+                    if abs_inject:
+                        m = re.search(r"<w:num\b", num_xml)
+                        pos = m.start() if m else num_xml.rfind("</w:numbering>")
+                        num_xml = num_xml[:pos] + abs_inject + "\n" + num_xml[pos:]
+                    num_inject = "\n".join(num_blocks)
+                    if num_inject:
+                        m = re.search(r"<w:numIdMacAtCleanup\b", num_xml)
+                        pos = m.start() if m else num_xml.rfind("</w:numbering>")
+                        num_xml = num_xml[:pos] + num_inject + "\n" + num_xml[pos:]
+                    data = num_xml.encode("utf-8")
+                zout.writestr(info, data)
+    buf_out.seek(0)
+    return buf_out.read()
+
+
+def merge_docx_sections(*docs_bytes):
+    """
+    Merge multiple docx byte strings into one document with page breaks between
+    sections.
+
+    Numbering IDs (abstractNumId / numId) in each extra document are remapped
+    to avoid conflicts with the base document's numbering definitions, then the
+    extra definitions are injected into the merged file's numbering.xml.  This
+    preserves the original list styles (bullets stay bullets, alpha lists stay
+    alpha lists) across section boundaries.
+    """
+    base_bytes = docs_bytes[0]
+
+    # Remap numbering in each extra so its IDs don't clash with the base.
+    # Use a rolling base: after remapping each extra, inject its definitions
+    # into the running base so the next extra gets offsets that account for
+    # all previously added abstractNum/num blocks, preventing duplicate IDs.
+    extras_remapped = []
+    running_base = base_bytes
+    for eb in docs_bytes[1:]:
+        remapped = _remap_extra_numbering(running_base, eb)
+        extras_remapped.append(remapped)
+        running_base = _inject_numbering(running_base, remapped)
+
+    # Merge document bodies with python-docx
+    base = Document(io.BytesIO(base_bytes))
+    body = base.element.body
+    last_sectPr = body.find(qn("w:sectPr"))
+
+    for extra_bytes in extras_remapped:
+        # Insert a page break before the next section
+        p_br = OxmlElement("w:p")
+        r_br = OxmlElement("w:r")
+        br   = OxmlElement("w:br")
+        br.set(qn("w:type"), "page")
+        r_br.append(br)
+        p_br.append(r_br)
+        if last_sectPr is not None:
+            body.insert(list(body).index(last_sectPr), p_br)
+        else:
+            body.append(p_br)
+
+        extra = Document(io.BytesIO(extra_bytes))
+        for elem in extra.element.body:
+            if elem.tag != qn("w:sectPr"):
+                if last_sectPr is not None:
+                    body.insert(list(body).index(last_sectPr), deepcopy(elem))
+                else:
+                    body.append(deepcopy(elem))
+
+    buf = io.BytesIO()
+    base.save(buf)
+    merged_bytes = buf.getvalue()
+
+    # Inject remapped numbering definitions from each extra into the merged doc
+    for extra_bytes in extras_remapped:
+        merged_bytes = _inject_numbering(merged_bytes, extra_bytes)
+
+    return merged_bytes
+
+
+def enforce_line_spacing(docx_bytes, spacing=1.15):
+    """
+    Final pass over the finished document: set every paragraph (body and
+    table cells, including nested tables) to the given multiple line spacing.
+
+    Re-injects the original numbering.xml afterwards because python-docx may
+    silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
+    workaround as in fill_and_process_template).
+    """
+    doc = Document(io.BytesIO(docx_bytes))
+
+    def _walk(paragraphs, tables):
+        for para in paragraphs:
+            para.paragraph_format.line_spacing = spacing
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    _walk(cell.paragraphs, cell.tables)
+
+    _walk(doc.paragraphs, doc.tables)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    saved_bytes = buf.getvalue()
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as z_orig:
+            if "word/numbering.xml" not in z_orig.namelist():
+                return saved_bytes
+            orig_num = z_orig.read("word/numbering.xml")
+        buf_in, buf_out = io.BytesIO(saved_bytes), io.BytesIO()
+        with zipfile.ZipFile(buf_in, "r") as z_in:
+            with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as z_out:
+                for info in z_in.infolist():
+                    data = z_in.read(info.filename)
+                    if info.filename == "word/numbering.xml":
+                        data = orig_num
+                    z_out.writestr(info, data)
+        buf_out.seek(0)
+        return buf_out.read()
+    except Exception:
+        return saved_bytes
+
+
+def build_substitutions(ui, tc):
+    """Build the EN + CN placeholder → value substitution dict."""
+    language      = ui.get("Output_language", "English")
+    company_name  = ui.get("Company_name", "")
+    co_short_name = ui.get("Co_short_name", "")
+    system_name   = ui.get("System_or_service_name", "")
+    report_type   = ui.get("Report_type", "")
+    subservice_org = ui.get("Subservice_org", "")
+    signing_city  = tc.get("signing_city", "")
+
+    # Format raw YYYY-MM-DD dates to "Month D, YYYY" / "YYYY年M月D日"
+    period_start = _format_date(ui.get("Period_start", ""), language)
+    period_end   = _format_date(ui.get("Period_end",   ""), language)
+    report_date  = _format_date(tc.get("report_date",  ""), language)
+
+    # Determine date placeholders based on report type
+    if "TYPE1" in report_type:
+        single_date = period_start  # Type I: "as of" date
+    else:
+        single_date = period_end    # Type II: period end date
+
+    period_str = (
+        f"{period_start} to {period_end}"
+        if period_start and period_end
+        else period_start or period_end
+    )
+
+    # Parse first SSO name and services from subservice_org (format: "Name | Services")
+    sso_name = ""
+    sso_services = ""
+    if subservice_org:
+        first_line = subservice_org.strip().splitlines()[0]
+        if "|" in first_line:
+            parts = first_line.split("|", 1)
+            sso_name     = parts[0].strip()
+            sso_services = parts[1].strip()
+        else:
+            sso_name = first_line.strip()
+
+    # Addressee line: replace the combined "Management of/Board of Directors of"
+    # placeholder before the generic [Service organization name] sub runs.
+    addressee = tc.get("addressee_choice", "Management")
+    if addressee == "Board of Directors":
+        addr_label = "Board of Directors"
+        addr_cn = "董事会"
+    else:
+        addr_label = "Management"
+        addr_cn = "管理层"
+    subs = {
+        # Addressee line — must come BEFORE the generic [Service organization name] sub.
+        # Templates use two EN wordings for the combined placeholder.
+        "To the Management of/Board of Directors of [Service organization name]":
+            f"To the {addr_label} of {company_name}",
+        "To the Management/Board of Directors of [Service organization name]":
+            f"To the {addr_label} of {company_name}",
+        # CN combined addressee: 董事会/管理层 → the chosen one
+        "董事会/管理层": addr_cn,
+        # EN placeholders
+        "[Service organization name]":          company_name,
+        "[Service organization short name]":     co_short_name,
+        "[Service organization\u2019s system]":  system_name,   # right single quote
+        "[Service organization's system]":       system_name,   # straight apostrophe
+        "[type or name of system]":              system_name,
+        # Note: [or identification of the function performed by the System] is
+        # handled by the [or ..] regex removal in fill_and_process_template.
+        "[date] to [date]":                      period_str,
+        "[date]":                                single_date,
+        "[Date of the service auditor\u2019s report]": report_date,  # right quote
+        "[Date of the service auditor's report]":      report_date,  # straight quote
+        "[Date of report]":                      report_date,
+        # AR signature: the bracketed alternative firm name is dropped — the
+        # "<firm> <city> Branch" line above it is kept (city adjusted below).
+        "[Ernst & Young Hua Ming LLP]":          "",
+        # City: replace the whole "default_city[alternatives]" pattern
+        "Shanghai[Beijing, Shenzhen]":           signing_city,
+        "[Beijing, Shenzhen]":                   signing_city,
+        "[Subservice organization name]":        sso_name,
+        "[identify the function or service provided by the subservice organization]": sso_services,
+        "[V]":                                   "V",
+        # CN placeholders — templates use fullwidth lenticular brackets
+        # 【】 (U+3010/U+3011)
+        "\u3010\u670d\u52a1\u673a\u6784\u540d\u79f0\u3011": company_name,   # 【服务机构名称】
+        "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
+        "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
+        "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        "\u3010\u65e5\u671f\u3011": single_date,   # 【日期】
+        "\u3010\u62a5\u544a\u65e5\u3011": report_date,  # 【报告日】
+        # City CN: replace the default+alternatives pattern
+        "\u4e2d\u56fd \u4e0a\u6d77\u3010\u6216\u4e2d\u56fd \u5317\u4eac\u6216\u4e2d\u56fd \u6df1\u5733\u3011": f"\u4e2d\u56fd {signing_city}",  # 中国 上海【或中国 北京或中国 深圳】→ 中国 {city}
+        "\u3010\u6216\u5b89\u6c38\u534e\u660e\u4f1a\u8ba1\u5e08\u4e8b\u52a1\u6240\uff08\u7279\u6b8a\u666e\u901a\u5408\u4f19\uff09\u3011": "",  # 【或安永华明...】→ empty (keep branch)
+    }
+    # AR signature branch line: adjust "… Shanghai Branch" / "…上海分所" to the
+    # signing city. Skipped when the city IS Shanghai — substituting a value
+    # identical to its placeholder would loop forever in the cross-run pass.
+    if signing_city and signing_city not in ("Shanghai", "上海"):
+        subs["Ernst & Young Hua Ming LLP Shanghai Branch"] = (
+            f"{EY_FIRM_NAME} {signing_city} Branch"
+        )
+        subs["安永华明会计师事务所（特殊普通合伙）上海分所"] = (
+            f"安永华明会计师事务所（特殊普通合伙）{signing_city}分所"
+        )
+    # Trust Service Criteria — fill the bracketed "Relevant to [Security, …]"
+    # placeholder from the user's TSC selection (SOC2). Only the BRACKETED
+    # variants are substituted; the unbracketed official criteria title
+    # ("…Trust Services Criteria for Security, Availability, …") must stay.
+    _TSC_DEFS = [
+        ("is_Security",             "Security",             "安全性"),
+        ("is_Availability",         "Availability",         "可用性"),
+        ("is_Processing_Integrity", "Processing Integrity", "进程完整性"),
+        ("is_Confidentiality",      "Confidentiality",      "保密性"),
+        ("is_Privacy",              "Privacy",              "隐私性"),
+    ]
+    tsc_en = [en for key, en, _cn in _TSC_DEFS if ui.get(key)]
+    tsc_cn = [cn for key, _en, cn in _TSC_DEFS if ui.get(key)]
+    if tsc_en:
+        if len(tsc_en) == 1:
+            tsc_en_str = tsc_en[0]
+        elif len(tsc_en) == 2:
+            tsc_en_str = f"{tsc_en[0]} and {tsc_en[1]}"
+        else:
+            tsc_en_str = ", ".join(tsc_en[:-1]) + f", and {tsc_en[-1]}"
+        if len(tsc_cn) == 1:
+            tsc_cn_str = tsc_cn[0]
+        else:
+            tsc_cn_str = "、".join(tsc_cn[:-1]) + f"以及{tsc_cn[-1]}"
+        tsc_en_lower = tsc_en_str.lower()
+        # EN templates use both Oxford-comma and non-Oxford variants, plus a
+        # second LOWERCASE occurrence ("…trust services criteria relevant to
+        # [security, …]") with its own wording variants.
+        subs["[Security, Availability, Processing Integrity, Confidentiality, and Privacy]"] = tsc_en_str
+        subs["[Security, Availability, Processing Integrity, Confidentiality and Privacy]"]  = tsc_en_str
+        subs["[security, availability, processing integrity, confidentiality, and privacy]"] = tsc_en_lower
+        subs["[security, availability, processing integrity, confidentiality, privacy]"]     = tsc_en_lower
+        subs["[security, availability, processing integrity and confidentiality, privacy]"]  = tsc_en_lower
+        # CN templates: 以及 / 及 variants plus one with a 进程性、完整性 typo
+        subs["【安全性、可用性、进程完整性、保密性以及隐私性】"]   = tsc_cn_str
+        subs["【安全性、可用性、进程完整性、保密性及隐私性】"]     = tsc_cn_str
+        subs["【安全性、可用性、进程性、完整性、保密性以及隐私性】"] = tsc_cn_str
+    # When transaction-processing wording is excluded, remove the inline
+    # transaction phrases and substitute "[or identification of the function
+    # performed by the System]" with the user-supplied system function description.
+    if not tc.get("has_transaction_processing", True):
+        sys_fn = ui.get("Systems_function", "")
+        # EN variants — remove transaction-processing phrases
+        subs["for processing user entities\u2019 transactions"] = ""   # right-quote
+        subs["for processing user entities' transactions"] = ""        # straight-quote
+        subs["for processing their transactions"] = ""
+        # "in processing or reporting transactions" → "in" so that the following
+        # [or identification...] substitution produces "in <system function>"
+        # rather than "in processing or reporting <system function>" (issue 8)
+        subs["in processing or reporting transactions"] = "in"
+        subs["[or identification of the function performed by the System]"] = sys_fn
+        subs["[or identification of the function performed by the system]"] = sys_fn
+        # Remove the "auditors" clause from the "intended solely for…" paragraph.
+        # That clause only applies when the system processes user-entity transactions.
+        # Both right-quote (U+2019) and straight-apostrophe variants are covered.
+        subs[
+            ", and their auditors who audit and report on such user entities\u2019 "
+            "financial statements or internal control over financial reporting"
+        ] = ""
+        subs[
+            ", and their auditors who audit and report on such user entities' "
+            "financial statements or internal control over financial reporting"
+        ] = ""
+    return subs
+
+
+def build_flags(tc):
+    """Build the boolean deletion-flag dict from template_config."""
+    return {
+        "cuec_identified":            tc.get("cuec_identified", True),
+        "sso_cc_identified":          tc.get("sso_cc_identified", True),
+        "has_transaction_processing": tc.get("has_transaction_processing", True),
+        "single_user_entity":         tc.get("single_user_entity", False),
+        "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
+        "has_other_information":      tc.get("has_other_information", True),
+        "addressee_choice":           tc.get("addressee_choice", "Management"),
+    }
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -517,6 +1763,201 @@ def _inline_bullet(paragraph, text):
 # ══════════════════════════════════════════════════════════════════════════════
 with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=not main_done):
 
+    # ── Complete report option ─────────────────────────────────────────────────
+    generate_complete = st.checkbox(
+        "Generate complete report (MA + AR + main sections)",
+        value=True,
+        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
+    )
+
+    if generate_complete:
+        with st.expander("Complete Report Settings", expanded=True):
+            cr1, cr2 = st.columns(2)
+
+            # Read current Report Type from session_state key (set by the selectbox below).
+            # Falls back to the previous run's saved value, then to default.
+            _cur_rt = (
+                st.session_state.get("form_report_type")
+                or st.session_state.get("user_inputs", {}).get("Report_type", "SOC2 TYPE2")
+            )
+            _cur_sso = (
+                st.session_state.get("form_scope_of_report")
+                or st.session_state.get("user_inputs", {}).get("Scope_of_the_report", "None")
+            )
+            _cur_lang = (
+                st.session_state.get("form_output_language")
+                or st.session_state.get("user_inputs", {}).get("Output_language", "English")
+            )
+
+            with cr1:
+                _std_options = get_standard_options(_cur_rt)
+                standard = st.selectbox("Standard", _std_options, key="cr_standard")
+                report_date  = st.text_input("Report Signing Date", placeholder="e.g. January 30, 2026", key="cr_report_date")
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+
+            with cr2:
+                addressee_choice = st.radio(
+                    "AR Addressee",
+                    ["Management", "Board of Directors"],
+                    index=0,
+                    key="cr_addressee",
+                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
+                )
+                cuec_choice = st.radio(
+                    "Complementary User Entity Controls (CUEC)",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_cuec",
+                )
+                has_transaction_processing = st.checkbox(
+                    "Includes transaction processing wording",
+                    value=True,
+                    key="cr_transaction",
+                )
+                if not has_transaction_processing:
+                    st.caption(
+                        "⚠️ When unchecked, the 'Systems Function' field below "
+                        "(Required Fields section) is used to describe the system's "
+                        "function in place of transaction-processing wording."
+                    )
+                single_user_entity = st.checkbox(
+                    "Single user entity report",
+                    value=False,
+                    key="cr_single_user",
+                )
+                has_ai_scope_exclusion = st.checkbox(
+                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
+                    value=False,
+                    key="cr_ai_scope",
+                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
+                )
+                has_other_information = st.checkbox(
+                    "Report includes 'Other Information' section",
+                    value=True,
+                    key="cr_other_info",
+                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
+                )
+
+            # SSO CC — only shown when SSO != None
+            if _cur_sso != "None":
+                sso_cc_choice = st.radio(
+                    "SSO Complementary Controls",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_sso_cc",
+                )
+            else:
+                sso_cc_choice = "Identified"
+
+            # Template resolution preview (computed every render)
+            st.markdown("---")
+            _ar_wp, _ar_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "AR")
+            _ma_wp, _ma_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "MA")
+
+            def _show_template_status(label, wp, path, dir_name):
+                if wp is None and isinstance(path, str):
+                    # path carries the error message when wp is None
+                    st.error(f"{label}: {path}")
+                elif wp is None:
+                    st.warning(f"{label}: No matching template found for this combination.")
+                elif path and os.path.isfile(path):
+                    st.info(f"{label}: WP No. {wp} \u2192 {os.path.basename(path)}")
+                elif isinstance(path, str) and path.startswith("Cannot"):
+                    st.error(f"{label}: WP No. {wp} — {path}")
+                else:
+                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
+
+            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
+            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
+
+            # ── Test mode: generate MA+AR without running the Dify workflow ──────
+            _ar_ok = _ar_path and os.path.isfile(_ar_path)
+            _ma_ok = _ma_path and os.path.isfile(_ma_path)
+            if _ar_ok and _ma_ok:
+                st.markdown("---")
+                st.caption(
+                    "Use the button below to test Section I + II template generation "
+                    "without running the full Dify workflow. "
+                    "Fill in the company fields below first, then click the button."
+                )
+                with st.expander("Test Template Generation (no Dify needed)", expanded=False):
+                    t1, t2 = st.columns(2)
+                    with t1:
+                        _t_company   = st.text_input("Company Name",       key="test_company",   placeholder="e.g. ABC Fintech Co., Ltd.")
+                        _t_short     = st.text_input("Short Name",          key="test_short",     placeholder="e.g. ABC")
+                        _t_system    = st.text_input("System Name",         key="test_system",    placeholder="e.g. Payment Processing System")
+                        _t_svc_desc  = st.text_input("Service Description", key="test_svc_desc",  placeholder="e.g. payment processing services")
+                    with t2:
+                        _t_period_s  = st.text_input("Period Start (YYYY-MM-DD)", key="test_period_s", placeholder="e.g. 2024-01-01")
+                        _t_period_e  = st.text_input("Period End   (YYYY-MM-DD)", key="test_period_e", placeholder="e.g. 2024-12-31")
+                        _t_sso_name  = st.text_input("SSO Name (if any)",    key="test_sso_name",  placeholder="leave blank if none")
+                        _t_sys_fn    = st.text_input("System Function (if no transaction processing)", key="test_sys_fn", placeholder="e.g. providing cloud-based payment infrastructure")
+                    if st.button("Generate test MA + AR sections", key="test_template_btn"):
+                        _test_ui = {
+                            "Company_name":          _t_company or "Test Organization",
+                            "Co_short_name":         _t_short   or "TestOrg",
+                            "System_or_service_name": _t_system or "Test System",
+                            "Service_description":   _t_svc_desc or "test services",
+                            "Period_start":          _t_period_s or "2024-01-01",
+                            "Period_end":            _t_period_e or "2024-12-31",
+                            "Report_type":           _cur_rt,
+                            "Output_language":       _cur_lang,
+                            "Subservice_org":        _t_sso_name or "None",
+                            "Systems_function":      _t_sys_fn or "",
+                            # TSC checkboxes live lower in the form; read their
+                            # persisted widget state from the previous rerun.
+                            "is_Security":             st.session_state.get("form_tsc_security", False),
+                            "is_Availability":         st.session_state.get("form_tsc_availability", False),
+                            "is_Processing_Integrity": st.session_state.get("form_tsc_processing", False),
+                            "is_Confidentiality":      st.session_state.get("form_tsc_confidentiality", False),
+                            "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
+                        }
+                        _test_tc = {
+                            "report_date":                report_date  or "January 1, 2025",
+                            "signing_city":               signing_city or "Shanghai",
+                            "cuec_identified":            cuec_choice == "Identified",
+                            "sso_cc_identified":          sso_cc_choice == "Identified",
+                            "has_transaction_processing": has_transaction_processing,
+                            "single_user_entity":         single_user_entity,
+                            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                            "has_other_information":      has_other_information,
+                            "addressee_choice":           addressee_choice,
+                        }
+                        try:
+                            with st.spinner("Generating test MA + AR sections…"):
+                                _t_subs  = build_substitutions(_test_ui, _test_tc)
+                                _t_flags = build_flags(_test_tc)
+                                _t_ma    = fill_and_process_template(_ma_path, _t_subs, _t_flags, _cur_lang)
+                                _t_ar    = fill_and_process_template(_ar_path, _t_subs, _t_flags, _cur_lang)
+                                _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
+                            _t_fname = (
+                                f"{(_t_short or 'Test')}_{_cur_rt.replace(' ','_')}"
+                                f"_MA_AR_test.docx"
+                            )
+                            st.download_button(
+                                label="⬇ Download test MA + AR (.docx)",
+                                data=_t_merged,
+                                file_name=_t_fname,
+                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            )
+                        except Exception as _exc:
+                            st.error(f"Test generation failed: {_exc}")
+
+    else:
+        standard                  = ""
+        report_date               = ""
+        signing_city              = ""
+        cuec_choice               = "Identified"
+        sso_cc_choice             = "Identified"
+        has_transaction_processing = True
+        single_user_entity         = False
+        has_ai_scope_exclusion     = False
+        has_other_information      = True
+        addressee_choice           = "Management"
+        _ar_path                   = None
+        _ma_path                   = None
+
+    st.markdown("---")
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
         "1. 请上传Excel大表，其中必须包含Control Matrix sheet；"
@@ -541,15 +1982,15 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         system_name         = st.text_input("Service / System Name",max_chars=256)
         period_start    = st.text_input("Report Period Start (as of date if SOC1)", placeholder="e.g. 2025-01-01")
         scope_of_report = st.selectbox("Subservice Organization Testing Strategy",
-            ["None", "All carve out", "Inclusive"])
+            ["None", "All carve out", "Inclusive"], key="form_scope_of_report")
         industry = st.selectbox("Industry",
                                 ["HR", "IaaS", "AI", "SaaS", "Others"])
 
     with req2:
         report_type     = st.selectbox("Report Type",
-            ["SOC1 TYPE1", "SOC1 TYPE2", "SOC2 TYPE1", "SOC2 TYPE2"])
+            ["SOC1 TYPE1", "SOC1 TYPE2", "SOC2 TYPE1", "SOC2 TYPE2"], key="form_report_type")
         output_language = st.selectbox("Output Language",
-            ["English", "中文"])
+            ["English", "中文"], key="form_output_language")
         service_description = st.text_input("Service Description",  max_chars=256)
         period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2024-12-31")
         subservice_org = st.text_area(
@@ -583,11 +2024,11 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     st.subheader("Trust Service Criteria (SOC2 only)")
     tsc_cols = st.columns(5)
-    is_security              = tsc_cols[0].checkbox("Security")
-    is_availability          = tsc_cols[1].checkbox("Availability")
-    is_processing_integrity  = tsc_cols[2].checkbox("Processing Integrity")
-    is_confidentiality       = tsc_cols[3].checkbox("Confidentiality")
-    is_privacy               = tsc_cols[4].checkbox("Privacy")
+    is_security              = tsc_cols[0].checkbox("Security",             key="form_tsc_security")
+    is_availability          = tsc_cols[1].checkbox("Availability",         key="form_tsc_availability")
+    is_processing_integrity  = tsc_cols[2].checkbox("Processing Integrity", key="form_tsc_processing")
+    is_confidentiality       = tsc_cols[3].checkbox("Confidentiality",      key="form_tsc_confidentiality")
+    is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
 
     st.markdown("---")
     run_main = st.button("▶ Run Step 1 — MAIN Workflow", type="primary", use_container_width=True)
@@ -606,10 +2047,40 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if (scope_of_report != "None") and (not subservice_org):
             errors.append("Please input Subservice Organizations and its service provided")
 
+        if generate_complete:
+            if not report_date:
+                errors.append("Report Signing Date is required when generating a complete report.")
+            if not signing_city:
+                errors.append("Signing City is required when generating a complete report.")
+            if not has_transaction_processing and not systems_function:
+                errors.append(
+                    "Systems Function is required when 'Includes transaction processing wording' "
+                    "is unchecked — please fill in the Systems Function field."
+                )
+
         if errors:
             for e in errors:
                 st.error(e)
             st.stop()
+
+        # Re-resolve templates using the current form's report_type, sso and language
+        if generate_complete:
+            _ar_wp_final, _ar_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp_final, _ma_path_final = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+            # Treat error strings (non-file paths) as missing
+            if _ar_path_final and not os.path.isfile(_ar_path_final):
+                st.warning(f"AR template issue: {_ar_path_final} — complete report will omit Section II.")
+                _ar_path_final = None
+            elif not _ar_path_final:
+                st.warning("AR template file not found for this combination — complete report will omit Section II.")
+            if _ma_path_final and not os.path.isfile(_ma_path_final):
+                st.warning(f"MA template issue: {_ma_path_final} — complete report will omit Section I.")
+                _ma_path_final = None
+            elif not _ma_path_final:
+                st.warning("MA template file not found for this combination — complete report will omit Section I.")
+        else:
+            _ar_path_final = None
+            _ma_path_final = None
 
         # Upload files
         with st.spinner("Uploading file(s) to Dify…"):
@@ -646,16 +2117,33 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "Subservice_org": subservice_org,
             "Scope_of_the_report": scope_of_report,
             "Co_website": co_website,
-        }
-
-        inputs_main = {
-            **st.session_state["user_inputs"],
-            "File_input": file_ids,
             "is_Security":             is_security,
             "is_Availability":         is_availability,
             "is_Processing_Integrity": is_processing_integrity,
             "is_Confidentiality":      is_confidentiality,
             "is_Privacy":              is_privacy,
+        }
+
+        # Store template config for download step
+        st.session_state["template_config"] = {
+            "generate_complete":          generate_complete,
+            "standard":                   standard,
+            "report_date":                report_date,
+            "signing_city":               signing_city,
+            "cuec_identified":            cuec_choice == "Identified",
+            "sso_cc_identified":          sso_cc_choice == "Identified",
+            "has_transaction_processing": has_transaction_processing,
+            "single_user_entity":         single_user_entity,
+            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+            "has_other_information":      has_other_information,
+            "addressee_choice":           addressee_choice,
+            "ar_template_path":           _ar_path_final,
+            "ma_template_path":           _ma_path_final,
+        }
+
+        inputs_main = {
+            **st.session_state["user_inputs"],
+            "File_input": file_ids,
         }
 
         status = st.empty()
@@ -834,20 +2322,52 @@ if final_done:
     st.success("🎉 Report is ready!")
 
     result_text = st.session_state["final_result"]
-    ui = st.session_state.get("user_inputs", {})
+    ui  = st.session_state.get("user_inputs", {})
+    tc  = st.session_state.get("template_config", {})
 
-    with st.expander("📖 Preview Report", expanded=True):
+    with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    docx_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
-    filename = (
-        f"{ui.get('Co_short_name', 'Report')}_"
-        f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-    )
+    # Always generate the Dify sections docx
+    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+
+    if (tc.get("generate_complete")
+            and tc.get("ar_template_path")
+            and tc.get("ma_template_path")):
+        subs  = build_substitutions(ui, tc)
+        flags = build_flags(tc)
+
+        _lang = ui.get("Output_language", "English")
+        try:
+            with st.spinner("Generating MA section (Section I)…"):
+                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+            with st.spinner("Generating AR section (Section II)…"):
+                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+            with st.spinner("Merging all sections…"):
+                final_bytes = enforce_line_spacing(
+                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                )
+            filename = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
+            )
+        except Exception as exc:
+            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+            final_bytes = enforce_line_spacing(dify_bytes)
+            filename = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+            )
+    else:
+        final_bytes = enforce_line_spacing(dify_bytes)
+        filename = (
+            f"{ui.get('Co_short_name', 'Report')}_"
+            f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+        )
 
     st.download_button(
         label="⬇ Download Report (.docx)",
-        data=docx_bytes,
+        data=final_bytes,
         file_name=filename,
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         type="primary",
