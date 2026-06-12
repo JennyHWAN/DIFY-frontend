@@ -179,14 +179,15 @@ _MONTHS = [
 
 
 def _format_date(s, language="English"):
-    """Convert YYYY-MM-DD to 'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
-    Strings that do not match YYYY-MM-DD are returned unchanged."""
+    """Convert YYYY-MM-DD (also YYYY/M/D, YYYY.M.D, 1-digit month/day) to
+    'Month D, YYYY' (EN) or 'YYYY年M月D日' (CN).
+    Strings that do not match a recognised date pattern are returned unchanged."""
     if not s:
         return s
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", s.strip())
+    m = re.match(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$", s.strip())
     if m:
         y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-        if 1 <= mo <= 12:
+        if 1 <= mo <= 12 and 1 <= d <= 31:
             if language == "中文":
                 return f"{y}年{mo}月{d}日"
             return f"{_MONTHS[mo - 1]} {d}, {y}"
@@ -603,6 +604,15 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     def _apply_subs_to_para(para):
         if not para.runs:
             return
+        # Phase 0: compound date-range placeholders contain the single 【日期】/
+        # [date] placeholder — consume them first with cross-run replacement,
+        # otherwise phase 1 could fill one half with the single date when the
+        # range spans multiple runs.
+        for placeholder in ("[date] to [date]", "【日期】至【日期】"):
+            value = subs.get(placeholder)
+            if value is not None:
+                while _smart_replace_in_para(para, placeholder, value):
+                    pass
         # Phase 1: per-run substitution — preserves individual run formatting
         # (bold, italic, etc.) when the placeholder is entirely within one run.
         for run in para.runs:
@@ -648,11 +658,17 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         while changed:
             changed = False
             full_text = "".join(r.text for r in para.runs)
-            if not full_text or "[" not in full_text:
+            if not full_text or ("[" not in full_text and "【" not in full_text):
                 break
 
-            # a) [or …] alternative phrases — always remove (with any leading space)
+            # a) [or …] / 【或…】 alternative phrases — always remove
+            #    (with any leading space for the EN variant)
             m = re.search(r" ?\[or [^\]]+\]", full_text, flags=re.IGNORECASE)
+            if m:
+                _smart_replace_in_para(para, m.group(0), "")
+                changed = True
+                continue
+            m = re.search(r"【或[^】]*】", full_text)
             if m:
                 _smart_replace_in_para(para, m.group(0), "")
                 changed = True
@@ -662,23 +678,23 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             if is_single_ue:
                 if _single_ue_flag:
                     # delete bracketed content entirely
-                    m = re.search(r"\[[^\]]*\]", full_text)
+                    m = re.search(r"\[[^\]]*\]|【[^】]*】", full_text)
                     if m:
                         _smart_replace_in_para(para, m.group(0), "")
                         changed = True
                         continue
                 else:
                     # strip brackets, keep content
-                    m = re.search(r"\[([^\]]*)\]", full_text)
+                    m = re.search(r"\[([^\]]*)\]|【([^】]*)】", full_text)
                     if m:
-                        _smart_replace_in_para(para, m.group(0), m.group(1))
+                        _smart_replace_in_para(para, m.group(0), m.group(1) or m.group(2) or "")
                         changed = True
                         continue
 
-            # c) any remaining [..] — strip brackets, keep content
-            m = re.search(r"\[([^\]]*)\]", full_text)
+            # c) any remaining [..] / 【..】 — strip brackets, keep content
+            m = re.search(r"\[([^\]]*)\]|【([^】]*)】", full_text)
             if m:
-                _smart_replace_in_para(para, m.group(0), m.group(1))
+                _smart_replace_in_para(para, m.group(0), m.group(1) or m.group(2) or "")
                 changed = True
                 continue
 
@@ -738,6 +754,9 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         "Management Assertion",          # MA section title (after co-name sub)
         "Ernst & Young",                 # AR signature block (firm name)
         "Hua Ming",                      # AR signature block (firm name variant)
+        "管理层认定",                     # CN MA section title (after co-name sub)
+        "独立服务审计师",                 # CN AR title (…报告 / …鉴证报告)
+        "安永华明",                       # CN AR signature block (firm name)
     ]
     # Date paragraph in MA: formatted date string is the entire paragraph text
     _DATE_RE = re.compile(
@@ -1151,6 +1170,11 @@ def build_substitutions(ui, tc):
         if period_start and period_end
         else period_start or period_end
     )
+    period_str_cn = (
+        f"{period_start}至{period_end}"
+        if period_start and period_end
+        else period_start or period_end
+    )
 
     # Parse first SSO name and services from subservice_org (format: "Name | Services")
     sso_name = ""
@@ -1210,6 +1234,9 @@ def build_substitutions(ui, tc):
         "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
         "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
         "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        # CN period range — must come BEFORE the single 【日期】 sub below
+        # (templates write Type II periods as 自【日期】至【日期】止).
+        "【日期】至【日期】": period_str_cn,
         "\u3010\u65e5\u671f\u3011": single_date,   # 【日期】
         "\u3010\u62a5\u544a\u65e5\u3011": report_date,  # 【报告日】
         # City CN: replace the default+alternatives pattern
@@ -1278,6 +1305,9 @@ def build_substitutions(ui, tc):
         subs["in processing or reporting transactions"] = "in"
         subs["[or identification of the function performed by the System]"] = sys_fn
         subs["[or identification of the function performed by the system]"] = sys_fn
+        # CN counterpart — without this sub the generic 【或…】 removal would
+        # delete the alternative instead of filling in the system function.
+        subs["【或确定体系执行的功能】"] = sys_fn
         # Remove the "auditors" clause from the "intended solely for…" paragraph.
         # That clause only applies when the system processes user-entity transactions.
         # Both right-quote (U+2019) and straight-apostrophe variants are covered.
@@ -1792,7 +1822,14 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             with cr1:
                 _std_options = get_standard_options(_cur_rt)
                 standard = st.selectbox("Standard", _std_options, key="cr_standard")
-                report_date  = st.text_input("Report Signing Date", placeholder="e.g. January 30, 2026", key="cr_report_date")
+                report_date  = st.text_input(
+                    "Report Signing Date (YYYY-MM-DD)",
+                    placeholder="e.g. 2026-01-30",
+                    key="cr_report_date",
+                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
+                         "\"2026年1月30日\" in Chinese reports. "
+                         "Other text is inserted into the report as-is.",
+                )
                 signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
 
             with cr2:
@@ -1913,7 +1950,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
                         }
                         _test_tc = {
-                            "report_date":                report_date  or "January 1, 2025",
+                            "report_date":                report_date  or "2025-01-01",
                             "signing_city":               signing_city or "Shanghai",
                             "cuec_identified":            cuec_choice == "Identified",
                             "sso_cc_identified":          sso_cc_choice == "Identified",
