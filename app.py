@@ -1161,6 +1161,44 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
 
+    # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
+    # rendered when the numbering level itself names no font — e.g. the CN AR
+    # "a." items showed in 黑体 because the mark carried eastAsia=黑体 and no
+    # ascii font. Force Times New Roman Latin + black there as well; the
+    # eastAsia font is again left untouched.
+    _mark_tail_tags = (qn("w:sectPr"), qn("w:pPrChange"))
+    for pPr in doc.element.body.iter(qn("w:pPr")):
+        rPr = pPr.find(qn("w:rPr"))
+        if rPr is None:
+            rPr = OxmlElement("w:rPr")
+            tail = next((ch for ch in pPr if ch.tag in _mark_tail_tags), None)
+            if tail is not None:
+                tail.addprevious(rPr)
+            else:
+                pPr.append(rPr)
+        rFonts = rPr.find(qn("w:rFonts"))
+        if rFonts is None:
+            rFonts = OxmlElement("w:rFonts")
+            rStyle = rPr.find(qn("w:rStyle"))
+            if rStyle is not None:
+                rStyle.addnext(rFonts)
+            else:
+                rPr.insert(0, rFonts)
+        rFonts.set(qn("w:ascii"), "Times New Roman")
+        rFonts.set(qn("w:hAnsi"), "Times New Roman")
+        rFonts.set(qn("w:cs"),    "Times New Roman")
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+            if rFonts.get(qn(theme_attr)) is not None:
+                del rFonts.attrib[qn(theme_attr)]
+        color = rPr.find(qn("w:color"))
+        if color is None:
+            color = OxmlElement("w:color")
+            rFonts.addnext(color)
+        color.set(qn("w:val"), "000000")
+        for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
+            if color.get(qn(theme_attr)) is not None:
+                del color.attrib[qn(theme_attr)]
+
     buf = io.BytesIO()
     doc.save(buf)
     saved_bytes = buf.getvalue()
