@@ -581,6 +581,27 @@ def _smart_replace_in_para(para, old, new):
     return True
 
 
+def _set_outline_level(para, level):
+    """Tag a paragraph with an explicit w:outlineLvl (0 = 1st level) so it
+    shows in Word's navigation pane. Heading-style references alone do not
+    survive the merge into the EY template document (the styles are not
+    defined there), and outlineLvl has no effect on visual formatting."""
+    pPr = para._p.get_or_add_pPr()
+    ol = pPr.find(qn("w:outlineLvl"))
+    if ol is None:
+        ol = OxmlElement("w:outlineLvl")
+        tail = next(
+            (ch for ch in pPr
+             if ch.tag in (qn("w:rPr"), qn("w:sectPr"), qn("w:pPrChange"))),
+            None,
+        )
+        if tail is not None:
+            tail.addprevious(ol)
+        else:
+            pPr.append(ol)
+    ol.set(qn("w:val"), str(level))
+
+
 def fill_and_process_template(template_path, subs, flags, language="English"):
     """
     Process an EY MA/AR docx template:
@@ -783,9 +804,12 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     _BOLD_KEEP_PATTERNS = [
         "Independent Service Auditor",   # AR section title
         "Management Assertion",          # MA section title (after co-name sub)
+        "Management Statements",         # MA title (ISAE 3000/3402 templates)
+        "Report of Its Assertions",      # MA title (SOC3 template)
         "Ernst & Young",                 # AR signature block (firm name)
         "Hua Ming",                      # AR signature block (firm name variant)
         "管理层认定",                     # CN MA section title (after co-name sub)
+        "管理层声明",                     # CN MA title (ISAE 3000/3402 templates)
         "独立服务审计师",                 # CN AR title (…报告 / …鉴证报告)
         "安永华明",                       # CN AR signature block (firm name)
     ]
@@ -795,6 +819,22 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     )
     # Company name used to detect the MA signature line (a short standalone para)
     _company_name_bold = subs.get("[Service organization name]", "")
+
+    # Section titles get an explicit outline level so MA and AR appear as
+    # 1st-level headings in Word's navigation pane (formatting unchanged).
+    _TITLE_PATTERNS = [
+        "Independent Service Auditor",
+        "Management Assertion",
+        "Management Statements",
+        "Report of Its Assertions",
+        "管理层认定",
+        "管理层声明",
+        "独立服务审计师",
+    ]
+
+    def _para_is_title(para):
+        full = "".join(r.text for r in para.runs).strip()
+        return len(full) <= 120 and any(p in full for p in _TITLE_PATTERNS)
 
     def _para_keep_bold(para):
         full = "".join(r.text for r in para.runs).strip()
@@ -863,6 +903,8 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
 
     for para in doc.paragraphs:
         kb = _para_keep_bold(para)
+        if _para_is_title(para):
+            _set_outline_level(para, 0)
         for run in para.runs:
             _std_run(run, keep_bold=kb)
         if not kb:
@@ -1147,7 +1189,18 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
 
     def _walk(paragraphs, tables):
         for para in paragraphs:
-            para.paragraph_format.line_spacing = spacing
+            pf = para.paragraph_format
+            pf.line_spacing = spacing
+            pf.space_before = Pt(0)
+            pf.space_after  = Pt(0)
+            # beforeLines/afterLines and autospacing attributes take precedence
+            # over before/after in Word — strip them so 0 actually applies.
+            sp_el = para._p.pPr.find(qn("w:spacing"))
+            if sp_el is not None:
+                for attr in ("w:beforeLines", "w:afterLines",
+                             "w:beforeAutospacing", "w:afterAutospacing"):
+                    if sp_el.get(qn(attr)) is not None:
+                        del sp_el.attrib[qn(attr)]
         for table in tables:
             for row in table.rows:
                 for cell in row.cells:
@@ -1172,6 +1225,13 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # Uniform 11 pt body text everywhere (Latin + complex script)
+        rPr.sz_val = Pt(11)
+        szCs = rPr.find(qn("w:szCs"))
+        if szCs is None:
+            szCs = OxmlElement("w:szCs")
+            rPr.find(qn("w:sz")).addnext(szCs)
+        szCs.set(qn("w:val"), "22")
         # EY template styles define Normal as BOLD; the Dify-generated sections
         # merged into the template document inherit it and render whole-bold.
         # Pin bold/underline OFF wherever the run does not set them itself, so
@@ -1228,6 +1288,13 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # List number glyphs and empty-paragraph line heights at 11 pt as well
+        rPr.sz_val = Pt(11)
+        mszCs = rPr.find(qn("w:szCs"))
+        if mszCs is None:
+            mszCs = OxmlElement("w:szCs")
+            rPr.find(qn("w:sz")).addnext(mszCs)
+        mszCs.set(qn("w:val"), "22")
         # Keep list number glyphs non-bold unless the mark sets bold itself
         # (the bold Normal style would otherwise bleed into them).
         mb_el = rPr.find(qn("w:b"))
@@ -1625,6 +1692,7 @@ def _add_table_from_md(doc, table_lines):
 
     table = doc.add_table(rows=1 + len(data_rows), cols=num_cols)
     table.style = "Table Grid"
+    _set_table_borders(table)
 
     # Header row — gray background, bold text
     for j, header_text in enumerate(headers):
@@ -1661,6 +1729,7 @@ def _add_numpipe_table(doc, lines, language="English"):
     header_row = list(hdr[:num_cols])
     table = doc.add_table(rows=1 + len(rows), cols=num_cols)
     table.style = "Table Grid"
+    _set_table_borders(table)
     for j, h in enumerate(header_row):
         cell = table.rows[0].cells[j]
         cell.text = ""
@@ -1677,6 +1746,37 @@ def _add_numpipe_table(doc, lines, language="English"):
             _apply_fonts(run)
     _set_col_widths(table, [1.2, 5.0, 9.7])
     _set_repeat_header(table)
+
+
+def _set_table_borders(tbl):
+    """Set explicit solid single borders (outline + inside grid) on a table.
+
+    Generated tables reference the 'Table Grid' style, which is not defined in
+    the EY template document the sections are merged into, so the style-based
+    borders vanish in the complete report. Borders set on the table itself
+    survive the merge."""
+    tblPr = tbl._tbl.tblPr
+    borders = tblPr.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tail = next(
+            (ch for ch in tblPr if ch.tag in
+             (qn("w:tblLayout"), qn("w:tblCellMar"), qn("w:tblLook"))),
+            None,
+        )
+        if tail is not None:
+            tail.addprevious(borders)
+        else:
+            tblPr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = borders.find(qn(f"w:{edge}"))
+        if el is None:
+            el = OxmlElement(f"w:{edge}")
+            borders.append(el)
+        el.set(qn("w:val"),   "single")
+        el.set(qn("w:sz"),    "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
 
 
 def _set_col_widths(tbl, widths_cm):
@@ -1708,6 +1808,10 @@ def _add_heading(doc, text, level):
     p = doc.add_paragraph(style=f"Heading {level}")
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after  = Pt(0)
+    # Explicit outline level: the "Heading N" style reference is lost when the
+    # section is merged into the EY template document, which empties Word's
+    # navigation pane. outlineLvl keeps the entry without changing formatting.
+    _set_outline_level(p, level - 1)
     run = p.add_run(text)
     _apply_fonts(run)
     run.font.color.rgb = RGBColor(0, 0, 0)
@@ -1819,6 +1923,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                     hdr = ("SN", "Term/Application Name", "Terminology/System Introduction")
                 tbl = doc.add_table(rows=1 + len(numbered_items), cols=3)
                 tbl.style = "Table Grid"
+                _set_table_borders(tbl)
                 for j, h in enumerate(hdr):
                     cell = tbl.rows[0].cells[j]
                     cell.text = ""
