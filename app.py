@@ -2092,7 +2092,12 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if run_ma_ar_only:
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
-            if not (_ar_path_t and os.path.isfile(_ar_path_t)):
+            if report_type.startswith("SOC2") and not any([
+                is_security, is_availability, is_processing_integrity,
+                is_confidentiality, is_privacy,
+            ]):
+                st.error("At least one Trust Service Criteria must be selected for SOC2 reports.")
+            elif not (_ar_path_t and os.path.isfile(_ar_path_t)):
                 st.error(f"AR template not available: {_ar_path_t or 'no matching template found'}")
             elif not (_ma_path_t and os.path.isfile(_ma_path_t)):
                 st.error(f"MA template not available: {_ma_path_t or 'no matching template found'}")
@@ -2159,6 +2164,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if not system_name: errors.append("Service/System Name is required.")
         if not service_description: errors.append("Service Description is required.")
         if not period_start: errors.append("Report Period Start is required.")
+        if report_type.endswith("TYPE2") and not period_end:
+            errors.append("Report Period End is required for Type 2 reports.")
+        if report_type.startswith("SOC2") and not any([
+            is_security, is_availability, is_processing_integrity,
+            is_confidentiality, is_privacy,
+        ]):
+            errors.append("At least one Trust Service Criteria must be selected for SOC2 reports.")
         if not uploaded_files: errors.append("At least one file must be uploaded.")
         if len(subservice_org) > 256:
             errors.append("Subservice Organization exceeds 256 characters")
