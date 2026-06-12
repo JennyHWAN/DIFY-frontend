@@ -204,7 +204,7 @@ _CUEC_KW     = ["无用户补充", "未识别用户补充", "user entity补充",
 _SSO_CC_KW   = ["子服务机构补偿", "子服务机构补充"]
 _TRANS_KW    = ["处理transaction", "processing user entity transaction"]
 _SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
-_OTHER_KW    = ["other information"]  # ALWAYS keep — never delete
+_OTHER_KW    = ["other information"]  # kept unless user says no Other Information section
 _AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
 
 
@@ -293,8 +293,13 @@ def _build_annotation_maps(docx_bytes, flags):
     body_list = list(body)
 
     for cid, text in comment_texts.items():
-        # "Other Information" paragraphs are ALWAYS kept
+        # "Other Information" paragraphs (注：若无Other Information这一章节，则删除…):
+        # kept by default; deleted only when the user indicated the report has
+        # no Other Information section and the comment is a delete instruction.
         if any(_kw_in(text, kw.lower()) for kw in _OTHER_KW):
+            if (not flags.get("has_other_information", True)
+                    and ("删除" in text or "delete" in text.lower())):
+                del_indices |= comment_to_indices.get(cid, set())
             continue
 
         indices = comment_to_indices.get(cid, set())
@@ -700,7 +705,26 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                     _apply_brackets(para, False)
 
     # ── Step 5: delete conditionally-excluded paragraphs ───────────────────
-    for idx in sorted(del_indices, reverse=True):
+    # Each deleted paragraph also takes ONE adjacent empty spacer paragraph
+    # with it (preferring the following one) so the blank-line separation
+    # between the surviving neighbours stays single, not doubled.
+    def _is_empty_para_el(el):
+        if el.tag != _p_tag:
+            return False
+        return not "".join(
+            t.text or "" for t in el.findall(f".//{qn('w:t')}")
+        ).strip()
+
+    _del_expanded = set(del_indices)
+    for idx in sorted(del_indices):
+        for adj in (idx + 1, idx - 1):
+            if adj in _del_expanded:
+                continue
+            if 0 <= adj < len(body_children) and _is_empty_para_el(body_children[adj]):
+                _del_expanded.add(adj)
+                break
+
+    for idx in sorted(_del_expanded, reverse=True):
         if idx < len(body_children):
             doc.element.body.remove(body_children[idx])
 
@@ -1057,6 +1081,50 @@ def merge_docx_sections(*docs_bytes):
     return merged_bytes
 
 
+def enforce_line_spacing(docx_bytes, spacing=1.15):
+    """
+    Final pass over the finished document: set every paragraph (body and
+    table cells, including nested tables) to the given multiple line spacing.
+
+    Re-injects the original numbering.xml afterwards because python-docx may
+    silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
+    workaround as in fill_and_process_template).
+    """
+    doc = Document(io.BytesIO(docx_bytes))
+
+    def _walk(paragraphs, tables):
+        for para in paragraphs:
+            para.paragraph_format.line_spacing = spacing
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    _walk(cell.paragraphs, cell.tables)
+
+    _walk(doc.paragraphs, doc.tables)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    saved_bytes = buf.getvalue()
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(docx_bytes), "r") as z_orig:
+            if "word/numbering.xml" not in z_orig.namelist():
+                return saved_bytes
+            orig_num = z_orig.read("word/numbering.xml")
+        buf_in, buf_out = io.BytesIO(saved_bytes), io.BytesIO()
+        with zipfile.ZipFile(buf_in, "r") as z_in:
+            with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as z_out:
+                for info in z_in.infolist():
+                    data = z_in.read(info.filename)
+                    if info.filename == "word/numbering.xml":
+                        data = orig_num
+                    z_out.writestr(info, data)
+        buf_out.seek(0)
+        return buf_out.read()
+    except Exception:
+        return saved_bytes
+
+
 def build_substitutions(ui, tc):
     """Build the EN + CN placeholder → value substitution dict."""
     language      = ui.get("Output_language", "English")
@@ -1101,17 +1169,25 @@ def build_substitutions(ui, tc):
     addressee = tc.get("addressee_choice", "Management")
     if addressee == "Board of Directors":
         addr_label = "Board of Directors"
+        addr_cn = "董事会"
     else:
         addr_label = "Management"
+        addr_cn = "管理层"
     subs = {
-        # Addressee line — must come BEFORE the generic [Service organization name] sub
+        # Addressee line — must come BEFORE the generic [Service organization name] sub.
+        # Templates use two EN wordings for the combined placeholder.
         "To the Management of/Board of Directors of [Service organization name]":
             f"To the {addr_label} of {company_name}",
+        "To the Management/Board of Directors of [Service organization name]":
+            f"To the {addr_label} of {company_name}",
+        # CN combined addressee: 董事会/管理层 → the chosen one
+        "董事会/管理层": addr_cn,
         # EN placeholders
         "[Service organization name]":          company_name,
         "[Service organization short name]":     co_short_name,
         "[Service organization\u2019s system]":  system_name,   # right single quote
         "[Service organization's system]":       system_name,   # straight apostrophe
+        "[type or name of system]":              system_name,
         # Note: [or identification of the function performed by the System] is
         # handled by the [or ..] regex removal in fill_and_process_template.
         "[date] to [date]":                      period_str,
@@ -1119,23 +1195,74 @@ def build_substitutions(ui, tc):
         "[Date of the service auditor\u2019s report]": report_date,  # right quote
         "[Date of the service auditor's report]":      report_date,  # straight quote
         "[Date of report]":                      report_date,
-        "[Ernst & Young Hua Ming LLP]":          EY_FIRM_NAME,
+        # AR signature: the bracketed alternative firm name is dropped — the
+        # "<firm> <city> Branch" line above it is kept (city adjusted below).
+        "[Ernst & Young Hua Ming LLP]":          "",
         # City: replace the whole "default_city[alternatives]" pattern
         "Shanghai[Beijing, Shenzhen]":           signing_city,
         "[Beijing, Shenzhen]":                   signing_city,
         "[Subservice organization name]":        sso_name,
         "[identify the function or service provided by the subservice organization]": sso_services,
         "[V]":                                   "V",
-        # CN placeholders
-        "\u300e\u670d\u52a1\u673a\u6784\u540d\u79f0\u300f": company_name,   # 【服务机构名称】
-        "\u300e\u670d\u52a1\u673a\u6784\u7b80\u79f0\u300f": co_short_name,  # 【服务机构简称】
-        "\u300e\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u300f": system_name,  # 【服务机构体系名称】
-        "\u300e\u65e5\u671f\u300f": single_date,   # 【日期】
-        "\u300e\u62a5\u544a\u65e5\u300f": report_date,  # 【报告日】
+        # CN placeholders — templates use fullwidth lenticular brackets
+        # 【】 (U+3010/U+3011)
+        "\u3010\u670d\u52a1\u673a\u6784\u540d\u79f0\u3011": company_name,   # 【服务机构名称】
+        "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
+        "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
+        "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        "\u3010\u65e5\u671f\u3011": single_date,   # 【日期】
+        "\u3010\u62a5\u544a\u65e5\u3011": report_date,  # 【报告日】
         # City CN: replace the default+alternatives pattern
         "\u4e2d\u56fd \u4e0a\u6d77\u3010\u6216\u4e2d\u56fd \u5317\u4eac\u6216\u4e2d\u56fd \u6df1\u5733\u3011": f"\u4e2d\u56fd {signing_city}",  # 中国 上海【或中国 北京或中国 深圳】→ 中国 {city}
         "\u3010\u6216\u5b89\u6c38\u534e\u660e\u4f1a\u8ba1\u5e08\u4e8b\u52a1\u6240\uff08\u7279\u6b8a\u666e\u901a\u5408\u4f19\uff09\u3011": "",  # 【或安永华明...】→ empty (keep branch)
     }
+    # AR signature branch line: adjust "… Shanghai Branch" / "…上海分所" to the
+    # signing city. Skipped when the city IS Shanghai — substituting a value
+    # identical to its placeholder would loop forever in the cross-run pass.
+    if signing_city and signing_city not in ("Shanghai", "上海"):
+        subs["Ernst & Young Hua Ming LLP Shanghai Branch"] = (
+            f"{EY_FIRM_NAME} {signing_city} Branch"
+        )
+        subs["安永华明会计师事务所（特殊普通合伙）上海分所"] = (
+            f"安永华明会计师事务所（特殊普通合伙）{signing_city}分所"
+        )
+    # Trust Service Criteria — fill the bracketed "Relevant to [Security, …]"
+    # placeholder from the user's TSC selection (SOC2). Only the BRACKETED
+    # variants are substituted; the unbracketed official criteria title
+    # ("…Trust Services Criteria for Security, Availability, …") must stay.
+    _TSC_DEFS = [
+        ("is_Security",             "Security",             "安全性"),
+        ("is_Availability",         "Availability",         "可用性"),
+        ("is_Processing_Integrity", "Processing Integrity", "进程完整性"),
+        ("is_Confidentiality",      "Confidentiality",      "保密性"),
+        ("is_Privacy",              "Privacy",              "隐私性"),
+    ]
+    tsc_en = [en for key, en, _cn in _TSC_DEFS if ui.get(key)]
+    tsc_cn = [cn for key, _en, cn in _TSC_DEFS if ui.get(key)]
+    if tsc_en:
+        if len(tsc_en) == 1:
+            tsc_en_str = tsc_en[0]
+        elif len(tsc_en) == 2:
+            tsc_en_str = f"{tsc_en[0]} and {tsc_en[1]}"
+        else:
+            tsc_en_str = ", ".join(tsc_en[:-1]) + f", and {tsc_en[-1]}"
+        if len(tsc_cn) == 1:
+            tsc_cn_str = tsc_cn[0]
+        else:
+            tsc_cn_str = "、".join(tsc_cn[:-1]) + f"以及{tsc_cn[-1]}"
+        tsc_en_lower = tsc_en_str.lower()
+        # EN templates use both Oxford-comma and non-Oxford variants, plus a
+        # second LOWERCASE occurrence ("…trust services criteria relevant to
+        # [security, …]") with its own wording variants.
+        subs["[Security, Availability, Processing Integrity, Confidentiality, and Privacy]"] = tsc_en_str
+        subs["[Security, Availability, Processing Integrity, Confidentiality and Privacy]"]  = tsc_en_str
+        subs["[security, availability, processing integrity, confidentiality, and privacy]"] = tsc_en_lower
+        subs["[security, availability, processing integrity, confidentiality, privacy]"]     = tsc_en_lower
+        subs["[security, availability, processing integrity and confidentiality, privacy]"]  = tsc_en_lower
+        # CN templates: 以及 / 及 variants plus one with a 进程性、完整性 typo
+        subs["【安全性、可用性、进程完整性、保密性以及隐私性】"]   = tsc_cn_str
+        subs["【安全性、可用性、进程完整性、保密性及隐私性】"]     = tsc_cn_str
+        subs["【安全性、可用性、进程性、完整性、保密性以及隐私性】"] = tsc_cn_str
     # When transaction-processing wording is excluded, remove the inline
     # transaction phrases and substitute "[or identification of the function
     # performed by the System]" with the user-supplied system function description.
@@ -1173,6 +1300,7 @@ def build_flags(tc):
         "has_transaction_processing": tc.get("has_transaction_processing", True),
         "single_user_entity":         tc.get("single_user_entity", False),
         "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
+        "has_other_information":      tc.get("has_other_information", True),
         "addressee_choice":           tc.get("addressee_choice", "Management"),
     }
 
@@ -1703,6 +1831,12 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                     key="cr_ai_scope",
                     help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
                 )
+                has_other_information = st.checkbox(
+                    "Report includes 'Other Information' section",
+                    value=True,
+                    key="cr_other_info",
+                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
+                )
 
             # SSO CC — only shown when SSO != None
             if _cur_sso != "None":
@@ -1770,6 +1904,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "Output_language":       _cur_lang,
                             "Subservice_org":        _t_sso_name or "None",
                             "Systems_function":      _t_sys_fn or "",
+                            # TSC checkboxes live lower in the form; read their
+                            # persisted widget state from the previous rerun.
+                            "is_Security":             st.session_state.get("form_tsc_security", False),
+                            "is_Availability":         st.session_state.get("form_tsc_availability", False),
+                            "is_Processing_Integrity": st.session_state.get("form_tsc_processing", False),
+                            "is_Confidentiality":      st.session_state.get("form_tsc_confidentiality", False),
+                            "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
                         }
                         _test_tc = {
                             "report_date":                report_date  or "January 1, 2025",
@@ -1779,6 +1920,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                             "has_transaction_processing": has_transaction_processing,
                             "single_user_entity":         single_user_entity,
                             "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                            "has_other_information":      has_other_information,
                             "addressee_choice":           addressee_choice,
                         }
                         try:
@@ -1787,7 +1929,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
                                 _t_flags = build_flags(_test_tc)
                                 _t_ma    = fill_and_process_template(_ma_path, _t_subs, _t_flags, _cur_lang)
                                 _t_ar    = fill_and_process_template(_ar_path, _t_subs, _t_flags, _cur_lang)
-                                _t_merged = merge_docx_sections(_t_ma, _t_ar)
+                                _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
                             _t_fname = (
                                 f"{(_t_short or 'Test')}_{_cur_rt.replace(' ','_')}"
                                 f"_MA_AR_test.docx"
@@ -1810,6 +1952,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         has_transaction_processing = True
         single_user_entity         = False
         has_ai_scope_exclusion     = False
+        has_other_information      = True
         addressee_choice           = "Management"
         _ar_path                   = None
         _ma_path                   = None
@@ -1881,11 +2024,11 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     st.subheader("Trust Service Criteria (SOC2 only)")
     tsc_cols = st.columns(5)
-    is_security              = tsc_cols[0].checkbox("Security")
-    is_availability          = tsc_cols[1].checkbox("Availability")
-    is_processing_integrity  = tsc_cols[2].checkbox("Processing Integrity")
-    is_confidentiality       = tsc_cols[3].checkbox("Confidentiality")
-    is_privacy               = tsc_cols[4].checkbox("Privacy")
+    is_security              = tsc_cols[0].checkbox("Security",             key="form_tsc_security")
+    is_availability          = tsc_cols[1].checkbox("Availability",         key="form_tsc_availability")
+    is_processing_integrity  = tsc_cols[2].checkbox("Processing Integrity", key="form_tsc_processing")
+    is_confidentiality       = tsc_cols[3].checkbox("Confidentiality",      key="form_tsc_confidentiality")
+    is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
 
     st.markdown("---")
     run_main = st.button("▶ Run Step 1 — MAIN Workflow", type="primary", use_container_width=True)
@@ -1974,6 +2117,11 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "Subservice_org": subservice_org,
             "Scope_of_the_report": scope_of_report,
             "Co_website": co_website,
+            "is_Security":             is_security,
+            "is_Availability":         is_availability,
+            "is_Processing_Integrity": is_processing_integrity,
+            "is_Confidentiality":      is_confidentiality,
+            "is_Privacy":              is_privacy,
         }
 
         # Store template config for download step
@@ -1987,6 +2135,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "has_transaction_processing": has_transaction_processing,
             "single_user_entity":         single_user_entity,
             "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+            "has_other_information":      has_other_information,
             "addressee_choice":           addressee_choice,
             "ar_template_path":           _ar_path_final,
             "ma_template_path":           _ma_path_final,
@@ -1995,11 +2144,6 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         inputs_main = {
             **st.session_state["user_inputs"],
             "File_input": file_ids,
-            "is_Security":             is_security,
-            "is_Availability":         is_availability,
-            "is_Processing_Integrity": is_processing_integrity,
-            "is_Confidentiality":      is_confidentiality,
-            "is_Privacy":              is_privacy,
         }
 
         status = st.empty()
@@ -2200,20 +2344,22 @@ if final_done:
             with st.spinner("Generating AR section (Section II)…"):
                 ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
             with st.spinner("Merging all sections…"):
-                final_bytes = merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                final_bytes = enforce_line_spacing(
+                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                )
             filename = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
             )
         except Exception as exc:
             st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
-            final_bytes = dify_bytes
+            final_bytes = enforce_line_spacing(dify_bytes)
             filename = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
             )
     else:
-        final_bytes = dify_bytes
+        final_bytes = enforce_line_spacing(dify_bytes)
         filename = (
             f"{ui.get('Co_short_name', 'Report')}_"
             f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
