@@ -51,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename", "auto_run"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -2276,7 +2276,9 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
     is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
 
     st.markdown("---")
-    run_main = st.button("▶ Run Step 1 — MAIN Workflow", type="primary", use_container_width=True)
+    run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
+    if run_main:
+        st.session_state["auto_run"] = True
 
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
@@ -2513,11 +2515,7 @@ if main_done:
 # ══════════════════════════════════════════════════════════════════════════════
 if main_done:
     with st.expander("🏛 Step 2 — SUB1: Entity Level Controls", expanded=not sub1_done):
-        st.write("SUB1 generates the Entity-Level Controls section using MAIN's outputs.")
-
-        run_sub1 = st.button("▶ Run Step 2 — SUB1 Workflow", type="primary", use_container_width=True)
-
-        if run_sub1:
+        if st.session_state.get("auto_run") and not sub1_done:
             if not key_sub1:
                 st.error("SUB1 API key is required (set in sidebar).")
                 st.stop()
@@ -2586,11 +2584,7 @@ if main_done:
 # ══════════════════════════════════════════════════════════════════════════════
 if sub1_done:
     with st.expander("📄 Step 3 — SUB2: Final Report Assembly", expanded=not final_done):
-        st.write("SUB2 assembles the complete SOC report from all previous outputs.")
-
-        run_sub2 = st.button("▶ Run Step 3 — SUB2 Workflow", type="primary", use_container_width=True)
-
-        if run_sub2:
+        if st.session_state.get("auto_run") and not final_done:
             if not key_sub2:
                 st.error("SUB2 API key is required (set in sidebar).")
                 st.stop()
@@ -2644,6 +2638,7 @@ if sub1_done:
                 st.stop()
 
             st.session_state["final_result"] = result
+            st.session_state.pop("auto_run", None)
             st.success("✅ Step 3 complete — Report generated successfully!")
             st.rerun()
 
@@ -2676,7 +2671,7 @@ if final_done:
 
             _lang = ui.get("Output_language", "English")
             try:
-                with st.spinner("Generating MA & AR section (Section I & II)…"):
+                with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
                     ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
                     ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
                     _built = enforce_line_spacing(
