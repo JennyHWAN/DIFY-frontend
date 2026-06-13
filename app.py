@@ -51,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -2612,42 +2612,51 @@ if final_done:
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    # Always generate the Dify sections docx
-    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+    # Build the final .docx once per result — cache in session state so that
+    # clicking the download button (which triggers a Streamlit rerun) does not
+    # re-run the spinners while the file is already downloading.
+    if "final_bytes" not in st.session_state:
+        dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
 
-    if (tc.get("generate_complete")
-            and tc.get("ar_template_path")
-            and tc.get("ma_template_path")):
-        subs  = build_substitutions(ui, tc)
-        flags = build_flags(tc)
+        if (tc.get("generate_complete")
+                and tc.get("ar_template_path")
+                and tc.get("ma_template_path")):
+            subs  = build_substitutions(ui, tc)
+            flags = build_flags(tc)
 
-        _lang = ui.get("Output_language", "English")
-        try:
-            with st.spinner("Generating MA section (Section I)…"):
-                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-            with st.spinner("Generating AR section (Section II)…"):
-                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-            with st.spinner("Merging all sections…"):
-                final_bytes = enforce_line_spacing(
-                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+            _lang = ui.get("Output_language", "English")
+            try:
+                with st.spinner("Generating MA section (Section I)…"):
+                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+                with st.spinner("Generating AR section (Section II)…"):
+                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+                with st.spinner("Merging all sections…"):
+                    _built = enforce_line_spacing(
+                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                    )
+                _fname = (
+                    f"{ui.get('Co_short_name', 'Report')}_"
+                    f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
                 )
-            filename = (
-                f"{ui.get('Co_short_name', 'Report')}_"
-                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
-            )
-        except Exception as exc:
-            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
-            final_bytes = enforce_line_spacing(dify_bytes)
-            filename = (
+            except Exception as exc:
+                st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+                _built = enforce_line_spacing(dify_bytes)
+                _fname = (
+                    f"{ui.get('Co_short_name', 'Report')}_"
+                    f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+                )
+        else:
+            _built = enforce_line_spacing(dify_bytes)
+            _fname = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
             )
-    else:
-        final_bytes = enforce_line_spacing(dify_bytes)
-        filename = (
-            f"{ui.get('Co_short_name', 'Report')}_"
-            f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-        )
+
+        st.session_state["final_bytes"]    = _built
+        st.session_state["final_filename"] = _fname
+
+    final_bytes = st.session_state["final_bytes"]
+    filename    = st.session_state["final_filename"]
 
     st.download_button(
         label="⬇ Download Report (.docx)",
