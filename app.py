@@ -2676,11 +2676,12 @@ if final_done:
 
             _lang = ui.get("Output_language", "English")
             try:
-                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-                _built = enforce_line_spacing(
-                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
-                )
+                with st.spinner("Generating MA & AR section (Section I & II)…"):
+                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+                    _built = enforce_line_spacing(
+                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                    )
                 _fname = (
                     f"{ui.get('Co_short_name', 'Report')}_"
                     f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
