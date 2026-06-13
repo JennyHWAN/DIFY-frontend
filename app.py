@@ -1834,6 +1834,54 @@ def _add_heading(doc, text, level):
     blank.paragraph_format.space_before = Pt(0)
 
 
+def _pin_list_numpr(para, doc, left_twips=720, hanging_twips=360):
+    """Copy numPr from the paragraph's List Bullet/List Number style onto the
+    paragraph itself, and set explicit indent to match the MA template
+    (left=1.27 cm, hanging=0.635 cm).
+
+    python-docx stores numPr only in the style definition, not per-paragraph.
+    When merged into the EY template docx (which lacks those styles) the bullet
+    or number disappears. Inlining numPr makes it survive the merge, and the
+    remap/inject machinery in merge_docx_sections will fix the numId so it
+    references the injected numbering definitions correctly.
+    """
+    style_name = para.style.name if para.style else None
+    if style_name not in ("List Bullet", "List Number"):
+        return
+    style = doc.styles[style_name]
+    sPPr = style.element.pPr
+    if sPPr is None:
+        return
+    sNumPr = sPPr.find(qn("w:numPr"))
+    if sNumPr is None:
+        return
+    sNumId = sNumPr.find(qn("w:numId"))
+    sIlvl  = sNumPr.find(qn("w:ilvl"))
+    numId_val = sNumId.get(qn("w:val")) if sNumId is not None else None
+    if not numId_val:
+        return
+    ilvl_val = (sIlvl.get(qn("w:val")) if sIlvl is not None else None) or "0"
+
+    pPr = para._p.get_or_add_pPr()
+    existing = pPr.find(qn("w:numPr"))
+    if existing is not None:
+        pPr.remove(existing)
+    numPr = OxmlElement("w:numPr")
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), ilvl_val)
+    numId_el = OxmlElement("w:numId")
+    numId_el.set(qn("w:val"), numId_val)
+    numPr.append(ilvl_el)
+    numPr.append(numId_el)
+    pPr.append(numPr)
+
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        ind = OxmlElement("w:ind")
+        pPr.append(ind)
+    ind.set(qn("w:left"),    str(left_twips))
+    ind.set(qn("w:hanging"), str(hanging_twips))
+
 
 def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     doc = Document()
@@ -1898,12 +1946,14 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, line[2:].strip())
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _pin_list_numpr(p, doc)
             last_was_blank = False
 
         elif re.match(r"^[•·]\s+", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _pin_list_numpr(p, doc)
             last_was_blank = False
 
         elif re.match(r"^\d+\. ", line):
@@ -1946,6 +1996,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                     p = doc.add_paragraph(style="List Number")
                     _inline_bullet(p, rest)
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    _pin_list_numpr(p, doc)
             last_was_blank = False
             continue  # i already advanced past the block
 
@@ -2233,8 +2284,7 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "🧪 Generate MA + AR only (templates, no Dify)",
             use_container_width=True,
             help="Fills the Section I + II templates using the fields above without "
-                 "running the Dify workflow. Blank fields fall back to placeholder "
-                 "test values.",
+                 "running the Dify workflow.",
         )
         if run_ma_ar_only:
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
@@ -2626,14 +2676,11 @@ if final_done:
 
             _lang = ui.get("Output_language", "English")
             try:
-                with st.spinner("Generating MA section (Section I)…"):
-                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-                with st.spinner("Generating AR section (Section II)…"):
-                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-                with st.spinner("Merging all sections…"):
-                    _built = enforce_line_spacing(
-                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
-                    )
+                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+                _built = enforce_line_spacing(
+                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                )
                 _fname = (
                     f"{ui.get('Co_short_name', 'Report')}_"
                     f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
