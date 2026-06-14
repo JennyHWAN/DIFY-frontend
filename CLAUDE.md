@@ -68,4 +68,5 @@ The sidebar **Reset** button clears all four session state keys: `main_outputs`,
 | `Report_type` | `"SOC1 TYPE1"`, `"SOC1 TYPE2"`, `"SOC2 TYPE1"`, `"SOC2 TYPE2"` |
 | `Output_language` | `"English"`, `"中文"`, `"Both"` |
 | `is_Security`, `is_Availability`, `is_Processing_Integrity`, `is_Confidentiality`, `is_Privacy` | Boolean TSC flags (SOC2 only; sent for all report types but only used by Dify when applicable) |
+| `is_CUEC`, `is_UER` | Booleans — include the Complementary User Entity Controls / User Entity Responsibilities sections. Checkbox defaults: CUEC on for SOC1, UER on for SOC2. Declared on MAIN but actually consumed by SUB2 (the frontend re-sends them in `inputs_sub2`). |
 | `Company_name`, `Co_short_name`, `Industry`, `System_or_service_name`, … | Company/service metadata fields |

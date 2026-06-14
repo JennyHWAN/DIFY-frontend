@@ -2287,6 +2287,22 @@ if not final_done:
     is_confidentiality       = tsc_cols[3].checkbox("Confidentiality",      key="form_tsc_confidentiality")
     is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
 
+    st.subheader("User Entity Section")
+    # Defaults follow the report type: CUEC for SOC1, UER for SOC2. The report_type
+    # is baked into the widget key so the default re-applies when the report type
+    # changes, while still letting the user override within a given type.
+    ue_cols = st.columns(2)
+    is_cuec = ue_cols[0].checkbox(
+        "Include Complementary User Entity Controls (CUEC)",
+        value=report_type.startswith("SOC1"),
+        key=f"form_is_cuec_{report_type}",
+        help="Default on for SOC1 reports. Generated from the control matrix.")
+    is_uer = ue_cols[1].checkbox(
+        "Include User Entity Responsibilities (UER)",
+        value=report_type.startswith("SOC2"),
+        key=f"form_is_uer_{report_type}",
+        help="Default on for SOC2 reports. Generated from the control matrix.")
+
     st.markdown("---")
     run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
 
@@ -2468,6 +2484,8 @@ if not final_done:
             "is_Processing_Integrity": is_processing_integrity,
             "is_Confidentiality":      is_confidentiality,
             "is_Privacy":              is_privacy,
+            "is_CUEC":                 is_cuec,
+            "is_UER":                  is_uer,
         }
 
         # Store template config for download step
@@ -2594,6 +2612,8 @@ if not final_done:
                 "Co_short_name":          to_str(so.get("Co_short_name") or ui.get("Co_short_name")),
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
                 "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
+                "is_CUEC":                bool(ui.get("is_CUEC", False)),
+                "is_UER":                 bool(ui.get("is_UER", False)),
             }
             try:
                 outputs_sub2 = run_workflow(inputs_sub2, api_base, key_sub2, node_status)
@@ -2627,6 +2647,71 @@ if final_done:
 
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
+
+    # ── Inputs used — kept visible so the user can review what produced this
+    #    report. The input form itself is hidden once final_done is True, so this
+    #    read-only summary is the only place the chosen values survive.
+    with st.expander("📋 Inputs used for this report", expanded=False):
+        _flag = lambda v: "✓" if v else "—"
+        _g = lambda k, d="": ui.get(k, d)
+
+        st.markdown("**Report parameters**")
+        st.markdown(
+            f"- Report type: `{_g('Report_type')}`\n"
+            f"- Output language: `{_g('Output_language')}`\n"
+            f"- Scope of report (SSO): `{_g('Scope_of_the_report')}`\n"
+            f"- Period: `{_g('Period_start')}` → `{_g('Period_end')}`"
+        )
+
+        st.markdown("**Company / service**")
+        st.markdown(
+            f"- Company name: {_g('Company_name') or '—'}\n"
+            f"- Short name: {_g('Co_short_name') or '—'}\n"
+            f"- Industry: {_g('Industry') or '—'}\n"
+            f"- System / service: {_g('System_or_service_name') or '—'}\n"
+            f"- Service description: {_g('Service_description') or '—'}\n"
+            f"- System (extra): {_g('System') or '—'}\n"
+            f"- Systems function: {_g('Systems_function') or '—'}\n"
+            f"- Domain: {_g('Domain') or '—'}\n"
+            f"- Subservice org: {_g('Subservice_org') or '—'}\n"
+            f"- Website: {_g('Co_website') or '—'}"
+        )
+
+        st.markdown("**Trust Service Criteria (SOC2)**")
+        st.markdown(
+            f"- Security {_flag(_g('is_Security'))} · "
+            f"Availability {_flag(_g('is_Availability'))} · "
+            f"Processing Integrity {_flag(_g('is_Processing_Integrity'))} · "
+            f"Confidentiality {_flag(_g('is_Confidentiality'))} · "
+            f"Privacy {_flag(_g('is_Privacy'))}"
+        )
+
+        st.markdown("**User Entity sections**")
+        st.markdown(
+            f"- CUEC (Complementary User Entity Controls): {_flag(_g('is_CUEC'))}\n"
+            f"- UER (User Entity Responsibilities): {_flag(_g('is_UER'))}"
+        )
+
+        if tc.get("generate_complete"):
+            st.markdown("**Complete-report (MA + AR) settings**")
+            st.markdown(
+                f"- Standard: `{tc.get('standard') or '—'}`\n"
+                f"- Report signing date: {tc.get('report_date') or '—'}\n"
+                f"- Signing city: {tc.get('signing_city') or '—'}\n"
+                f"- AR addressee: {tc.get('addressee_choice') or '—'}\n"
+                f"- CUEC identified: {_flag(tc.get('cuec_identified'))}\n"
+                f"- SSO complementary controls identified: {_flag(tc.get('sso_cc_identified'))}\n"
+                f"- Transaction processing wording: {_flag(tc.get('has_transaction_processing'))}\n"
+                f"- Single user entity: {_flag(tc.get('single_user_entity'))}\n"
+                f"- AI scope exclusion: {_flag(tc.get('has_ai_scope_exclusion'))}\n"
+                f"- Other Information section: {_flag(tc.get('has_other_information'))}"
+            )
+            _mp = tc.get("ma_template_path")
+            _ap = tc.get("ar_template_path")
+            st.markdown(
+                f"- MA template: `{os.path.basename(_mp) if _mp else '—'}`\n"
+                f"- AR template: `{os.path.basename(_ap) if _ap else '—'}`"
+            )
 
     # Build the final .docx once per result — cache in session state so that
     # clicking the download button (which triggers a Streamlit rerun) does not
