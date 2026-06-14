@@ -2479,9 +2479,9 @@ if not final_done:
             "File_input": file_ids,
         }
 
-        with st.spinner(""):
-            step_label  = st.empty()
-            node_status = st.empty()
+        step_label  = st.empty()
+        node_status = st.empty()
+        if True:
             # ── Step 1 ────────────────────────────────────────────────────────
             step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
             try:
