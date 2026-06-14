@@ -1610,8 +1610,6 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             if data.get("status") == "failed":
                 raise RuntimeError(f"Workflow failed: {data.get('error', 'unknown error')}")
             outputs = data.get("outputs", {})
-            if status_placeholder:
-                status_placeholder.empty()
             break
 
         elif event_type == "error":
@@ -2481,9 +2479,9 @@ if not final_done:
             "File_input": file_ids,
         }
 
-        node_status = st.empty()
-        step_label  = st.empty()
         with st.spinner(""):
+            step_label  = st.empty()
+            node_status = st.empty()
             # ── Step 1 ────────────────────────────────────────────────────────
             step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
             try:
