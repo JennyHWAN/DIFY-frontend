@@ -51,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename", "auto_run"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -64,18 +64,19 @@ s1 = "✅" if main_done  else "🔵"
 s2 = "✅" if sub1_done  else ("🟡" if main_done  else "⚪")
 s3 = "✅" if final_done else ("🟡" if sub1_done  else "⚪")
 
-st.markdown(
-    f"""
-    <div style='display:flex;gap:2rem;padding:0.5rem 0 1.2rem 0;font-size:1rem'>
-        <span>{s1} <b>Step 1</b> — MAIN: Extract &amp; Prepare</span>
-        <span>→</span>
-        <span>{s2} <b>Step 2</b> — SUB1: Entity Level</span>
-        <span>→</span>
-        <span>{s3} <b>Step 3</b> — SUB2: Final Report</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def _status_html(a, b, c):
+    return (
+        "<div style='display:flex;gap:2rem;padding:0.5rem 0 1.2rem 0;font-size:1rem'>"
+        f"<span>{a} <b>Step 1</b> — MAIN: Extract &amp; Prepare</span>"
+        "<span>→</span>"
+        f"<span>{b} <b>Step 2</b> — SUB1: Entity Level</span>"
+        "<span>→</span>"
+        f"<span>{c} <b>Step 3</b> — SUB2: Final Report</span>"
+        "</div>"
+    )
+
+status_bar = st.empty()
+status_bar.markdown(_status_html(s1, s2, s3), unsafe_allow_html=True)
 
 # ── Template helpers ───────────────────────────────────────────────────────────
 
@@ -2070,9 +2071,9 @@ def _inline_bullet(paragraph, text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — User inputs + MAIN workflow
+# STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
-with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=not main_done):
+if not final_done:
 
     # ── Complete report option ─────────────────────────────────────────────────
     generate_complete = st.checkbox(
@@ -2277,8 +2278,6 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
 
     st.markdown("---")
     run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
-    if run_main:
-        st.session_state["auto_run"] = True
 
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
@@ -2482,49 +2481,33 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "File_input": file_ids,
         }
 
-        status = st.empty()
-        with st.spinner("Running MAIN workflow — this may take several minutes…"):
+        node_status = st.empty()
+        step_label  = st.empty()
+        with st.spinner(""):
+            # ── Step 1 ────────────────────────────────────────────────────────
+            step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
             try:
-                outputs = run_workflow(inputs_main, api_base, key_main, status)
+                outputs_main = run_workflow(inputs_main, api_base, key_main, node_status)
             except requests.HTTPError as e:
                 st.error(f"MAIN workflow error: {e.response.status_code} — {e.response.text}")
                 st.stop()
             except Exception as e:
                 st.error(f"MAIN workflow error: {e}")
                 st.stop()
+            if outputs_main.get("Error") or outputs_main.get("Error_ORG"):
+                st.error(f"MAIN workflow returned an error:\n{outputs_main.get('Error') or outputs_main.get('Error_ORG')}")
+                st.stop()
+            st.session_state["main_outputs"] = outputs_main
+            status_bar.markdown(_status_html("✅", "🟡", "⚪"), unsafe_allow_html=True)
 
-        if outputs.get("Error") or outputs.get("Error_ORG"):
-            st.error(f"MAIN workflow returned an error:\n{outputs.get('Error') or outputs.get('Error_ORG')}")
-            st.stop()
-
-        st.session_state["main_outputs"] = outputs
-        st.success("✅ Step 1 complete — MAIN workflow finished.")
-        st.rerun()
-
-if main_done:
-    with st.expander("🔍 MAIN Workflow Outputs (preview)", expanded=False):
-        mo = st.session_state["main_outputs"]
-        for k, v in mo.items():
-            if v:
-                st.markdown(f"**{k}**")
-                st.text(str(v)[:500] + ("…" if len(str(v)) > 500 else ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — SUB1: Entity Level
-# ══════════════════════════════════════════════════════════════════════════════
-if main_done:
-    with st.expander("🏛 Step 2 — SUB1: Entity Level Controls", expanded=not sub1_done):
-        if st.session_state.get("auto_run") and not sub1_done:
+            # ── Step 2 ────────────────────────────────────────────────────────
             if not key_sub1:
                 st.error("SUB1 API key is required (set in sidebar).")
                 st.stop()
-
-            mo = st.session_state["main_outputs"]
-            ui = st.session_state.get("user_inputs", {})
-
+            step_label.info("⏳ Step 2 — Running SUB1 workflow — this may take several minutes…")
+            mo = outputs_main
+            ui = st.session_state["user_inputs"]
             inputs_sub1 = {
-                # Sections from MAIN
                 "overview_section":               to_str(mo.get("overview_section")),
                 "principals_section":             to_str(mo.get("principals_section")),
                 "scope_section":                  to_str(mo.get("scope_section")),
@@ -2544,7 +2527,6 @@ if main_done:
                 "entity_control_objective":       to_str(mo.get("entity_control_objective")),
                 "entity_domain_packs_direct":     to_str(mo.get("entity_domain_packs_direct")),
                 "rag_context":                    to_str(mo.get("rag_context")),
-                # User inputs passed through
                 "Report_type":            ui.get("Report_type", ""),
                 "Output_language":        ui.get("Output_language", ""),
                 "Company_name":           ui.get("Company_name", ""),
@@ -2557,44 +2539,26 @@ if main_done:
                 "Period_start":           ui.get("Period_start", ""),
                 "Period_end":             ui.get("Period_end", ""),
             }
+            try:
+                outputs_sub1 = run_workflow(inputs_sub1, api_base, key_sub1, node_status)
+            except requests.HTTPError as e:
+                st.error(f"SUB1 workflow error: {e.response.status_code} — {e.response.text}")
+                st.stop()
+            except Exception as e:
+                st.error(f"SUB1 workflow error: {e}")
+                st.stop()
+            st.session_state["sub1_outputs"] = outputs_sub1
+            status_bar.markdown(_status_html("✅", "✅", "🟡"), unsafe_allow_html=True)
 
-            status = st.empty()
-            with st.spinner("Running SUB1 workflow — this may take several minutes…"):
-                try:
-                    outputs = run_workflow(inputs_sub1, api_base, key_sub1, status)
-                except requests.HTTPError as e:
-                    st.error(f"SUB1 workflow error: {e.response.status_code} — {e.response.text}")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"SUB1 workflow error: {e}")
-                    st.stop()
-
-            st.session_state["sub1_outputs"] = outputs
-            st.success("✅ Step 2 complete — SUB1 workflow finished.")
-            st.rerun()
-
-    if sub1_done:
-        with st.expander("🔍 SUB1 Outputs (entity_level_section preview)", expanded=False):
-            entity_sec = st.session_state["sub1_outputs"].get("entity_level_section", "")
-            st.text(entity_sec[:1000] + ("…" if len(entity_sec) > 1000 else ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — SUB2: Final Report
-# ══════════════════════════════════════════════════════════════════════════════
-if sub1_done:
-    with st.expander("📄 Step 3 — SUB2: Final Report Assembly", expanded=not final_done):
-        if st.session_state.get("auto_run") and not final_done:
+            # ── Step 3 ────────────────────────────────────────────────────────
             if not key_sub2:
                 st.error("SUB2 API key is required (set in sidebar).")
                 st.stop()
-
-            so = st.session_state["sub1_outputs"]
-            mo = st.session_state["main_outputs"]
+            step_label.info("⏳ Step 3 — Running SUB2 workflow — this may take several minutes…")
+            so = outputs_sub1
+            mo = outputs_main
             ui = st.session_state.get("user_inputs", {})
-
             inputs_sub2 = {
-                # All outputs from SUB1 (passthrough + entity_level_section)
                 "overview_section":               to_str(so.get("overview_section")),
                 "principals_section":             to_str(so.get("principals_section")),
                 "scope_section":                  to_str(so.get("scope_section")),
@@ -2620,27 +2584,23 @@ if sub1_done:
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
                 "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
             }
-
-            status = st.empty()
-            with st.spinner("Running SUB2 workflow — this may take several minutes…"):
-                try:
-                    outputs = run_workflow(inputs_sub2, api_base, key_sub2, status)
-                except requests.HTTPError as e:
-                    st.error(f"SUB2 workflow error: {e.response.status_code} — {e.response.text}")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"SUB2 workflow error: {e}")
-                    st.stop()
-
-            result = outputs.get("Result", "")
+            try:
+                outputs_sub2 = run_workflow(inputs_sub2, api_base, key_sub2, node_status)
+            except requests.HTTPError as e:
+                st.error(f"SUB2 workflow error: {e.response.status_code} — {e.response.text}")
+                st.stop()
+            except Exception as e:
+                st.error(f"SUB2 workflow error: {e}")
+                st.stop()
+            result = outputs_sub2.get("Result", "")
             if not result:
                 st.warning("SUB2 completed but returned no output.")
                 st.stop()
-
             st.session_state["final_result"] = result
-            st.session_state.pop("auto_run", None)
-            st.success("✅ Step 3 complete — Report generated successfully!")
-            st.rerun()
+
+        status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
+        st.rerun()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
