@@ -1603,21 +1603,14 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
                 status_placeholder.markdown(
                     "<style>"
                     "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
-                    "@keyframes _nd_bar{0%{left:-40%}60%{left:100%}100%{left:100%}}"
                     "._nd_s{display:inline-block;width:13px;height:13px;"
                     "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
                     "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
                     "vertical-align:middle;margin-right:6px}"
-                    "._nd_track{position:relative;height:4px;border-radius:2px;"
-                    "background:rgba(180,180,180,0.2);overflow:hidden;margin-top:6px}"
-                    "._nd_fill{position:absolute;top:0;height:100%;width:40%;"
-                    "background:#aaa;border-radius:2px;"
-                    "animation:_nd_bar 1.6s ease-in-out infinite}"
                     "</style>"
                     f'<div style="font-size:0.95em;padding:3px 0">'
                     f'<span class="_nd_s"></span>'
                     f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
-                    '<div class="_nd_track"><div class="_nd_fill"></div></div>'
                     "</div>",
                     unsafe_allow_html=True,
                 )
