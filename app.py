@@ -2292,16 +2292,21 @@ if not final_done:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
+    # Labels are kept short (acronym only) so they stay on a single line within the
+    # half-width column — otherwise the long CUEC label wraps and its help "?" icon
+    # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
-        "Include Complementary User Entity Controls (CUEC)",
+        "Include CUEC",
         value=report_type.startswith("SOC1"),
         key=f"form_is_cuec_{report_type}",
-        help="Default on for SOC1 reports. Generated from the control matrix.")
+        help="Complementary User Entity Controls — default on for SOC1 reports. "
+             "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
-        "Include User Entity Responsibilities (UER)",
+        "Include UER",
         value=report_type.startswith("SOC2"),
         key=f"form_is_uer_{report_type}",
-        help="Default on for SOC2 reports. Generated from the control matrix.")
+        help="User Entity Responsibilities — default on for SOC2 reports. "
+             "Generated from the control matrix.")
 
     st.markdown("---")
     run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
