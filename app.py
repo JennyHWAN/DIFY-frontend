@@ -1600,7 +1600,20 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             # all 19 output fields and can be several hundred KB.
             event = node_data = None
             if status_placeholder:
-                status_placeholder.info(f"⚙️ Nodes completed: {node_count}   (last: {node_title})")
+                status_placeholder.markdown(
+                    "<style>"
+                    "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
+                    "._nd_s{display:inline-block;width:13px;height:13px;"
+                    "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
+                    "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
+                    "vertical-align:middle;margin-right:6px}"
+                    "</style>"
+                    f'<div style="font-size:0.95em;padding:3px 0">'
+                    f'<span class="_nd_s"></span>'
+                    f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
             if node_status == "failed":
                 raise RuntimeError(f"Workflow node failed: {node_error or f'node {node_title!r} (#{node_count})'}")
 
