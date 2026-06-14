@@ -51,7 +51,7 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config"]:
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
             st.session_state.pop(k, None)
         st.rerun()
 
@@ -64,18 +64,19 @@ s1 = "✅" if main_done  else "🔵"
 s2 = "✅" if sub1_done  else ("🟡" if main_done  else "⚪")
 s3 = "✅" if final_done else ("🟡" if sub1_done  else "⚪")
 
-st.markdown(
-    f"""
-    <div style='display:flex;gap:2rem;padding:0.5rem 0 1.2rem 0;font-size:1rem'>
-        <span>{s1} <b>Step 1</b> — MAIN: Extract &amp; Prepare</span>
-        <span>→</span>
-        <span>{s2} <b>Step 2</b> — SUB1: Entity Level</span>
-        <span>→</span>
-        <span>{s3} <b>Step 3</b> — SUB2: Final Report</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+def _status_html(a, b, c):
+    return (
+        "<div style='display:flex;gap:2rem;padding:0.5rem 0 1.2rem 0;font-size:1rem'>"
+        f"<span>{a} <b>Step 1</b> — MAIN: Extract &amp; Prepare</span>"
+        "<span>→</span>"
+        f"<span>{b} <b>Step 2</b> — SUB1: Entity Level</span>"
+        "<span>→</span>"
+        f"<span>{c} <b>Step 3</b> — SUB2: Final Report</span>"
+        "</div>"
+    )
+
+status_bar = st.empty()
+status_bar.markdown(_status_html(s1, s2, s3), unsafe_allow_html=True)
 
 # ── Template helpers ───────────────────────────────────────────────────────────
 
@@ -195,22 +196,34 @@ def _format_date(s, language="English"):
 
 
 def _capitalize_name(s):
-    """Normalise a name typed in ALL lowercase or ALL UPPERCASE to
-    word-initial capitals ('acme tech co., ltd.' / 'ACME TECH CO., LTD.'
-    → 'Acme Tech Co., Ltd.'). Mixed-case input is kept exactly as typed,
-    and names containing CJK characters are never changed."""
+    """Normalise a typed name to word-initial capitals.
+
+    - ALL UPPERCASE input is title-cased ('ACME TECH CO., LTD.'
+      → 'Acme Tech Co., Ltd.').
+    - Otherwise each word starting with a lowercase letter is capitalised,
+      keeping the rest of the word as typed ('fgde information Technology'
+      → 'Fgde Information Technology'). Words with internal capitals
+      ('iPhone') and words already capitalised are left unchanged.
+    - Names containing CJK characters are never changed."""
     if not s:
         return s
     letters = [c for c in s if c.isalpha()]
     if not letters or not all(c.isascii() for c in letters):
         return s
-    if all(c.islower() for c in letters) or all(c.isupper() for c in letters):
+    if all(c.isupper() for c in letters):
         return re.sub(
             r"[A-Za-z][A-Za-z'’]*",
             lambda m: m.group(0)[0].upper() + m.group(0)[1:].lower(),
             s,
         )
-    return s
+
+    def _fix_word(m):
+        w = m.group(0)
+        if w[0].islower() and not any(c.isupper() for c in w[1:]):
+            return w[0].upper() + w[1:]
+        return w
+
+    return re.sub(r"[A-Za-z][A-Za-z'’]*", _fix_word, s)
 
 
 def _kw_in(comment_text, keyword):
@@ -569,6 +582,27 @@ def _smart_replace_in_para(para, old, new):
     return True
 
 
+def _set_outline_level(para, level):
+    """Tag a paragraph with an explicit w:outlineLvl (0 = 1st level) so it
+    shows in Word's navigation pane. Heading-style references alone do not
+    survive the merge into the EY template document (the styles are not
+    defined there), and outlineLvl has no effect on visual formatting."""
+    pPr = para._p.get_or_add_pPr()
+    ol = pPr.find(qn("w:outlineLvl"))
+    if ol is None:
+        ol = OxmlElement("w:outlineLvl")
+        tail = next(
+            (ch for ch in pPr
+             if ch.tag in (qn("w:rPr"), qn("w:sectPr"), qn("w:pPrChange"))),
+            None,
+        )
+        if tail is not None:
+            tail.addprevious(ol)
+        else:
+            pPr.append(ol)
+    ol.set(qn("w:val"), str(level))
+
+
 def fill_and_process_template(template_path, subs, flags, language="English"):
     """
     Process an EY MA/AR docx template:
@@ -771,9 +805,12 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     _BOLD_KEEP_PATTERNS = [
         "Independent Service Auditor",   # AR section title
         "Management Assertion",          # MA section title (after co-name sub)
+        "Management Statements",         # MA title (ISAE 3000/3402 templates)
+        "Report of Its Assertions",      # MA title (SOC3 template)
         "Ernst & Young",                 # AR signature block (firm name)
         "Hua Ming",                      # AR signature block (firm name variant)
         "管理层认定",                     # CN MA section title (after co-name sub)
+        "管理层声明",                     # CN MA title (ISAE 3000/3402 templates)
         "独立服务审计师",                 # CN AR title (…报告 / …鉴证报告)
         "安永华明",                       # CN AR signature block (firm name)
     ]
@@ -783,6 +820,22 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     )
     # Company name used to detect the MA signature line (a short standalone para)
     _company_name_bold = subs.get("[Service organization name]", "")
+
+    # Section titles get an explicit outline level so MA and AR appear as
+    # 1st-level headings in Word's navigation pane (formatting unchanged).
+    _TITLE_PATTERNS = [
+        "Independent Service Auditor",
+        "Management Assertion",
+        "Management Statements",
+        "Report of Its Assertions",
+        "管理层认定",
+        "管理层声明",
+        "独立服务审计师",
+    ]
+
+    def _para_is_title(para):
+        full = "".join(r.text for r in para.runs).strip()
+        return len(full) <= 120 and any(p in full for p in _TITLE_PATTERNS)
 
     def _para_keep_bold(para):
         full = "".join(r.text for r in para.runs).strip()
@@ -851,6 +904,8 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
 
     for para in doc.paragraphs:
         kb = _para_keep_bold(para)
+        if _para_is_title(para):
+            _set_outline_level(para, 0)
         for run in para.runs:
             _std_run(run, keep_bold=kb)
         if not kb:
@@ -1135,7 +1190,18 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
 
     def _walk(paragraphs, tables):
         for para in paragraphs:
-            para.paragraph_format.line_spacing = spacing
+            pf = para.paragraph_format
+            pf.line_spacing = spacing
+            pf.space_before = Pt(0)
+            pf.space_after  = Pt(0)
+            # beforeLines/afterLines and autospacing attributes take precedence
+            # over before/after in Word — strip them so 0 actually applies.
+            sp_el = para._p.pPr.find(qn("w:spacing"))
+            if sp_el is not None:
+                for attr in ("w:beforeLines", "w:afterLines",
+                             "w:beforeAutospacing", "w:afterAutospacing"):
+                    if sp_el.get(qn(attr)) is not None:
+                        del sp_el.attrib[qn(attr)]
         for table in tables:
             for row in table.rows:
                 for cell in row.cells:
@@ -1160,6 +1226,31 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # Uniform 11 pt body text everywhere (Latin + complex script)
+        rPr.sz_val = Pt(11)
+        szCs = rPr.find(qn("w:szCs"))
+        if szCs is None:
+            szCs = OxmlElement("w:szCs")
+            rPr.find(qn("w:sz")).addnext(szCs)
+        szCs.set(qn("w:val"), "22")
+        # EY template styles define Normal as BOLD; the Dify-generated sections
+        # merged into the template document inherit it and render whole-bold.
+        # Pin bold/underline OFF wherever the run does not set them itself, so
+        # explicit bold (titles, **bold** markdown, table headers) and explicit
+        # underline (H3 headings) are preserved.
+        b_el = rPr.find(qn("w:b"))
+        if b_el is None:
+            b_el = OxmlElement("w:b")
+            b_el.set(qn("w:val"), "0")
+            rFonts.addnext(b_el)
+        if rPr.find(qn("w:bCs")) is None:
+            bcs_el = OxmlElement("w:bCs")
+            bcs_el.set(qn("w:val"), "0")
+            b_el.addnext(bcs_el)
+        if rPr.find(qn("w:u")) is None:
+            u_el = OxmlElement("w:u")
+            u_el.set(qn("w:val"), "none")
+            rPr.append(u_el)
 
     # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
     # rendered when the numbering level itself names no font — e.g. the CN AR
@@ -1198,6 +1289,24 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         for theme_attr in ("w:themeColor", "w:themeTint", "w:themeShade"):
             if color.get(qn(theme_attr)) is not None:
                 del color.attrib[qn(theme_attr)]
+        # List number glyphs and empty-paragraph line heights at 11 pt as well
+        rPr.sz_val = Pt(11)
+        mszCs = rPr.find(qn("w:szCs"))
+        if mszCs is None:
+            mszCs = OxmlElement("w:szCs")
+            rPr.find(qn("w:sz")).addnext(mszCs)
+        mszCs.set(qn("w:val"), "22")
+        # Keep list number glyphs non-bold unless the mark sets bold itself
+        # (the bold Normal style would otherwise bleed into them).
+        mb_el = rPr.find(qn("w:b"))
+        if mb_el is None:
+            mb_el = OxmlElement("w:b")
+            mb_el.set(qn("w:val"), "0")
+            rFonts.addnext(mb_el)
+        if rPr.find(qn("w:bCs")) is None:
+            mbcs_el = OxmlElement("w:bCs")
+            mbcs_el.set(qn("w:val"), "0")
+            mb_el.addnext(mbcs_el)
 
     buf = io.BytesIO()
     doc.save(buf)
@@ -1235,7 +1344,8 @@ def build_substitutions(ui, tc):
         system_name   = _capitalize_name(system_name)
     report_type   = ui.get("Report_type", "")
     subservice_org = ui.get("Subservice_org", "")
-    signing_city  = tc.get("signing_city", "")
+    # City typed in lowercase ('shanghai') → 'Shanghai'; CJK ('上海') untouched
+    signing_city  = _capitalize_name(tc.get("signing_city", ""))
 
     # Format raw YYYY-MM-DD dates to "Month D, YYYY" / "YYYY年M月D日"
     period_start = _format_date(ui.get("Period_start", ""), language)
@@ -1490,7 +1600,20 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             # all 19 output fields and can be several hundred KB.
             event = node_data = None
             if status_placeholder:
-                status_placeholder.info(f"⚙️ Nodes completed: {node_count}   (last: {node_title})")
+                status_placeholder.markdown(
+                    "<style>"
+                    "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
+                    "._nd_s{display:inline-block;width:13px;height:13px;"
+                    "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
+                    "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
+                    "vertical-align:middle;margin-right:6px}"
+                    "</style>"
+                    f'<div style="font-size:0.95em;padding:3px 0">'
+                    f'<span class="_nd_s"></span>'
+                    f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
             if node_status == "failed":
                 raise RuntimeError(f"Workflow node failed: {node_error or f'node {node_title!r} (#{node_count})'}")
 
@@ -1500,8 +1623,6 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             if data.get("status") == "failed":
                 raise RuntimeError(f"Workflow failed: {data.get('error', 'unknown error')}")
             outputs = data.get("outputs", {})
-            if status_placeholder:
-                status_placeholder.empty()
             break
 
         elif event_type == "error":
@@ -1583,6 +1704,7 @@ def _add_table_from_md(doc, table_lines):
 
     table = doc.add_table(rows=1 + len(data_rows), cols=num_cols)
     table.style = "Table Grid"
+    _set_table_borders(table)
 
     # Header row — gray background, bold text
     for j, header_text in enumerate(headers):
@@ -1619,6 +1741,7 @@ def _add_numpipe_table(doc, lines, language="English"):
     header_row = list(hdr[:num_cols])
     table = doc.add_table(rows=1 + len(rows), cols=num_cols)
     table.style = "Table Grid"
+    _set_table_borders(table)
     for j, h in enumerate(header_row):
         cell = table.rows[0].cells[j]
         cell.text = ""
@@ -1635,6 +1758,37 @@ def _add_numpipe_table(doc, lines, language="English"):
             _apply_fonts(run)
     _set_col_widths(table, [1.2, 5.0, 9.7])
     _set_repeat_header(table)
+
+
+def _set_table_borders(tbl):
+    """Set explicit solid single borders (outline + inside grid) on a table.
+
+    Generated tables reference the 'Table Grid' style, which is not defined in
+    the EY template document the sections are merged into, so the style-based
+    borders vanish in the complete report. Borders set on the table itself
+    survive the merge."""
+    tblPr = tbl._tbl.tblPr
+    borders = tblPr.find(qn("w:tblBorders"))
+    if borders is None:
+        borders = OxmlElement("w:tblBorders")
+        tail = next(
+            (ch for ch in tblPr if ch.tag in
+             (qn("w:tblLayout"), qn("w:tblCellMar"), qn("w:tblLook"))),
+            None,
+        )
+        if tail is not None:
+            tail.addprevious(borders)
+        else:
+            tblPr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        el = borders.find(qn(f"w:{edge}"))
+        if el is None:
+            el = OxmlElement(f"w:{edge}")
+            borders.append(el)
+        el.set(qn("w:val"),   "single")
+        el.set(qn("w:sz"),    "4")
+        el.set(qn("w:space"), "0")
+        el.set(qn("w:color"), "000000")
 
 
 def _set_col_widths(tbl, widths_cm):
@@ -1666,6 +1820,10 @@ def _add_heading(doc, text, level):
     p = doc.add_paragraph(style=f"Heading {level}")
     p.paragraph_format.space_before = Pt(0)
     p.paragraph_format.space_after  = Pt(0)
+    # Explicit outline level: the "Heading N" style reference is lost when the
+    # section is merged into the EY template document, which empties Word's
+    # navigation pane. outlineLvl keeps the entry without changing formatting.
+    _set_outline_level(p, level - 1)
     run = p.add_run(text)
     _apply_fonts(run)
     run.font.color.rgb = RGBColor(0, 0, 0)
@@ -1687,6 +1845,54 @@ def _add_heading(doc, text, level):
     blank.paragraph_format.space_after  = Pt(0)
     blank.paragraph_format.space_before = Pt(0)
 
+
+def _pin_list_numpr(para, doc, left_twips=720, hanging_twips=360):
+    """Copy numPr from the paragraph's List Bullet/List Number style onto the
+    paragraph itself, and set explicit indent to match the MA template
+    (left=1.27 cm, hanging=0.635 cm).
+
+    python-docx stores numPr only in the style definition, not per-paragraph.
+    When merged into the EY template docx (which lacks those styles) the bullet
+    or number disappears. Inlining numPr makes it survive the merge, and the
+    remap/inject machinery in merge_docx_sections will fix the numId so it
+    references the injected numbering definitions correctly.
+    """
+    style_name = para.style.name if para.style else None
+    if style_name not in ("List Bullet", "List Number"):
+        return
+    style = doc.styles[style_name]
+    sPPr = style.element.pPr
+    if sPPr is None:
+        return
+    sNumPr = sPPr.find(qn("w:numPr"))
+    if sNumPr is None:
+        return
+    sNumId = sNumPr.find(qn("w:numId"))
+    sIlvl  = sNumPr.find(qn("w:ilvl"))
+    numId_val = sNumId.get(qn("w:val")) if sNumId is not None else None
+    if not numId_val:
+        return
+    ilvl_val = (sIlvl.get(qn("w:val")) if sIlvl is not None else None) or "0"
+
+    pPr = para._p.get_or_add_pPr()
+    existing = pPr.find(qn("w:numPr"))
+    if existing is not None:
+        pPr.remove(existing)
+    numPr = OxmlElement("w:numPr")
+    ilvl_el = OxmlElement("w:ilvl")
+    ilvl_el.set(qn("w:val"), ilvl_val)
+    numId_el = OxmlElement("w:numId")
+    numId_el.set(qn("w:val"), numId_val)
+    numPr.append(ilvl_el)
+    numPr.append(numId_el)
+    pPr.append(numPr)
+
+    ind = pPr.find(qn("w:ind"))
+    if ind is None:
+        ind = OxmlElement("w:ind")
+        pPr.append(ind)
+    ind.set(qn("w:left"),    str(left_twips))
+    ind.set(qn("w:hanging"), str(hanging_twips))
 
 
 def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
@@ -1752,12 +1958,14 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, line[2:].strip())
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _pin_list_numpr(p, doc)
             last_was_blank = False
 
         elif re.match(r"^[•·]\s+", line):
             p = doc.add_paragraph(style="List Bullet")
             _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+            _pin_list_numpr(p, doc)
             last_was_blank = False
 
         elif re.match(r"^\d+\. ", line):
@@ -1777,6 +1985,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                     hdr = ("SN", "Term/Application Name", "Terminology/System Introduction")
                 tbl = doc.add_table(rows=1 + len(numbered_items), cols=3)
                 tbl.style = "Table Grid"
+                _set_table_borders(tbl)
                 for j, h in enumerate(hdr):
                     cell = tbl.rows[0].cells[j]
                     cell.text = ""
@@ -1799,6 +2008,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
                     p = doc.add_paragraph(style="List Number")
                     _inline_bullet(p, rest)
                     p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+                    _pin_list_numpr(p, doc)
             last_was_blank = False
             continue  # i already advanced past the block
 
@@ -1872,9 +2082,9 @@ def _inline_bullet(paragraph, text):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — User inputs + MAIN workflow
+# STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
-with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=not main_done):
+if not final_done:
 
     # ── Complete report option ─────────────────────────────────────────────────
     generate_complete = st.checkbox(
@@ -1990,79 +2200,6 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
             _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
 
-            # ── Test mode: generate MA+AR without running the Dify workflow ──────
-            _ar_ok = _ar_path and os.path.isfile(_ar_path)
-            _ma_ok = _ma_path and os.path.isfile(_ma_path)
-            if _ar_ok and _ma_ok:
-                st.markdown("---")
-                st.caption(
-                    "Use the button below to test Section I + II template generation "
-                    "without running the full Dify workflow. "
-                    "Fill in the company fields below first, then click the button."
-                )
-                with st.expander("Test Template Generation (no Dify needed)", expanded=False):
-                    t1, t2 = st.columns(2)
-                    with t1:
-                        _t_company   = st.text_input("Company Name",       key="test_company",   placeholder="e.g. ABC Fintech Co., Ltd.")
-                        _t_short     = st.text_input("Short Name",          key="test_short",     placeholder="e.g. ABC")
-                        _t_system    = st.text_input("System Name",         key="test_system",    placeholder="e.g. Payment Processing System")
-                        _t_svc_desc  = st.text_input("Service Description", key="test_svc_desc",  placeholder="e.g. payment processing services")
-                    with t2:
-                        _t_period_s  = st.text_input("Period Start (YYYY-MM-DD)", key="test_period_s", placeholder="e.g. 2024-01-01")
-                        _t_period_e  = st.text_input("Period End   (YYYY-MM-DD)", key="test_period_e", placeholder="e.g. 2024-12-31")
-                        _t_sso_name  = st.text_input("SSO Name (if any)",    key="test_sso_name",  placeholder="leave blank if none")
-                        _t_sys_fn    = st.text_input("System Function (if no transaction processing)", key="test_sys_fn", placeholder="e.g. providing cloud-based payment infrastructure")
-                    if st.button("Generate test MA + AR sections", key="test_template_btn"):
-                        _test_ui = {
-                            "Company_name":          _t_company or "Test Organization",
-                            "Co_short_name":         _t_short   or "TestOrg",
-                            "System_or_service_name": _t_system or "Test System",
-                            "Service_description":   _t_svc_desc or "test services",
-                            "Period_start":          _t_period_s or "2024-01-01",
-                            "Period_end":            _t_period_e or "2024-12-31",
-                            "Report_type":           _cur_rt,
-                            "Output_language":       _cur_lang,
-                            "Subservice_org":        _t_sso_name or "None",
-                            "Systems_function":      _t_sys_fn or "",
-                            # TSC checkboxes live lower in the form; read their
-                            # persisted widget state from the previous rerun.
-                            "is_Security":             st.session_state.get("form_tsc_security", False),
-                            "is_Availability":         st.session_state.get("form_tsc_availability", False),
-                            "is_Processing_Integrity": st.session_state.get("form_tsc_processing", False),
-                            "is_Confidentiality":      st.session_state.get("form_tsc_confidentiality", False),
-                            "is_Privacy":              st.session_state.get("form_tsc_privacy", False),
-                        }
-                        _test_tc = {
-                            "report_date":                report_date  or "2025-01-01",
-                            "signing_city":               signing_city or "Shanghai",
-                            "cuec_identified":            cuec_choice == "Identified",
-                            "sso_cc_identified":          sso_cc_choice == "Identified",
-                            "has_transaction_processing": has_transaction_processing,
-                            "single_user_entity":         single_user_entity,
-                            "has_ai_scope_exclusion":     has_ai_scope_exclusion,
-                            "has_other_information":      has_other_information,
-                            "addressee_choice":           addressee_choice,
-                        }
-                        try:
-                            with st.spinner("Generating test MA + AR sections…"):
-                                _t_subs  = build_substitutions(_test_ui, _test_tc)
-                                _t_flags = build_flags(_test_tc)
-                                _t_ma    = fill_and_process_template(_ma_path, _t_subs, _t_flags, _cur_lang)
-                                _t_ar    = fill_and_process_template(_ar_path, _t_subs, _t_flags, _cur_lang)
-                                _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
-                            _t_fname = (
-                                f"{(_t_short or 'Test')}_{_cur_rt.replace(' ','_')}"
-                                f"_MA_AR_test.docx"
-                            )
-                            st.download_button(
-                                label="⬇ Download test MA + AR (.docx)",
-                                data=_t_merged,
-                                file_name=_t_fname,
-                                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                            )
-                        except Exception as _exc:
-                            st.error(f"Test generation failed: {_exc}")
-
     else:
         standard                  = ""
         report_date               = ""
@@ -2151,7 +2288,82 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
     is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
 
     st.markdown("---")
-    run_main = st.button("▶ Run Step 1 — MAIN Workflow", type="primary", use_container_width=True)
+    run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
+
+    # ── MA + AR only: fill the templates from the fields above, no Dify run ────
+    if generate_complete:
+        run_ma_ar_only = st.button(
+            "🧪 Generate MA + AR only (templates, no Dify)",
+            use_container_width=True,
+            help="Fills the Section I + II templates using the fields above without "
+                 "running the Dify workflow.",
+        )
+        if run_ma_ar_only:
+            _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+            if report_type.startswith("SOC2") and not any([
+                is_security, is_availability, is_processing_integrity,
+                is_confidentiality, is_privacy,
+            ]):
+                st.error("At least one Trust Service Criteria must be selected for SOC2 reports.")
+            elif not (_ar_path_t and os.path.isfile(_ar_path_t)):
+                st.error(f"AR template not available: {_ar_path_t or 'no matching template found'}")
+            elif not (_ma_path_t and os.path.isfile(_ma_path_t)):
+                st.error(f"MA template not available: {_ma_path_t or 'no matching template found'}")
+            else:
+                _test_ui = {
+                    "Company_name":           company_name        or "Test Organization",
+                    "Co_short_name":          co_short_name       or "TestOrg",
+                    "System_or_service_name": system_name         or "Test System",
+                    "Service_description":    service_description or "test services",
+                    "Period_start":           period_start        or "2024-01-01",
+                    "Period_end":             period_end          or "2024-12-31",
+                    "Report_type":            report_type,
+                    "Output_language":        output_language,
+                    "Subservice_org":         subservice_org      or "None",
+                    "Systems_function":       systems_function    or "",
+                    "is_Security":             is_security,
+                    "is_Availability":         is_availability,
+                    "is_Processing_Integrity": is_processing_integrity,
+                    "is_Confidentiality":      is_confidentiality,
+                    "is_Privacy":              is_privacy,
+                }
+                _test_tc = {
+                    "report_date":                report_date  or "2025-01-01",
+                    "signing_city":               signing_city or "Shanghai",
+                    "cuec_identified":            cuec_choice == "Identified",
+                    "sso_cc_identified":          sso_cc_choice == "Identified",
+                    "has_transaction_processing": has_transaction_processing,
+                    "single_user_entity":         single_user_entity,
+                    "has_ai_scope_exclusion":     has_ai_scope_exclusion,
+                    "has_other_information":      has_other_information,
+                    "addressee_choice":           addressee_choice,
+                }
+                try:
+                    with st.spinner("Generating MA + AR sections…"):
+                        _t_subs  = build_substitutions(_test_ui, _test_tc)
+                        _t_flags = build_flags(_test_tc)
+                        _t_ma    = fill_and_process_template(_ma_path_t, _t_subs, _t_flags, output_language)
+                        _t_ar    = fill_and_process_template(_ar_path_t, _t_subs, _t_flags, output_language)
+                        _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
+                    st.session_state["ma_ar_only"] = {
+                        "bytes": _t_merged,
+                        "filename": (
+                            f"{(co_short_name or 'Test')}_{report_type.replace(' ', '_')}"
+                            f"_MA_AR.docx"
+                        ),
+                    }
+                except Exception as _exc:
+                    st.session_state.pop("ma_ar_only", None)
+                    st.error(f"MA + AR generation failed: {_exc}")
+
+        if st.session_state.get("ma_ar_only"):
+            st.download_button(
+                label="⬇ Download MA + AR (.docx)",
+                data=st.session_state["ma_ar_only"]["bytes"],
+                file_name=st.session_state["ma_ar_only"]["filename"],
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            )
 
     if run_main:
         errors = []
@@ -2161,6 +2373,13 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
         if not system_name: errors.append("Service/System Name is required.")
         if not service_description: errors.append("Service Description is required.")
         if not period_start: errors.append("Report Period Start is required.")
+        if report_type.endswith("TYPE2") and not period_end:
+            errors.append("Report Period End is required for Type 2 reports.")
+        if report_type.startswith("SOC2") and not any([
+            is_security, is_availability, is_processing_integrity,
+            is_confidentiality, is_privacy,
+        ]):
+            errors.append("At least one Trust Service Criteria must be selected for SOC2 reports.")
         if not uploaded_files: errors.append("At least one file must be uploaded.")
         if len(subservice_org) > 256:
             errors.append("Subservice Organization exceeds 256 characters")
@@ -2273,53 +2492,33 @@ with st.expander("📋 Step 1 — Report Parameters & MAIN Workflow", expanded=n
             "File_input": file_ids,
         }
 
-        status = st.empty()
-        with st.spinner("Running MAIN workflow — this may take several minutes…"):
+        step_label  = st.empty()
+        node_status = st.empty()
+        if True:
+            # ── Step 1 ────────────────────────────────────────────────────────
+            step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
             try:
-                outputs = run_workflow(inputs_main, api_base, key_main, status)
+                outputs_main = run_workflow(inputs_main, api_base, key_main, node_status)
             except requests.HTTPError as e:
                 st.error(f"MAIN workflow error: {e.response.status_code} — {e.response.text}")
                 st.stop()
             except Exception as e:
                 st.error(f"MAIN workflow error: {e}")
                 st.stop()
+            if outputs_main.get("Error") or outputs_main.get("Error_ORG"):
+                st.error(f"MAIN workflow returned an error:\n{outputs_main.get('Error') or outputs_main.get('Error_ORG')}")
+                st.stop()
+            st.session_state["main_outputs"] = outputs_main
+            status_bar.markdown(_status_html("✅", "🟡", "⚪"), unsafe_allow_html=True)
 
-        if outputs.get("Error") or outputs.get("Error_ORG"):
-            st.error(f"MAIN workflow returned an error:\n{outputs.get('Error') or outputs.get('Error_ORG')}")
-            st.stop()
-
-        st.session_state["main_outputs"] = outputs
-        st.success("✅ Step 1 complete — MAIN workflow finished.")
-        st.rerun()
-
-if main_done:
-    with st.expander("🔍 MAIN Workflow Outputs (preview)", expanded=False):
-        mo = st.session_state["main_outputs"]
-        for k, v in mo.items():
-            if v:
-                st.markdown(f"**{k}**")
-                st.text(str(v)[:500] + ("…" if len(str(v)) > 500 else ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — SUB1: Entity Level
-# ══════════════════════════════════════════════════════════════════════════════
-if main_done:
-    with st.expander("🏛 Step 2 — SUB1: Entity Level Controls", expanded=not sub1_done):
-        st.write("SUB1 generates the Entity-Level Controls section using MAIN's outputs.")
-
-        run_sub1 = st.button("▶ Run Step 2 — SUB1 Workflow", type="primary", use_container_width=True)
-
-        if run_sub1:
+            # ── Step 2 ────────────────────────────────────────────────────────
             if not key_sub1:
                 st.error("SUB1 API key is required (set in sidebar).")
                 st.stop()
-
-            mo = st.session_state["main_outputs"]
-            ui = st.session_state.get("user_inputs", {})
-
+            step_label.info("⏳ Step 2 — Running SUB1 workflow — this may take several minutes…")
+            mo = outputs_main
+            ui = st.session_state["user_inputs"]
             inputs_sub1 = {
-                # Sections from MAIN
                 "overview_section":               to_str(mo.get("overview_section")),
                 "principals_section":             to_str(mo.get("principals_section")),
                 "scope_section":                  to_str(mo.get("scope_section")),
@@ -2339,7 +2538,6 @@ if main_done:
                 "entity_control_objective":       to_str(mo.get("entity_control_objective")),
                 "entity_domain_packs_direct":     to_str(mo.get("entity_domain_packs_direct")),
                 "rag_context":                    to_str(mo.get("rag_context")),
-                # User inputs passed through
                 "Report_type":            ui.get("Report_type", ""),
                 "Output_language":        ui.get("Output_language", ""),
                 "Company_name":           ui.get("Company_name", ""),
@@ -2352,48 +2550,26 @@ if main_done:
                 "Period_start":           ui.get("Period_start", ""),
                 "Period_end":             ui.get("Period_end", ""),
             }
+            try:
+                outputs_sub1 = run_workflow(inputs_sub1, api_base, key_sub1, node_status)
+            except requests.HTTPError as e:
+                st.error(f"SUB1 workflow error: {e.response.status_code} — {e.response.text}")
+                st.stop()
+            except Exception as e:
+                st.error(f"SUB1 workflow error: {e}")
+                st.stop()
+            st.session_state["sub1_outputs"] = outputs_sub1
+            status_bar.markdown(_status_html("✅", "✅", "🟡"), unsafe_allow_html=True)
 
-            status = st.empty()
-            with st.spinner("Running SUB1 workflow — this may take several minutes…"):
-                try:
-                    outputs = run_workflow(inputs_sub1, api_base, key_sub1, status)
-                except requests.HTTPError as e:
-                    st.error(f"SUB1 workflow error: {e.response.status_code} — {e.response.text}")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"SUB1 workflow error: {e}")
-                    st.stop()
-
-            st.session_state["sub1_outputs"] = outputs
-            st.success("✅ Step 2 complete — SUB1 workflow finished.")
-            st.rerun()
-
-    if sub1_done:
-        with st.expander("🔍 SUB1 Outputs (entity_level_section preview)", expanded=False):
-            entity_sec = st.session_state["sub1_outputs"].get("entity_level_section", "")
-            st.text(entity_sec[:1000] + ("…" if len(entity_sec) > 1000 else ""))
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — SUB2: Final Report
-# ══════════════════════════════════════════════════════════════════════════════
-if sub1_done:
-    with st.expander("📄 Step 3 — SUB2: Final Report Assembly", expanded=not final_done):
-        st.write("SUB2 assembles the complete SOC report from all previous outputs.")
-
-        run_sub2 = st.button("▶ Run Step 3 — SUB2 Workflow", type="primary", use_container_width=True)
-
-        if run_sub2:
+            # ── Step 3 ────────────────────────────────────────────────────────
             if not key_sub2:
                 st.error("SUB2 API key is required (set in sidebar).")
                 st.stop()
-
-            so = st.session_state["sub1_outputs"]
-            mo = st.session_state["main_outputs"]
+            step_label.info("⏳ Step 3 — Running SUB2 workflow — this may take several minutes…")
+            so = outputs_sub1
+            mo = outputs_main
             ui = st.session_state.get("user_inputs", {})
-
             inputs_sub2 = {
-                # All outputs from SUB1 (passthrough + entity_level_section)
                 "overview_section":               to_str(so.get("overview_section")),
                 "principals_section":             to_str(so.get("principals_section")),
                 "scope_section":                  to_str(so.get("scope_section")),
@@ -2419,26 +2595,23 @@ if sub1_done:
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
                 "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
             }
-
-            status = st.empty()
-            with st.spinner("Running SUB2 workflow — this may take several minutes…"):
-                try:
-                    outputs = run_workflow(inputs_sub2, api_base, key_sub2, status)
-                except requests.HTTPError as e:
-                    st.error(f"SUB2 workflow error: {e.response.status_code} — {e.response.text}")
-                    st.stop()
-                except Exception as e:
-                    st.error(f"SUB2 workflow error: {e}")
-                    st.stop()
-
-            result = outputs.get("Result", "")
+            try:
+                outputs_sub2 = run_workflow(inputs_sub2, api_base, key_sub2, node_status)
+            except requests.HTTPError as e:
+                st.error(f"SUB2 workflow error: {e.response.status_code} — {e.response.text}")
+                st.stop()
+            except Exception as e:
+                st.error(f"SUB2 workflow error: {e}")
+                st.stop()
+            result = outputs_sub2.get("Result", "")
             if not result:
                 st.warning("SUB2 completed but returned no output.")
                 st.stop()
-
             st.session_state["final_result"] = result
-            st.success("✅ Step 3 complete — Report generated successfully!")
-            st.rerun()
+
+        status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
+        st.rerun()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2455,42 +2628,49 @@ if final_done:
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    # Always generate the Dify sections docx
-    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+    # Build the final .docx once per result — cache in session state so that
+    # clicking the download button (which triggers a Streamlit rerun) does not
+    # re-run the spinners while the file is already downloading.
+    if "final_bytes" not in st.session_state:
+        dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
 
-    if (tc.get("generate_complete")
-            and tc.get("ar_template_path")
-            and tc.get("ma_template_path")):
-        subs  = build_substitutions(ui, tc)
-        flags = build_flags(tc)
+        if (tc.get("generate_complete")
+                and tc.get("ar_template_path")
+                and tc.get("ma_template_path")):
+            subs  = build_substitutions(ui, tc)
+            flags = build_flags(tc)
 
-        _lang = ui.get("Output_language", "English")
-        try:
-            with st.spinner("Generating MA section (Section I)…"):
-                ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-            with st.spinner("Generating AR section (Section II)…"):
-                ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-            with st.spinner("Merging all sections…"):
-                final_bytes = enforce_line_spacing(
-                    merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+            _lang = ui.get("Output_language", "English")
+            try:
+                with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
+                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+                    _built = enforce_line_spacing(
+                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                    )
+                _fname = (
+                    f"{ui.get('Co_short_name', 'Report')}_"
+                    f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
                 )
-            filename = (
-                f"{ui.get('Co_short_name', 'Report')}_"
-                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
-            )
-        except Exception as exc:
-            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
-            final_bytes = enforce_line_spacing(dify_bytes)
-            filename = (
+            except Exception as exc:
+                st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+                _built = enforce_line_spacing(dify_bytes)
+                _fname = (
+                    f"{ui.get('Co_short_name', 'Report')}_"
+                    f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+                )
+        else:
+            _built = enforce_line_spacing(dify_bytes)
+            _fname = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
             )
-    else:
-        final_bytes = enforce_line_spacing(dify_bytes)
-        filename = (
-            f"{ui.get('Co_short_name', 'Report')}_"
-            f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-        )
+
+        st.session_state["final_bytes"]    = _built
+        st.session_state["final_filename"] = _fname
+
+    final_bytes = st.session_state["final_bytes"]
+    filename    = st.session_state["final_filename"]
 
     st.download_button(
         label="⬇ Download Report (.docx)",
