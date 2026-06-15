@@ -1369,17 +1369,30 @@ def build_substitutions(ui, tc):
         else period_start or period_end
     )
 
-    # Parse first SSO name and services from subservice_org (format: "Name | Services")
-    sso_name = ""
-    sso_services = ""
+    # Parse SSO entries from subservice_org.
+    # Supported formats (one org per line):
+    #   "Name | Short Name | Services"  (preferred — 3 columns)
+    #   "Name | Services"               (2 columns — short name defaults to full name)
+    #   "Name"                          (1 column — both short name and services empty)
+    _sso_entries = []  # list of (name, short_name, services)
     if subservice_org:
-        first_line = subservice_org.strip().splitlines()[0]
-        if "|" in first_line:
-            parts = first_line.split("|", 1)
-            sso_name     = parts[0].strip()
-            sso_services = parts[1].strip()
-        else:
-            sso_name = first_line.strip()
+        for _raw in subservice_org.strip().splitlines():
+            _ln = _raw.strip()
+            if not _ln:
+                continue
+            _parts = [p.strip() for p in _ln.split("|")]
+            if len(_parts) >= 3:
+                _sso_entries.append((_parts[0], _parts[1], "|".join(_parts[2:]).strip()))
+            elif len(_parts) == 2:
+                _sso_entries.append((_parts[0], _parts[0], _parts[1]))
+            else:
+                _sso_entries.append((_parts[0], _parts[0], ""))
+    _sso_a = _sso_entries[0] if len(_sso_entries) > 0 else ("", "", "")
+    _sso_b = _sso_entries[1] if len(_sso_entries) > 1 else ("", "", "")
+    _sso_c = _sso_entries[2] if len(_sso_entries) > 2 else ("", "", "")
+    sso_name       = _sso_a[0]
+    sso_short_name = _sso_a[1]
+    sso_services   = _sso_a[2]
 
     # Addressee line: replace the combined "Management of/Board of Directors of"
     # placeholder before the generic [Service organization name] sub runs.
@@ -1418,8 +1431,23 @@ def build_substitutions(ui, tc):
         # City: replace the whole "default_city[alternatives]" pattern
         "Shanghai[Beijing, Shenzhen]":           signing_city,
         "[Beijing, Shenzhen]":                   signing_city,
+        # Single-SSO EN placeholders (generic, appear in non-A/B templates)
         "[Subservice organization name]":        sso_name,
+        "[Subservice organization short name]":  sso_short_name,
         "[identify the function or service provided by the subservice organization]": sso_services,
+        "[description of services provided]":    sso_services,
+        # Multi-SSO EN placeholders (A / B / C variants in templates like WP 10.1)
+        "[Subservice organization A name]":      _sso_a[0],
+        "[Subservice organization A short name]": _sso_a[1],
+        "[identify the function or service provided by the subservice organization A]": _sso_a[2],
+        "[Subservice organization B name]":      _sso_b[0],
+        "[Subservice organization B short name]": _sso_b[1],
+        "[identify the function or service provided by the subservice organization B]": _sso_b[2],
+        "[Subservice organization C short name]": _sso_c[1],
+        # Capital-O variant found in some templates
+        "[Service Organization short name]":     co_short_name,
+        "[Company name]":                        company_name,
+        "[Service System name]":                 system_name,
         "[V]":                                   "V",
         # CN placeholders — templates use fullwidth lenticular brackets
         # 【】 (U+3010/U+3011)
@@ -1427,6 +1455,20 @@ def build_substitutions(ui, tc):
         "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
         "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
         "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        # Single-SSO CN placeholders
+        "【子服务机构名称】":              sso_name,
+        "【子服务机构简称】":              sso_short_name,
+        "【子服务机构】":                  sso_name,
+        "【子服务机构提供的功能或服务】":  sso_services,
+        "【子服务机构的服务类型或内容】":  sso_services,
+        # Multi-SSO CN placeholders (A / B / C variants)
+        "【子服务机构A名称】":             _sso_a[0],
+        "【子服务机构A简称】":             _sso_a[1],
+        "【子服务机构A的服务类型或内容】": _sso_a[2],
+        "【子服务机构B名称】":             _sso_b[0],
+        "【子服务机构B简称】":             _sso_b[1],
+        "【子服务机构B的服务类型或内容】": _sso_b[2],
+        "【子服务机构C简称】":             _sso_c[1],
         # CN period range — must come BEFORE the single 【日期】 sub below
         # (templates write Type II periods as 自【日期】至【日期】止).
         "【日期】至【日期】": period_str_cn,
@@ -2161,8 +2203,12 @@ if not final_done:
         period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2024-12-31")
         subservice_org = st.text_area(
                             "Subservice Organization (N/A if no subservice organization)",
-                            placeholder="Alibaba Cloud | Elastic Cloud, Object Storage\nTencent Cloud | Cloud Virtual Machine, TencentDB",
-                            help="Required if exist Subservice Organization. One entry per line, format: Organization Name | Services Used\nExample: Alibaba Cloud | Elastic Cloud, Object Storage",
+                            placeholder="Alibaba Cloud | Alibaba Cloud | Elastic Cloud, Object Storage\nTencent Cloud | Tencent | Cloud Virtual Machine, TencentDB",
+                            help=(
+                                "One entry per line. Format: Full Name | Short Name | Services\n"
+                                "Example: Alibaba Cloud | Alibaba Cloud | Elastic Cloud, Object Storage\n"
+                                "If Short Name is omitted (2 columns), Full Name is used as Short Name."
+                            ),
                             height=100,
                         )
         if len(subservice_org) > 256:
