@@ -751,6 +751,19 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                 changed = True
                 continue
 
+        # d) Orphaned brackets from template-authoring inconsistencies. Some
+        #    multi-SSO templates open the conditional block by merging its 【 into
+        #    the first 【服务机构简称】 placeholder (single bracket instead of
+        #    double); once that placeholder is substituted away, the block's
+        #    closing 】 is left with no opening to pair against, so cases a–c above
+        #    can never match it. By this point all real bracket pairs and [or…]
+        #    phrases are gone, so any remaining 【】[] is an artifact — strip the
+        #    lone bracket characters (these templates never use them as literal
+        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN".
+        for run in para.runs:
+            if run.text and re.search(r"[【】\[\]]", run.text):
+                run.text = re.sub(r"[【】\[\]]", "", run.text)
+
         # Normalize spaces introduced by empty removals
         prev_ended_space = False
         for run in para.runs:
@@ -1179,8 +1192,9 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     Final pass over the finished document: set every paragraph (body and
     table cells, including nested tables) to the given multiple line spacing,
     and normalise every run to Times New Roman Latin/complex-script fonts and
-    black text. The CJK (eastAsia) font is left untouched so the per-language
-    choice made earlier (华文楷体 / 黑体) survives.
+    black text, and the CJK (eastAsia) font to 华文楷体 — so the whole document
+    is uniform (Times New Roman for Latin, 华文楷体 for Chinese) regardless of
+    what each merged section set, instead of the old 华文楷体 / 黑体 mix.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -1215,10 +1229,11 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     for r_el in doc.element.body.iter(qn("w:r")):
         rPr = r_el.get_or_add_rPr()
         rFonts = rPr.get_or_add_rFonts()
-        rFonts.set(qn("w:ascii"), "Times New Roman")
-        rFonts.set(qn("w:hAnsi"), "Times New Roman")
-        rFonts.set(qn("w:cs"),    "Times New Roman")
-        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
         color = rPr.get_or_add_color()
@@ -1255,8 +1270,7 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
     # rendered when the numbering level itself names no font — e.g. the CN AR
     # "a." items showed in 黑体 because the mark carried eastAsia=黑体 and no
-    # ascii font. Force Times New Roman Latin + black there as well; the
-    # eastAsia font is again left untouched.
+    # ascii font. Force Times New Roman Latin + 华文楷体 CJK + black here too.
     _mark_tail_tags = (qn("w:sectPr"), qn("w:pPrChange"))
     for pPr in doc.element.body.iter(qn("w:pPr")):
         rPr = pPr.find(qn("w:rPr"))
@@ -1275,10 +1289,11 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
                 rStyle.addnext(rFonts)
             else:
                 rPr.insert(0, rFonts)
-        rFonts.set(qn("w:ascii"), "Times New Roman")
-        rFonts.set(qn("w:hAnsi"), "Times New Roman")
-        rFonts.set(qn("w:cs"),    "Times New Roman")
-        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
         color = rPr.find(qn("w:color"))
@@ -1369,17 +1384,30 @@ def build_substitutions(ui, tc):
         else period_start or period_end
     )
 
-    # Parse first SSO name and services from subservice_org (format: "Name | Services")
-    sso_name = ""
-    sso_services = ""
+    # Parse SSO entries from subservice_org.
+    # Supported formats (one org per line):
+    #   "Name | Short Name | Services"  (preferred — 3 columns)
+    #   "Name | Services"               (2 columns — short name defaults to full name)
+    #   "Name"                          (1 column — both short name and services empty)
+    _sso_entries = []  # list of (name, short_name, services)
     if subservice_org:
-        first_line = subservice_org.strip().splitlines()[0]
-        if "|" in first_line:
-            parts = first_line.split("|", 1)
-            sso_name     = parts[0].strip()
-            sso_services = parts[1].strip()
-        else:
-            sso_name = first_line.strip()
+        for _raw in subservice_org.strip().splitlines():
+            _ln = _raw.strip()
+            if not _ln:
+                continue
+            _parts = [p.strip() for p in _ln.split("|")]
+            if len(_parts) >= 3:
+                _sso_entries.append((_parts[0], _parts[1], "|".join(_parts[2:]).strip()))
+            elif len(_parts) == 2:
+                _sso_entries.append((_parts[0], _parts[0], _parts[1]))
+            else:
+                _sso_entries.append((_parts[0], _parts[0], ""))
+    _sso_a = _sso_entries[0] if len(_sso_entries) > 0 else ("", "", "")
+    _sso_b = _sso_entries[1] if len(_sso_entries) > 1 else ("", "", "")
+    _sso_c = _sso_entries[2] if len(_sso_entries) > 2 else ("", "", "")
+    sso_name       = _sso_a[0]
+    sso_short_name = _sso_a[1]
+    sso_services   = _sso_a[2]
 
     # Addressee line: replace the combined "Management of/Board of Directors of"
     # placeholder before the generic [Service organization name] sub runs.
@@ -1418,8 +1446,23 @@ def build_substitutions(ui, tc):
         # City: replace the whole "default_city[alternatives]" pattern
         "Shanghai[Beijing, Shenzhen]":           signing_city,
         "[Beijing, Shenzhen]":                   signing_city,
+        # Single-SSO EN placeholders (generic, appear in non-A/B templates)
         "[Subservice organization name]":        sso_name,
+        "[Subservice organization short name]":  sso_short_name,
         "[identify the function or service provided by the subservice organization]": sso_services,
+        "[description of services provided]":    sso_services,
+        # Multi-SSO EN placeholders (A / B / C variants in templates like WP 10.1)
+        "[Subservice organization A name]":      _sso_a[0],
+        "[Subservice organization A short name]": _sso_a[1],
+        "[identify the function or service provided by the subservice organization A]": _sso_a[2],
+        "[Subservice organization B name]":      _sso_b[0],
+        "[Subservice organization B short name]": _sso_b[1],
+        "[identify the function or service provided by the subservice organization B]": _sso_b[2],
+        "[Subservice organization C short name]": _sso_c[1],
+        # Capital-O variant found in some templates
+        "[Service Organization short name]":     co_short_name,
+        "[Company name]":                        company_name,
+        "[Service System name]":                 system_name,
         "[V]":                                   "V",
         # CN placeholders — templates use fullwidth lenticular brackets
         # 【】 (U+3010/U+3011)
@@ -1427,6 +1470,20 @@ def build_substitutions(ui, tc):
         "\u3010\u670d\u52a1\u673a\u6784\u7b80\u79f0\u3011": co_short_name,  # 【服务机构简称】
         "\u3010\u670d\u52a1\u673a\u6784\u4f53\u7cfb\u540d\u79f0\u3011": system_name,  # 【服务机构体系名称】
         "【服务机构服务体系名称】": system_name,  # 【服务机构服务体系名称】 (SOC3 CN variant)
+        # Single-SSO CN placeholders
+        "【子服务机构名称】":              sso_name,
+        "【子服务机构简称】":              sso_short_name,
+        "【子服务机构】":                  sso_name,
+        "【子服务机构提供的功能或服务】":  sso_services,
+        "【子服务机构的服务类型或内容】":  sso_services,
+        # Multi-SSO CN placeholders (A / B / C variants)
+        "【子服务机构A名称】":             _sso_a[0],
+        "【子服务机构A简称】":             _sso_a[1],
+        "【子服务机构A的服务类型或内容】": _sso_a[2],
+        "【子服务机构B名称】":             _sso_b[0],
+        "【子服务机构B简称】":             _sso_b[1],
+        "【子服务机构B的服务类型或内容】": _sso_b[2],
+        "【子服务机构C简称】":             _sso_c[1],
         # CN period range — must come BEFORE the single 【日期】 sub below
         # (templates write Type II periods as 自【日期】至【日期】止).
         "【日期】至【日期】": period_str_cn,
@@ -1555,6 +1612,50 @@ def to_str(v) -> str:
     return str(v)
 
 
+def subservice_org_for_dify(raw) -> str:
+    """Reduce Subservice_org to the 'Name | Services' form the Dify backend
+    expects before sending it to any workflow.
+
+    The UI text area accepts an optional short-name column
+    ('Name | Short Name | Services'), but that short name is consumed only by
+    the local EY-template fill (build_substitutions). The backend code node
+    parses with split('|', 1) — a 3-column line would put the short name into
+    the services field and break the generated bullets/table. Stripping the
+    short name here keeps the backend contract unchanged (no Dify re-import).
+    """
+    if not raw:
+        return raw
+    out = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 3:
+            services = "|".join(parts[2:]).strip()
+            out.append(f"{parts[0]} | {services}")
+        else:
+            out.append(s)
+    return "\n".join(out)
+
+
+def _spinner_html(text: str) -> str:
+    """A single in-place status line with an animated CSS spinner. Reused for
+    both the node-progress counter and the final build message so the same
+    placeholder can be overwritten in place (no second spinner stacked below)."""
+    return (
+        "<style>"
+        "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
+        "._nd_s{display:inline-block;width:13px;height:13px;"
+        "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
+        "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
+        "vertical-align:middle;margin-right:6px}"
+        "</style>"
+        f'<div style="font-size:0.95em;padding:3px 0">'
+        f'<span class="_nd_s"></span>{text}</div>'
+    )
+
+
 def run_workflow(inputs, api_base, api_key, status_placeholder=None):
     """
     Calls the Dify workflow API in streaming mode to avoid nginx 504 timeouts.
@@ -1601,17 +1702,9 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             event = node_data = None
             if status_placeholder:
                 status_placeholder.markdown(
-                    "<style>"
-                    "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
-                    "._nd_s{display:inline-block;width:13px;height:13px;"
-                    "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
-                    "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
-                    "vertical-align:middle;margin-right:6px}"
-                    "</style>"
-                    f'<div style="font-size:0.95em;padding:3px 0">'
-                    f'<span class="_nd_s"></span>'
-                    f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
-                    "</div>",
+                    _spinner_html(
+                        f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
+                    ),
                     unsafe_allow_html=True,
                 )
             if node_status == "failed":
@@ -1638,11 +1731,11 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
 
 FONT_LATIN   = "Times New Roman"
-FONT_CHINESE = "黑体"
+FONT_CHINESE = "华文楷体"
 
 
 def _apply_fonts(run):
-    """Set Times New Roman for Latin characters, 黑体 for Chinese characters.
+    """Set Times New Roman for Latin characters, 华文楷体 for Chinese characters.
     Word automatically picks the right one per character based on Unicode range."""
     rPr = run._r.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
@@ -1656,7 +1749,8 @@ def _apply_fonts(run):
 
 
 def _set_style_fonts(style):
-    """Apply the same dual-font setting at the paragraph-style level."""
+    """Apply the same dual-font setting (Times New Roman + 华文楷体) at the
+    paragraph-style level."""
     rPr = style.element.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
@@ -2161,8 +2255,12 @@ if not final_done:
         period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2024-12-31")
         subservice_org = st.text_area(
                             "Subservice Organization (N/A if no subservice organization)",
-                            placeholder="Alibaba Cloud | Elastic Cloud, Object Storage\nTencent Cloud | Cloud Virtual Machine, TencentDB",
-                            help="Required if exist Subservice Organization. One entry per line, format: Organization Name | Services Used\nExample: Alibaba Cloud | Elastic Cloud, Object Storage",
+                            placeholder="Alibaba Cloud | Alibaba Cloud | Elastic Cloud, Object Storage\nTencent Cloud | Tencent | Cloud Virtual Machine, TencentDB",
+                            help=(
+                                "One entry per line. Format: Full Name | Short Name | Services\n"
+                                "Example: Alibaba Cloud | Alibaba Cloud | Elastic Cloud, Object Storage\n"
+                                "If Short Name is omitted (2 columns), Full Name is used as Short Name."
+                            ),
                             height=100,
                         )
         if len(subservice_org) > 256:
@@ -2237,17 +2335,16 @@ if not final_done:
                     key="cr_other_info",
                     help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
                 )
-
-            # SSO CC — only shown when SSO != None
-            if scope_of_report != "None":
-                sso_cc_choice = st.radio(
-                    "SSO Complementary Controls",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_sso_cc",
-                )
-            else:
-                sso_cc_choice = "Identified"
+                # SSO CC — only shown when SSO != None
+                if scope_of_report != "None":
+                    sso_cc_choice = st.radio(
+                        "SSO Complementary Controls",
+                        ["Identified", "Not Identified"],
+                        index=0,
+                        key="cr_sso_cc",
+                    )
+                else:
+                    sso_cc_choice = "Identified"
 
             # Template resolution preview (computed every render)
             st.markdown("---")
@@ -2317,19 +2414,28 @@ if not final_done:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
+    # Defaults are seeded into session_state once per report type (the key embeds
+    # report_type, so switching types applies that type's fresh default the first
+    # time it is seen). The checkboxes are then rendered WITHOUT a `value=` arg so
+    # a user's manual toggle is read straight from session_state and never
+    # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
+    _cuec_key = f"form_is_cuec_{report_type}"
+    _uer_key  = f"form_is_uer_{report_type}"
+    if _cuec_key not in st.session_state:
+        st.session_state[_cuec_key] = report_type.startswith("SOC1")
+    if _uer_key not in st.session_state:
+        st.session_state[_uer_key] = report_type.startswith("SOC2")
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
-        value=report_type.startswith("SOC1"),
-        key=f"form_is_cuec_{report_type}",
+        key=_cuec_key,
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
-        value=report_type.startswith("SOC2"),
-        key=f"form_is_uer_{report_type}",
+        key=_uer_key,
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
 
@@ -2537,6 +2643,7 @@ if not final_done:
 
         inputs_main = {
             **st.session_state["user_inputs"],
+            "Subservice_org": subservice_org_for_dify(subservice_org),
             "File_input": file_ids,
         }
 
@@ -2592,7 +2699,7 @@ if not final_done:
                 "Co_short_name":          ui.get("Co_short_name", ""),
                 "Industry":               ui.get("Industry", ""),
                 "System_or_service_name": ui.get("System_or_service_name", ""),
-                "Subservice_org":         ui.get("Subservice_org", ""),
+                "Subservice_org":         subservice_org_for_dify(ui.get("Subservice_org", "")),
                 "Scope_of_the_report":    ui.get("Scope_of_the_report", ""),
                 "Domain":                 ui.get("Domain", ""),
                 "Period_start":           ui.get("Period_start", ""),
@@ -2632,7 +2739,7 @@ if not final_done:
                 "website_content":                to_str(so.get("website_content")),
                 "activity_control_objectives_json": to_str(so.get("activity_control_objectives_json")),
                 "rag_context":                    to_str(so.get("rag_context")),
-                "Subservice_org":         to_str(so.get("Subservice_org") or ui.get("Subservice_org")),
+                "Subservice_org":         subservice_org_for_dify(to_str(so.get("Subservice_org") or ui.get("Subservice_org"))),
                 "Scope_of_the_report":    to_str(so.get("Scope_of_the_report") or ui.get("Scope_of_the_report")),
                 "Period_start":           to_str(so.get("Period_start") or ui.get("Period_start")),
                 "Period_end":             to_str(so.get("Period_end") or ui.get("Period_end")),
@@ -2662,16 +2769,22 @@ if not final_done:
             st.session_state["final_result"] = result
 
             # Build the final .docx now — while we are still rendered inside the
-            # Steps container (right after "Nodes completed…"), so the
-            # "Generating and merging…" spinner appears exactly where the user is
-            # already looking instead of off-screen after the rerun. Cached so the
+            # Steps container, so the status is visible where the user is already
+            # looking instead of off-screen after the rerun. Cached so the
             # post-rerun result section reuses it instead of rebuilding.
-            step_label.info("⏳ Building the final report document…")
-            with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
-                _built, _fname = build_final_document(
-                    result, st.session_state.get("user_inputs", {}),
-                    st.session_state.get("template_config", {}),
-                )
+            #
+            # Overwrite the node-counter line *in place* (same placeholder) with
+            # a single stable build message — this removes the "Nodes completed…"
+            # spinner instead of stacking a second spinner below it.
+            step_label.empty()
+            node_status.markdown(
+                _spinner_html("Generating and merging MA &amp; AR section (Section I &amp; II)…"),
+                unsafe_allow_html=True,
+            )
+            _built, _fname = build_final_document(
+                result, st.session_state.get("user_inputs", {}),
+                st.session_state.get("template_config", {}),
+            )
             st.session_state["final_bytes"]    = _built
             st.session_state["final_filename"] = _fname
 
