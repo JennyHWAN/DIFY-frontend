@@ -2086,135 +2086,6 @@ def _inline_bullet(paragraph, text):
 # ══════════════════════════════════════════════════════════════════════════════
 if not final_done:
 
-    # ── Complete report option ─────────────────────────────────────────────────
-    generate_complete = st.checkbox(
-        "Generate complete report (MA + AR + main sections)",
-        value=True,
-        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
-    )
-
-    if generate_complete:
-        with st.expander("Complete Report Settings", expanded=True):
-            cr1, cr2 = st.columns(2)
-
-            # Read current Report Type from session_state key (set by the selectbox below).
-            # Falls back to the previous run's saved value, then to default.
-            _cur_rt = (
-                st.session_state.get("form_report_type")
-                or st.session_state.get("user_inputs", {}).get("Report_type", "SOC2 TYPE2")
-            )
-            _cur_sso = (
-                st.session_state.get("form_scope_of_report")
-                or st.session_state.get("user_inputs", {}).get("Scope_of_the_report", "None")
-            )
-            _cur_lang = (
-                st.session_state.get("form_output_language")
-                or st.session_state.get("user_inputs", {}).get("Output_language", "English")
-            )
-
-            with cr1:
-                _std_options = get_standard_options(_cur_rt)
-                standard = st.selectbox("Standard", _std_options, key="cr_standard")
-                report_date  = st.text_input(
-                    "Report Signing Date (YYYY-MM-DD)",
-                    placeholder="e.g. 2026-01-30",
-                    key="cr_report_date",
-                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
-                         "\"2026年1月30日\" in Chinese reports. "
-                         "Other text is inserted into the report as-is.",
-                )
-                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
-
-            with cr2:
-                addressee_choice = st.radio(
-                    "AR Addressee",
-                    ["Management", "Board of Directors"],
-                    index=0,
-                    key="cr_addressee",
-                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
-                )
-                cuec_choice = st.radio(
-                    "Complementary User Entity Controls (CUEC)",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_cuec",
-                )
-                has_transaction_processing = st.checkbox(
-                    "Includes transaction processing wording",
-                    value=True,
-                    key="cr_transaction",
-                )
-                if not has_transaction_processing:
-                    st.caption(
-                        "⚠️ When unchecked, the 'Systems Function' field below "
-                        "(Required Fields section) is used to describe the system's "
-                        "function in place of transaction-processing wording."
-                    )
-                single_user_entity = st.checkbox(
-                    "Single user entity report",
-                    value=False,
-                    key="cr_single_user",
-                )
-                has_ai_scope_exclusion = st.checkbox(
-                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
-                    value=False,
-                    key="cr_ai_scope",
-                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
-                )
-                has_other_information = st.checkbox(
-                    "Report includes 'Other Information' section",
-                    value=True,
-                    key="cr_other_info",
-                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
-                )
-
-            # SSO CC — only shown when SSO != None
-            if _cur_sso != "None":
-                sso_cc_choice = st.radio(
-                    "SSO Complementary Controls",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_sso_cc",
-                )
-            else:
-                sso_cc_choice = "Identified"
-
-            # Template resolution preview (computed every render)
-            st.markdown("---")
-            _ar_wp, _ar_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "AR")
-            _ma_wp, _ma_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "MA")
-
-            def _show_template_status(label, wp, path, dir_name):
-                if wp is None and isinstance(path, str):
-                    # path carries the error message when wp is None
-                    st.error(f"{label}: {path}")
-                elif wp is None:
-                    st.warning(f"{label}: No matching template found for this combination.")
-                elif path and os.path.isfile(path):
-                    st.info(f"{label}: WP No. {wp} \u2192 {os.path.basename(path)}")
-                elif isinstance(path, str) and path.startswith("Cannot"):
-                    st.error(f"{label}: WP No. {wp} — {path}")
-                else:
-                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
-
-            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
-            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
-
-    else:
-        standard                  = ""
-        report_date               = ""
-        signing_city              = ""
-        cuec_choice               = "Identified"
-        sso_cc_choice             = "Identified"
-        has_transaction_processing = True
-        single_user_entity         = False
-        has_ai_scope_exclusion     = False
-        has_other_information      = True
-        addressee_choice           = "Management"
-        _ar_path                   = None
-        _ma_path                   = None
-
-    st.markdown("---")
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
         "1. 请上传Excel大表，其中必须包含Control Matrix sheet；"
@@ -2258,6 +2129,122 @@ if not final_done:
                         )
         if len(subservice_org) > 256:
             st.warning("⚠️ Subservice Organization exceeds 256 characters. Please shorten it.")
+
+    # ── Complete report option ─────────────────────────────────────────────────
+    # Placed after Required Fields so the MA/AR template settings below react to
+    # the Report Type / Subservice Testing Strategy / Output Language chosen above.
+    st.markdown("---")
+    generate_complete = st.checkbox(
+        "Generate complete report (MA + AR + main sections)",
+        value=True,
+        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
+    )
+
+    if generate_complete:
+        with st.expander("Complete Report Settings", expanded=True):
+            cr1, cr2 = st.columns(2)
+
+            with cr1:
+                _std_options = get_standard_options(report_type)
+                standard = st.selectbox("Standard", _std_options, key="cr_standard")
+                report_date  = st.text_input(
+                    "Report Signing Date (YYYY-MM-DD)",
+                    placeholder="e.g. 2026-01-30",
+                    key="cr_report_date",
+                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
+                         "\"2026年1月30日\" in Chinese reports. "
+                         "Other text is inserted into the report as-is.",
+                )
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+
+            with cr2:
+                addressee_choice = st.radio(
+                    "AR Addressee",
+                    ["Management", "Board of Directors"],
+                    index=0,
+                    key="cr_addressee",
+                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
+                )
+                cuec_choice = st.radio(
+                    "Complementary User Entity Controls (CUEC)",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_cuec",
+                )
+                has_transaction_processing = st.checkbox(
+                    "Includes transaction processing wording",
+                    value=True,
+                    key="cr_transaction",
+                )
+                if not has_transaction_processing:
+                    st.caption(
+                        "⚠️ When unchecked, the 'Systems Function' field "
+                        "(Optional Fields section) is used to describe the system's "
+                        "function in place of transaction-processing wording."
+                    )
+                single_user_entity = st.checkbox(
+                    "Single user entity report",
+                    value=False,
+                    key="cr_single_user",
+                )
+                has_ai_scope_exclusion = st.checkbox(
+                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
+                    value=False,
+                    key="cr_ai_scope",
+                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
+                )
+                has_other_information = st.checkbox(
+                    "Report includes 'Other Information' section",
+                    value=True,
+                    key="cr_other_info",
+                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
+                )
+
+            # SSO CC — only shown when SSO != None
+            if scope_of_report != "None":
+                sso_cc_choice = st.radio(
+                    "SSO Complementary Controls",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_sso_cc",
+                )
+            else:
+                sso_cc_choice = "Identified"
+
+            # Template resolution preview (computed every render)
+            st.markdown("---")
+            _ar_wp, _ar_path = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp, _ma_path = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+
+            def _show_template_status(label, wp, path, dir_name):
+                if wp is None and isinstance(path, str):
+                    # path carries the error message when wp is None
+                    st.error(f"{label}: {path}")
+                elif wp is None:
+                    st.warning(f"{label}: No matching template found for this combination.")
+                elif path and os.path.isfile(path):
+                    st.info(f"{label}: WP No. {wp} → {os.path.basename(path)}")
+                elif isinstance(path, str) and path.startswith("Cannot"):
+                    st.error(f"{label}: WP No. {wp} — {path}")
+                else:
+                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
+
+            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
+            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
+
+    else:
+        standard                  = ""
+        report_date               = ""
+        signing_city              = ""
+        cuec_choice               = "Identified"
+        sso_cc_choice             = "Identified"
+        has_transaction_processing = True
+        single_user_entity         = False
+        has_ai_scope_exclusion     = False
+        has_other_information      = True
+        addressee_choice           = "Management"
+        _ar_path                   = None
+        _ma_path                   = None
 
 
 
