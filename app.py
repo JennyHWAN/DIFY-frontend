@@ -1597,6 +1597,50 @@ def to_str(v) -> str:
     return str(v)
 
 
+def subservice_org_for_dify(raw) -> str:
+    """Reduce Subservice_org to the 'Name | Services' form the Dify backend
+    expects before sending it to any workflow.
+
+    The UI text area accepts an optional short-name column
+    ('Name | Short Name | Services'), but that short name is consumed only by
+    the local EY-template fill (build_substitutions). The backend code node
+    parses with split('|', 1) — a 3-column line would put the short name into
+    the services field and break the generated bullets/table. Stripping the
+    short name here keeps the backend contract unchanged (no Dify re-import).
+    """
+    if not raw:
+        return raw
+    out = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        parts = [p.strip() for p in s.split("|")]
+        if len(parts) >= 3:
+            services = "|".join(parts[2:]).strip()
+            out.append(f"{parts[0]} | {services}")
+        else:
+            out.append(s)
+    return "\n".join(out)
+
+
+def _spinner_html(text: str) -> str:
+    """A single in-place status line with an animated CSS spinner. Reused for
+    both the node-progress counter and the final build message so the same
+    placeholder can be overwritten in place (no second spinner stacked below)."""
+    return (
+        "<style>"
+        "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
+        "._nd_s{display:inline-block;width:13px;height:13px;"
+        "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
+        "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
+        "vertical-align:middle;margin-right:6px}"
+        "</style>"
+        f'<div style="font-size:0.95em;padding:3px 0">'
+        f'<span class="_nd_s"></span>{text}</div>'
+    )
+
+
 def run_workflow(inputs, api_base, api_key, status_placeholder=None):
     """
     Calls the Dify workflow API in streaming mode to avoid nginx 504 timeouts.
@@ -1643,17 +1687,9 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
             event = node_data = None
             if status_placeholder:
                 status_placeholder.markdown(
-                    "<style>"
-                    "@keyframes _nd_spin{to{transform:rotate(360deg)}}"
-                    "._nd_s{display:inline-block;width:13px;height:13px;"
-                    "border:2px solid rgba(180,180,180,0.3);border-top-color:#aaa;"
-                    "border-radius:50%;animation:_nd_spin 0.75s linear infinite;"
-                    "vertical-align:middle;margin-right:6px}"
-                    "</style>"
-                    f'<div style="font-size:0.95em;padding:3px 0">'
-                    f'<span class="_nd_s"></span>'
-                    f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
-                    "</div>",
+                    _spinner_html(
+                        f"Nodes completed: {node_count}&nbsp;&nbsp;(last: {node_title})"
+                    ),
                     unsafe_allow_html=True,
                 )
             if node_status == "failed":
@@ -2283,17 +2319,16 @@ if not final_done:
                     key="cr_other_info",
                     help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
                 )
-
-            # SSO CC — only shown when SSO != None
-            if scope_of_report != "None":
-                sso_cc_choice = st.radio(
-                    "SSO Complementary Controls",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_sso_cc",
-                )
-            else:
-                sso_cc_choice = "Identified"
+                # SSO CC — only shown when SSO != None
+                if scope_of_report != "None":
+                    sso_cc_choice = st.radio(
+                        "SSO Complementary Controls",
+                        ["Identified", "Not Identified"],
+                        index=0,
+                        key="cr_sso_cc",
+                    )
+                else:
+                    sso_cc_choice = "Identified"
 
             # Template resolution preview (computed every render)
             st.markdown("---")
@@ -2363,19 +2398,28 @@ if not final_done:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
+    # Defaults are seeded into session_state once per report type (the key embeds
+    # report_type, so switching types applies that type's fresh default the first
+    # time it is seen). The checkboxes are then rendered WITHOUT a `value=` arg so
+    # a user's manual toggle is read straight from session_state and never
+    # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
+    _cuec_key = f"form_is_cuec_{report_type}"
+    _uer_key  = f"form_is_uer_{report_type}"
+    if _cuec_key not in st.session_state:
+        st.session_state[_cuec_key] = report_type.startswith("SOC1")
+    if _uer_key not in st.session_state:
+        st.session_state[_uer_key] = report_type.startswith("SOC2")
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
-        value=report_type.startswith("SOC1"),
-        key=f"form_is_cuec_{report_type}",
+        key=_cuec_key,
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
-        value=report_type.startswith("SOC2"),
-        key=f"form_is_uer_{report_type}",
+        key=_uer_key,
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
 
@@ -2583,6 +2627,7 @@ if not final_done:
 
         inputs_main = {
             **st.session_state["user_inputs"],
+            "Subservice_org": subservice_org_for_dify(subservice_org),
             "File_input": file_ids,
         }
 
@@ -2638,7 +2683,7 @@ if not final_done:
                 "Co_short_name":          ui.get("Co_short_name", ""),
                 "Industry":               ui.get("Industry", ""),
                 "System_or_service_name": ui.get("System_or_service_name", ""),
-                "Subservice_org":         ui.get("Subservice_org", ""),
+                "Subservice_org":         subservice_org_for_dify(ui.get("Subservice_org", "")),
                 "Scope_of_the_report":    ui.get("Scope_of_the_report", ""),
                 "Domain":                 ui.get("Domain", ""),
                 "Period_start":           ui.get("Period_start", ""),
@@ -2678,7 +2723,7 @@ if not final_done:
                 "website_content":                to_str(so.get("website_content")),
                 "activity_control_objectives_json": to_str(so.get("activity_control_objectives_json")),
                 "rag_context":                    to_str(so.get("rag_context")),
-                "Subservice_org":         to_str(so.get("Subservice_org") or ui.get("Subservice_org")),
+                "Subservice_org":         subservice_org_for_dify(to_str(so.get("Subservice_org") or ui.get("Subservice_org"))),
                 "Scope_of_the_report":    to_str(so.get("Scope_of_the_report") or ui.get("Scope_of_the_report")),
                 "Period_start":           to_str(so.get("Period_start") or ui.get("Period_start")),
                 "Period_end":             to_str(so.get("Period_end") or ui.get("Period_end")),
@@ -2708,16 +2753,22 @@ if not final_done:
             st.session_state["final_result"] = result
 
             # Build the final .docx now — while we are still rendered inside the
-            # Steps container (right after "Nodes completed…"), so the
-            # "Generating and merging…" spinner appears exactly where the user is
-            # already looking instead of off-screen after the rerun. Cached so the
+            # Steps container, so the status is visible where the user is already
+            # looking instead of off-screen after the rerun. Cached so the
             # post-rerun result section reuses it instead of rebuilding.
-            step_label.info("⏳ Building the final report document…")
-            with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
-                _built, _fname = build_final_document(
-                    result, st.session_state.get("user_inputs", {}),
-                    st.session_state.get("template_config", {}),
-                )
+            #
+            # Overwrite the node-counter line *in place* (same placeholder) with
+            # a single stable build message — this removes the "Nodes completed…"
+            # spinner instead of stacking a second spinner below it.
+            step_label.empty()
+            node_status.markdown(
+                _spinner_html("Generating and merging MA &amp; AR section (Section I &amp; II)…"),
+                unsafe_allow_html=True,
+            )
+            _built, _fname = build_final_document(
+                result, st.session_state.get("user_inputs", {}),
+                st.session_state.get("template_config", {}),
+            )
             st.session_state["final_bytes"]    = _built
             st.session_state["final_filename"] = _fname
 
