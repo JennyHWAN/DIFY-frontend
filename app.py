@@ -2081,6 +2081,44 @@ def _inline_bullet(paragraph, text):
         _inline(paragraph, text)
 
 
+def build_final_document(result_text, ui, tc):
+    """Build the final .docx bytes (+ filename) from the SUB2 markdown result.
+
+    Returns (bytes, filename). In complete mode the EY MA/AR templates are filled
+    and merged with the Dify sections; otherwise the Dify sections are rendered
+    on their own. Any failure in the complete path falls back to Dify-only.
+    Caller is responsible for wrapping this in a spinner if desired.
+    """
+    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+
+    if (tc.get("generate_complete")
+            and tc.get("ar_template_path")
+            and tc.get("ma_template_path")):
+        subs  = build_substitutions(ui, tc)
+        flags = build_flags(tc)
+        _lang = ui.get("Output_language", "English")
+        try:
+            ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+            ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+            built = enforce_line_spacing(
+                merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+            )
+            fname = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
+            )
+            return built, fname
+        except Exception as exc:
+            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+
+    built = enforce_line_spacing(dify_bytes)
+    fname = (
+        f"{ui.get('Co_short_name', 'Report')}_"
+        f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+    )
+    return built, fname
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2604,6 +2642,8 @@ if not final_done:
                 "Co_short_name":          to_str(so.get("Co_short_name") or ui.get("Co_short_name")),
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
                 "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
+                "UER_json":               to_str(mo.get("UER_json")),
+                "control_list_text":      to_str(mo.get("control_list_text")),
                 "is_CUEC":                bool(ui.get("is_CUEC", False)),
                 "is_UER":                 bool(ui.get("is_UER", False)),
             }
@@ -2621,6 +2661,20 @@ if not final_done:
                 st.stop()
             st.session_state["final_result"] = result
 
+            # Build the final .docx now — while we are still rendered inside the
+            # Steps container (right after "Nodes completed…"), so the
+            # "Generating and merging…" spinner appears exactly where the user is
+            # already looking instead of off-screen after the rerun. Cached so the
+            # post-rerun result section reuses it instead of rebuilding.
+            step_label.info("⏳ Building the final report document…")
+            with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
+                _built, _fname = build_final_document(
+                    result, st.session_state.get("user_inputs", {}),
+                    st.session_state.get("template_config", {}),
+                )
+            st.session_state["final_bytes"]    = _built
+            st.session_state["final_filename"] = _fname
+
         status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
         st.rerun()
 
@@ -2636,6 +2690,16 @@ if final_done:
     result_text = st.session_state["final_result"]
     ui  = st.session_state.get("user_inputs", {})
     tc  = st.session_state.get("template_config", {})
+
+    # The document is normally built right after Step 3 (inside the Steps
+    # container, so the spinner is visible there). This guarded block is only a
+    # fallback for sessions where final_result exists but final_bytes does not
+    # (e.g. a restored session). Cached so reruns don't rebuild it.
+    if "final_bytes" not in st.session_state:
+        with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
+            _built, _fname = build_final_document(result_text, ui, tc)
+        st.session_state["final_bytes"]    = _built
+        st.session_state["final_filename"] = _fname
 
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
@@ -2704,47 +2768,6 @@ if final_done:
                 f"- MA template: `{os.path.basename(_mp) if _mp else '—'}`\n"
                 f"- AR template: `{os.path.basename(_ap) if _ap else '—'}`"
             )
-
-    # Build the final .docx once per result — cache in session state so that
-    # clicking the download button (which triggers a Streamlit rerun) does not
-    # re-run the spinners while the file is already downloading.
-    if "final_bytes" not in st.session_state:
-        dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
-
-        if (tc.get("generate_complete")
-                and tc.get("ar_template_path")
-                and tc.get("ma_template_path")):
-            subs  = build_substitutions(ui, tc)
-            flags = build_flags(tc)
-
-            _lang = ui.get("Output_language", "English")
-            try:
-                with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
-                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-                    _built = enforce_line_spacing(
-                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
-                    )
-                _fname = (
-                    f"{ui.get('Co_short_name', 'Report')}_"
-                    f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
-                )
-            except Exception as exc:
-                st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
-                _built = enforce_line_spacing(dify_bytes)
-                _fname = (
-                    f"{ui.get('Co_short_name', 'Report')}_"
-                    f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-                )
-        else:
-            _built = enforce_line_spacing(dify_bytes)
-            _fname = (
-                f"{ui.get('Co_short_name', 'Report')}_"
-                f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-            )
-
-        st.session_state["final_bytes"]    = _built
-        st.session_state["final_filename"] = _fname
 
     final_bytes = st.session_state["final_bytes"]
     filename    = st.session_state["final_filename"]

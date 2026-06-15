@@ -46,17 +46,17 @@ Everything lives in one ~2700-line file: `app.py`. There is no backend server of
 
 ### Dify Orchestration
 
-`run_workflow(inputs, api_base, api_key, status_placeholder=None)` POSTs to `/workflows/run` in **streaming (SSE)** mode with `timeout=(30, 1800)` (30s connect / 1800s read) and `verify=False` (intentional, internal use). It parses SSE events itself, updates the UI on `node_finished`, raises on `node_finished status=failed` / `workflow_finished status=failed` / `error` events, and returns the `outputs` dict from `workflow_finished`. It deliberately drops large event payloads before any Streamlit call (the MAIN end-node carries all 19 fields, hundreds of KB).
+`run_workflow(inputs, api_base, api_key, status_placeholder=None)` POSTs to `/workflows/run` in **streaming (SSE)** mode with `timeout=(30, 1800)` (30s connect / 1800s read) and `verify=False` (intentional, internal use). It parses SSE events itself, updates the UI on `node_finished`, raises on `node_finished status=failed` / `workflow_finished status=failed` / `error` events, and returns the `outputs` dict from `workflow_finished`. It deliberately drops large event payloads before any Streamlit call (the MAIN end-node carries all 20 fields, hundreds of KB).
 
 `upload_file(...)` multipart-POSTs to `/files/upload` (also `verify=False`) and returns `upload_file_id`. `to_str(v)` coerces any workflow output to `str` (`None`→`""`, list/dict→JSON with `ensure_ascii=False`) before it is passed to the next step.
 
 **Three-step data flow** (all three run from a single **"Run All Steps (1 → 2 → 3)"** button — not three separate clicks):
 
-1. Upload files + fill form → MAIN → `main_outputs` (19 fields)
+1. Upload files + fill form → MAIN → `main_outputs` (20 fields)
 2. SUB1 reads `main_outputs` → `sub1_outputs`
 3. SUB2 reads both (`inputs_sub2`) → `final_result` (markdown string)
 
-The MAIN→SUB1→SUB2 19-field contract is the key coupling with `DIFY-backend`; see `../CLAUDE.md`. **SUB2 fallback pattern:** SUB2 inputs use `to_str(sub1_outputs.get(key) or user_inputs.get(key))` so fields SUB1 didn't modify still flow through. **Error handling:** Dify may return graceful error fields rather than HTTP errors — `outputs.get("Error")` / `outputs.get("Error_ORG")` are checked after each step and surfaced before stopping.
+The MAIN→SUB1→SUB2 20-field contract is the key coupling with `DIFY-backend`; see `../CLAUDE.md`. **SUB2 fallback pattern:** SUB2 inputs use `to_str(sub1_outputs.get(key) or user_inputs.get(key))` so fields SUB1 didn't modify still flow through. `UER_json` and `cuec_preformatted` are read straight from `main_outputs` in `inputs_sub2` (they bypass SUB1). **Error handling:** Dify may return graceful error fields rather than HTTP errors — `outputs.get("Error")` / `outputs.get("Error_ORG")` are checked after each step and surfaced before stopping.
 
 ### `.docx` Rendering — Two Modes
 
