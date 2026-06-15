@@ -1,6 +1,13 @@
 # AI-Driven SOC Report Generator
 
-A Streamlit application that generates SOC 1 and SOC 2 audit reports from control matrix files using a Dify AI workflow. Upload Excel, PDF, or Word files and receive a formatted `.docx` report.
+A Streamlit application that generates SOC 1 and SOC 2 audit reports from control matrix files. Upload Excel, PDF, or Word files and receive a formatted `.docx` report.
+
+The final document combines two pipelines:
+
+1. **EY Word templates** (local, no AI) — Section I (Management Assertion) and Section II (Independent Auditor's Report), filled in from the form fields.
+2. **Dify AI workflow** (three streaming steps) — Sections III–IV, the generated report body.
+
+Both are assembled into a single `.docx`. You can also generate just the template sections, or just the Dify body.
 
 ---
 
@@ -96,11 +103,37 @@ API keys are embedded inside `_internal\` within the bundle and are not visible 
 
 ## Using the App
 
-The app runs as a three-step workflow. Each step must complete before the next becomes available.
+Everything is on a single page. Fill in the form, then click **Run All Steps** — the app uploads the files, runs the three Dify workflow steps (MAIN → SUB1 → SUB2) back-to-back, assembles the document, and offers it for download. There are no separate per-step buttons; progress is shown per node as it runs.
 
-### Step 1 — MAIN: Extract & Prepare
+### Complete Report Settings
 
-**Upload files:** One or more Excel, PDF, or Word files containing the control matrix and supporting data.
+**Generate complete report (MA + AR + main sections)** is checked by default. When enabled, the output includes the two EY-template sections ahead of the Dify-generated body:
+
+- **Section I — Management Assertion (MA)**
+- **Section II — Independent Auditor's Report (AR)**
+
+Uncheck it to generate only the Dify sections (III–IV).
+
+When enabled, the **Complete Report Settings** panel drives the templates:
+
+| Setting | Description |
+|---|---|
+| Standard | Audit standard (the available options depend on Report Type) |
+| Report Signing Date | `YYYY-MM-DD`; auto-formatted as "January 30, 2026" (EN) / "2026年1月30日" (CN) |
+| Signing City | City shown in the signature block, e.g. Shanghai |
+| AR Addressee | "Management" or "Board of Directors" — sets the AR opening line |
+| Complementary User Entity Controls (CUEC) | Identified / Not Identified — controls CUEC wording in the AR |
+| Includes transaction processing wording | When unchecked, the **Systems Function** field is used in place of the transaction-processing wording |
+| Single user entity report | Toggles single-user-entity template spans |
+| Subject matter includes AI technology | Adds the paragraph noting AI is used but excluded from audit scope |
+| Report includes 'Other Information' section | When unchecked, removes paragraphs that reference the Other Information section |
+| SSO Complementary Controls | Identified / Not Identified (shown only when a Subservice Organization testing strategy other than *None* is selected) |
+
+The panel also shows a **live template-resolution preview** indicating which MA/AR `.docx` will be used for the chosen Report Type / Standard / SSO / Language combination, or a warning if none matches.
+
+### Upload & form fields
+
+**Upload:** One or more Excel, PDF, or Word files containing the control matrix and supporting data.
 
 **Required fields:**
 
@@ -111,37 +144,39 @@ The app runs as a three-step workflow. Each step must complete before the next b
 | Service / System Name | Name of the system being audited |
 | Service Description | Brief description of the service |
 | Report Period Start | Start date, e.g. `2025-01-01` (use as-of date for TYPE1) |
+| Report Period End | Required for TYPE2; leave blank (N/A) for TYPE1 |
 | Report Type | SOC1 TYPE1, SOC1 TYPE2, SOC2 TYPE1, or SOC2 TYPE2 |
 | Output Language | English or 中文 |
 | Subservice Organization Testing Strategy | None, All carve out, or Inclusive |
+| Subservice Organization | Name and services (one per line: `Org Name \| Services`); required if testing strategy is not *None* |
 | Industry | HR, IaaS, AI, SaaS, or Others |
 
 **Optional fields:**
 
 | Field | Description |
 |---|---|
-| Report Period End | Required for TYPE2; leave blank for TYPE1 |
-| Company Website | Included in the report header |
-| Internal Supporting Systems | Auto-extracted from the control matrix if left blank |
-| Systems Function | Describes the purpose of the supporting systems |
 | Control Domain | Only needed if not present in the uploaded document |
-| Subservice Organization | Name and services; required if testing strategy is not None |
+| Company Website | Included in the report header |
+| Systems Function | Describes the purpose of the internal supporting systems |
+| Internal Supporting Systems | Auto-extracted from the control matrix if left blank |
 
-**Trust Service Criteria (SOC 2 only):** Check Security, Availability, Processing Integrity, Confidentiality, and/or Privacy as applicable.
+**Trust Service Criteria (SOC 2 only):** Check Security, Availability, Processing Integrity, Confidentiality, and/or Privacy as applicable. At least one is required for SOC 2 reports.
 
-Click **Run Step 1 — MAIN Workflow** to start. This step typically takes several minutes.
+**User Entity Section** — two toggles for optional report sections generated from the control matrix:
 
-### Step 2 — SUB1: Entity Level Controls
+- **Include CUEC** (Complementary User Entity Controls) — on by default for SOC1 reports
+- **Include UER** (User Entity Responsibilities) — on by default for SOC2 reports
 
-Appears after Step 1 completes. Click **Run Step 2 — SUB1 Workflow**. No additional inputs required.
+The default follows the Report Type but can be overridden within a given type.
 
-### Step 3 — SUB2: Final Report Assembly
+### Generating the report
 
-Appears after Step 2 completes. Click **Run Step 3 — SUB2 Workflow**. No additional inputs required.
+- **▶ Run All Steps (1 → 2 → 3)** — uploads files and runs the full Dify pipeline, then assembles and offers the final `.docx`. Typically takes several minutes.
+- **🧪 Generate MA + AR only (templates, no Dify)** — fills the Section I + II templates from the form fields *without* calling Dify (handy for checking template output). Produces a `{ShortName}_{ReportType}_MA_AR.docx` download.
 
 ### Download
 
-When Step 3 finishes, a report preview appears and a **Download Report (.docx)** button is shown.
+When the run finishes, a report preview appears and a **Download Report (.docx)** button is shown.
 
 The downloaded file is named: `{CompanyShortName}_{ReportType}_Report.docx`
 
