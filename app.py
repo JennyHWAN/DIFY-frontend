@@ -2081,140 +2081,49 @@ def _inline_bullet(paragraph, text):
         _inline(paragraph, text)
 
 
+def build_final_document(result_text, ui, tc):
+    """Build the final .docx bytes (+ filename) from the SUB2 markdown result.
+
+    Returns (bytes, filename). In complete mode the EY MA/AR templates are filled
+    and merged with the Dify sections; otherwise the Dify sections are rendered
+    on their own. Any failure in the complete path falls back to Dify-only.
+    Caller is responsible for wrapping this in a spinner if desired.
+    """
+    dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+
+    if (tc.get("generate_complete")
+            and tc.get("ar_template_path")
+            and tc.get("ma_template_path")):
+        subs  = build_substitutions(ui, tc)
+        flags = build_flags(tc)
+        _lang = ui.get("Output_language", "English")
+        try:
+            ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
+            ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+            built = enforce_line_spacing(
+                merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+            )
+            fname = (
+                f"{ui.get('Co_short_name', 'Report')}_"
+                f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
+            )
+            return built, fname
+        except Exception as exc:
+            st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
+
+    built = enforce_line_spacing(dify_bytes)
+    fname = (
+        f"{ui.get('Co_short_name', 'Report')}_"
+        f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+    )
+    return built, fname
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
 if not final_done:
 
-    # ── Complete report option ─────────────────────────────────────────────────
-    generate_complete = st.checkbox(
-        "Generate complete report (MA + AR + main sections)",
-        value=True,
-        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
-    )
-
-    if generate_complete:
-        with st.expander("Complete Report Settings", expanded=True):
-            cr1, cr2 = st.columns(2)
-
-            # Read current Report Type from session_state key (set by the selectbox below).
-            # Falls back to the previous run's saved value, then to default.
-            _cur_rt = (
-                st.session_state.get("form_report_type")
-                or st.session_state.get("user_inputs", {}).get("Report_type", "SOC2 TYPE2")
-            )
-            _cur_sso = (
-                st.session_state.get("form_scope_of_report")
-                or st.session_state.get("user_inputs", {}).get("Scope_of_the_report", "None")
-            )
-            _cur_lang = (
-                st.session_state.get("form_output_language")
-                or st.session_state.get("user_inputs", {}).get("Output_language", "English")
-            )
-
-            with cr1:
-                _std_options = get_standard_options(_cur_rt)
-                standard = st.selectbox("Standard", _std_options, key="cr_standard")
-                report_date  = st.text_input(
-                    "Report Signing Date (YYYY-MM-DD)",
-                    placeholder="e.g. 2026-01-30",
-                    key="cr_report_date",
-                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
-                         "\"2026年1月30日\" in Chinese reports. "
-                         "Other text is inserted into the report as-is.",
-                )
-                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
-
-            with cr2:
-                addressee_choice = st.radio(
-                    "AR Addressee",
-                    ["Management", "Board of Directors"],
-                    index=0,
-                    key="cr_addressee",
-                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
-                )
-                cuec_choice = st.radio(
-                    "Complementary User Entity Controls (CUEC)",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_cuec",
-                )
-                has_transaction_processing = st.checkbox(
-                    "Includes transaction processing wording",
-                    value=True,
-                    key="cr_transaction",
-                )
-                if not has_transaction_processing:
-                    st.caption(
-                        "⚠️ When unchecked, the 'Systems Function' field below "
-                        "(Required Fields section) is used to describe the system's "
-                        "function in place of transaction-processing wording."
-                    )
-                single_user_entity = st.checkbox(
-                    "Single user entity report",
-                    value=False,
-                    key="cr_single_user",
-                )
-                has_ai_scope_exclusion = st.checkbox(
-                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
-                    value=False,
-                    key="cr_ai_scope",
-                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
-                )
-                has_other_information = st.checkbox(
-                    "Report includes 'Other Information' section",
-                    value=True,
-                    key="cr_other_info",
-                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
-                )
-
-            # SSO CC — only shown when SSO != None
-            if _cur_sso != "None":
-                sso_cc_choice = st.radio(
-                    "SSO Complementary Controls",
-                    ["Identified", "Not Identified"],
-                    index=0,
-                    key="cr_sso_cc",
-                )
-            else:
-                sso_cc_choice = "Identified"
-
-            # Template resolution preview (computed every render)
-            st.markdown("---")
-            _ar_wp, _ar_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "AR")
-            _ma_wp, _ma_path = resolve_template(_cur_rt, standard, _cur_sso, _cur_lang, "MA")
-
-            def _show_template_status(label, wp, path, dir_name):
-                if wp is None and isinstance(path, str):
-                    # path carries the error message when wp is None
-                    st.error(f"{label}: {path}")
-                elif wp is None:
-                    st.warning(f"{label}: No matching template found for this combination.")
-                elif path and os.path.isfile(path):
-                    st.info(f"{label}: WP No. {wp} \u2192 {os.path.basename(path)}")
-                elif isinstance(path, str) and path.startswith("Cannot"):
-                    st.error(f"{label}: WP No. {wp} — {path}")
-                else:
-                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
-
-            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
-            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
-
-    else:
-        standard                  = ""
-        report_date               = ""
-        signing_city              = ""
-        cuec_choice               = "Identified"
-        sso_cc_choice             = "Identified"
-        has_transaction_processing = True
-        single_user_entity         = False
-        has_ai_scope_exclusion     = False
-        has_other_information      = True
-        addressee_choice           = "Management"
-        _ar_path                   = None
-        _ma_path                   = None
-
-    st.markdown("---")
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
         "1. 请上传Excel大表，其中必须包含Control Matrix sheet；"
@@ -2259,6 +2168,122 @@ if not final_done:
         if len(subservice_org) > 256:
             st.warning("⚠️ Subservice Organization exceeds 256 characters. Please shorten it.")
 
+    # ── Complete report option ─────────────────────────────────────────────────
+    # Placed after Required Fields so the MA/AR template settings below react to
+    # the Report Type / Subservice Testing Strategy / Output Language chosen above.
+    st.markdown("---")
+    generate_complete = st.checkbox(
+        "Generate complete report (MA + AR + main sections)",
+        value=True,
+        help="When checked, the download will include Section I (Management Assertion) and Section II (Independent Auditor's Report) generated from EY templates, followed by the Dify-generated sections. Uncheck to generate Sections III–IV only (existing behaviour).",
+    )
+
+    if generate_complete:
+        with st.expander("Complete Report Settings", expanded=True):
+            cr1, cr2 = st.columns(2)
+
+            with cr1:
+                _std_options = get_standard_options(report_type)
+                standard = st.selectbox("Standard", _std_options, key="cr_standard")
+                report_date  = st.text_input(
+                    "Report Signing Date (YYYY-MM-DD)",
+                    placeholder="e.g. 2026-01-30",
+                    key="cr_report_date",
+                    help="Formatted automatically: \"January 30, 2026\" in English reports, "
+                         "\"2026年1月30日\" in Chinese reports. "
+                         "Other text is inserted into the report as-is.",
+                )
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+
+            with cr2:
+                addressee_choice = st.radio(
+                    "AR Addressee",
+                    ["Management", "Board of Directors"],
+                    index=0,
+                    key="cr_addressee",
+                    help="Controls whether the AR opens 'To the Management of' or 'To the Board of Directors of' followed by the service organization name.",
+                )
+                cuec_choice = st.radio(
+                    "Complementary User Entity Controls (CUEC)",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_cuec",
+                )
+                has_transaction_processing = st.checkbox(
+                    "Includes transaction processing wording",
+                    value=True,
+                    key="cr_transaction",
+                )
+                if not has_transaction_processing:
+                    st.caption(
+                        "⚠️ When unchecked, the 'Systems Function' field "
+                        "(Optional Fields section) is used to describe the system's "
+                        "function in place of transaction-processing wording."
+                    )
+                single_user_entity = st.checkbox(
+                    "Single user entity report",
+                    value=False,
+                    key="cr_single_user",
+                )
+                has_ai_scope_exclusion = st.checkbox(
+                    "Subject matter includes AI technology (audit scope excludes AI-specific functions)",
+                    value=False,
+                    key="cr_ai_scope",
+                    help="When checked, includes the paragraph disclosing that AI technology is used in the subject matter but is not within the audit scope. Leave unchecked if the subject matter does not involve AI technology.",
+                )
+                has_other_information = st.checkbox(
+                    "Report includes 'Other Information' section",
+                    value=True,
+                    key="cr_other_info",
+                    help="When unchecked, template paragraphs that refer to the Other Information section (注：如果没有Other Information这一章节，删除本段) are removed.",
+                )
+
+            # SSO CC — only shown when SSO != None
+            if scope_of_report != "None":
+                sso_cc_choice = st.radio(
+                    "SSO Complementary Controls",
+                    ["Identified", "Not Identified"],
+                    index=0,
+                    key="cr_sso_cc",
+                )
+            else:
+                sso_cc_choice = "Identified"
+
+            # Template resolution preview (computed every render)
+            st.markdown("---")
+            _ar_wp, _ar_path = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
+            _ma_wp, _ma_path = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+
+            def _show_template_status(label, wp, path, dir_name):
+                if wp is None and isinstance(path, str):
+                    # path carries the error message when wp is None
+                    st.error(f"{label}: {path}")
+                elif wp is None:
+                    st.warning(f"{label}: No matching template found for this combination.")
+                elif path and os.path.isfile(path):
+                    st.info(f"{label}: WP No. {wp} → {os.path.basename(path)}")
+                elif isinstance(path, str) and path.startswith("Cannot"):
+                    st.error(f"{label}: WP No. {wp} — {path}")
+                else:
+                    st.warning(f"{label}: WP No. {wp} listed but .docx not found in {dir_name}/")
+
+            _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
+            _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
+
+    else:
+        standard                  = ""
+        report_date               = ""
+        signing_city              = ""
+        cuec_choice               = "Identified"
+        sso_cc_choice             = "Identified"
+        has_transaction_processing = True
+        single_user_entity         = False
+        has_ai_scope_exclusion     = False
+        has_other_information      = True
+        addressee_choice           = "Management"
+        _ar_path                   = None
+        _ma_path                   = None
+
 
 
     # ── Optional fields ────────────────────────────────────────────────────────
@@ -2286,6 +2311,27 @@ if not final_done:
     is_processing_integrity  = tsc_cols[2].checkbox("Processing Integrity", key="form_tsc_processing")
     is_confidentiality       = tsc_cols[3].checkbox("Confidentiality",      key="form_tsc_confidentiality")
     is_privacy               = tsc_cols[4].checkbox("Privacy",              key="form_tsc_privacy")
+
+    st.subheader("User Entity Section")
+    # Defaults follow the report type: CUEC for SOC1, UER for SOC2. The report_type
+    # is baked into the widget key so the default re-applies when the report type
+    # changes, while still letting the user override within a given type.
+    ue_cols = st.columns(2)
+    # Labels are kept short (acronym only) so they stay on a single line within the
+    # half-width column — otherwise the long CUEC label wraps and its help "?" icon
+    # drops to the second line, misaligning it with UER's. Full names live in `help`.
+    is_cuec = ue_cols[0].checkbox(
+        "Include CUEC",
+        value=report_type.startswith("SOC1"),
+        key=f"form_is_cuec_{report_type}",
+        help="Complementary User Entity Controls — default on for SOC1 reports. "
+             "Generated from the control matrix.")
+    is_uer = ue_cols[1].checkbox(
+        "Include UER",
+        value=report_type.startswith("SOC2"),
+        key=f"form_is_uer_{report_type}",
+        help="User Entity Responsibilities — default on for SOC2 reports. "
+             "Generated from the control matrix.")
 
     st.markdown("---")
     run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
@@ -2468,6 +2514,8 @@ if not final_done:
             "is_Processing_Integrity": is_processing_integrity,
             "is_Confidentiality":      is_confidentiality,
             "is_Privacy":              is_privacy,
+            "is_CUEC":                 is_cuec,
+            "is_UER":                  is_uer,
         }
 
         # Store template config for download step
@@ -2594,6 +2642,10 @@ if not final_done:
                 "Co_short_name":          to_str(so.get("Co_short_name") or ui.get("Co_short_name")),
                 "System_or_service_name": to_str(so.get("System_or_service_name") or ui.get("System_or_service_name")),
                 "cuec_preformatted":      to_str(mo.get("cuec_preformatted")),
+                "UER_json":               to_str(mo.get("UER_json")),
+                "control_list_text":      to_str(mo.get("control_list_text")),
+                "is_CUEC":                bool(ui.get("is_CUEC", False)),
+                "is_UER":                 bool(ui.get("is_UER", False)),
             }
             try:
                 outputs_sub2 = run_workflow(inputs_sub2, api_base, key_sub2, node_status)
@@ -2608,6 +2660,20 @@ if not final_done:
                 st.warning("SUB2 completed but returned no output.")
                 st.stop()
             st.session_state["final_result"] = result
+
+            # Build the final .docx now — while we are still rendered inside the
+            # Steps container (right after "Nodes completed…"), so the
+            # "Generating and merging…" spinner appears exactly where the user is
+            # already looking instead of off-screen after the rerun. Cached so the
+            # post-rerun result section reuses it instead of rebuilding.
+            step_label.info("⏳ Building the final report document…")
+            with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
+                _built, _fname = build_final_document(
+                    result, st.session_state.get("user_inputs", {}),
+                    st.session_state.get("template_config", {}),
+                )
+            st.session_state["final_bytes"]    = _built
+            st.session_state["final_filename"] = _fname
 
         status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
         st.rerun()
@@ -2625,49 +2691,83 @@ if final_done:
     ui  = st.session_state.get("user_inputs", {})
     tc  = st.session_state.get("template_config", {})
 
+    # The document is normally built right after Step 3 (inside the Steps
+    # container, so the spinner is visible there). This guarded block is only a
+    # fallback for sessions where final_result exists but final_bytes does not
+    # (e.g. a restored session). Cached so reruns don't rebuild it.
+    if "final_bytes" not in st.session_state:
+        with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
+            _built, _fname = build_final_document(result_text, ui, tc)
+        st.session_state["final_bytes"]    = _built
+        st.session_state["final_filename"] = _fname
+
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    # Build the final .docx once per result — cache in session state so that
-    # clicking the download button (which triggers a Streamlit rerun) does not
-    # re-run the spinners while the file is already downloading.
-    if "final_bytes" not in st.session_state:
-        dify_bytes = markdown_to_docx(result_text, ui.get("Output_language", "English"))
+    # ── Inputs used — kept visible so the user can review what produced this
+    #    report. The input form itself is hidden once final_done is True, so this
+    #    read-only summary is the only place the chosen values survive.
+    with st.expander("📋 Inputs used for this report", expanded=False):
+        _flag = lambda v: "✓" if v else "—"
+        _g = lambda k, d="": ui.get(k, d)
 
-        if (tc.get("generate_complete")
-                and tc.get("ar_template_path")
-                and tc.get("ma_template_path")):
-            subs  = build_substitutions(ui, tc)
-            flags = build_flags(tc)
+        st.markdown("**Report parameters**")
+        st.markdown(
+            f"- Report type: `{_g('Report_type')}`\n"
+            f"- Output language: `{_g('Output_language')}`\n"
+            f"- Scope of report (SSO): `{_g('Scope_of_the_report')}`\n"
+            f"- Period: `{_g('Period_start')}` → `{_g('Period_end')}`"
+        )
 
-            _lang = ui.get("Output_language", "English")
-            try:
-                with st.spinner("Generating and merging MA & AR section (Section I & II)…"):
-                    ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
-                    ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
-                    _built = enforce_line_spacing(
-                        merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
-                    )
-                _fname = (
-                    f"{ui.get('Co_short_name', 'Report')}_"
-                    f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
-                )
-            except Exception as exc:
-                st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
-                _built = enforce_line_spacing(dify_bytes)
-                _fname = (
-                    f"{ui.get('Co_short_name', 'Report')}_"
-                    f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
-                )
-        else:
-            _built = enforce_line_spacing(dify_bytes)
-            _fname = (
-                f"{ui.get('Co_short_name', 'Report')}_"
-                f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
+        st.markdown("**Company / service**")
+        st.markdown(
+            f"- Company name: {_g('Company_name') or '—'}\n"
+            f"- Short name: {_g('Co_short_name') or '—'}\n"
+            f"- Industry: {_g('Industry') or '—'}\n"
+            f"- System / service: {_g('System_or_service_name') or '—'}\n"
+            f"- Service description: {_g('Service_description') or '—'}\n"
+            f"- System (extra): {_g('System') or '—'}\n"
+            f"- Systems function: {_g('Systems_function') or '—'}\n"
+            f"- Domain: {_g('Domain') or '—'}\n"
+            f"- Subservice org: {_g('Subservice_org') or '—'}\n"
+            f"- Website: {_g('Co_website') or '—'}"
+        )
+
+        st.markdown("**Trust Service Criteria (SOC2)**")
+        st.markdown(
+            f"- Security {_flag(_g('is_Security'))} · "
+            f"Availability {_flag(_g('is_Availability'))} · "
+            f"Processing Integrity {_flag(_g('is_Processing_Integrity'))} · "
+            f"Confidentiality {_flag(_g('is_Confidentiality'))} · "
+            f"Privacy {_flag(_g('is_Privacy'))}"
+        )
+
+        st.markdown("**User Entity sections**")
+        st.markdown(
+            f"- CUEC (Complementary User Entity Controls): {_flag(_g('is_CUEC'))}\n"
+            f"- UER (User Entity Responsibilities): {_flag(_g('is_UER'))}"
+        )
+
+        if tc.get("generate_complete"):
+            st.markdown("**Complete-report (MA + AR) settings**")
+            st.markdown(
+                f"- Standard: `{tc.get('standard') or '—'}`\n"
+                f"- Report signing date: {tc.get('report_date') or '—'}\n"
+                f"- Signing city: {tc.get('signing_city') or '—'}\n"
+                f"- AR addressee: {tc.get('addressee_choice') or '—'}\n"
+                f"- CUEC identified: {_flag(tc.get('cuec_identified'))}\n"
+                f"- SSO complementary controls identified: {_flag(tc.get('sso_cc_identified'))}\n"
+                f"- Transaction processing wording: {_flag(tc.get('has_transaction_processing'))}\n"
+                f"- Single user entity: {_flag(tc.get('single_user_entity'))}\n"
+                f"- AI scope exclusion: {_flag(tc.get('has_ai_scope_exclusion'))}\n"
+                f"- Other Information section: {_flag(tc.get('has_other_information'))}"
             )
-
-        st.session_state["final_bytes"]    = _built
-        st.session_state["final_filename"] = _fname
+            _mp = tc.get("ma_template_path")
+            _ap = tc.get("ar_template_path")
+            st.markdown(
+                f"- MA template: `{os.path.basename(_mp) if _mp else '—'}`\n"
+                f"- AR template: `{os.path.basename(_ap) if _ap else '—'}`"
+            )
 
     final_bytes = st.session_state["final_bytes"]
     filename    = st.session_state["final_filename"]
