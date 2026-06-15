@@ -751,6 +751,19 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
                 changed = True
                 continue
 
+        # d) Orphaned brackets from template-authoring inconsistencies. Some
+        #    multi-SSO templates open the conditional block by merging its 【 into
+        #    the first 【服务机构简称】 placeholder (single bracket instead of
+        #    double); once that placeholder is substituted away, the block's
+        #    closing 】 is left with no opening to pair against, so cases a–c above
+        #    can never match it. By this point all real bracket pairs and [or…]
+        #    phrases are gone, so any remaining 【】[] is an artifact — strip the
+        #    lone bracket characters (these templates never use them as literal
+        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN".
+        for run in para.runs:
+            if run.text and re.search(r"[【】\[\]]", run.text):
+                run.text = re.sub(r"[【】\[\]]", "", run.text)
+
         # Normalize spaces introduced by empty removals
         prev_ended_space = False
         for run in para.runs:
@@ -1179,8 +1192,9 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     Final pass over the finished document: set every paragraph (body and
     table cells, including nested tables) to the given multiple line spacing,
     and normalise every run to Times New Roman Latin/complex-script fonts and
-    black text. The CJK (eastAsia) font is left untouched so the per-language
-    choice made earlier (华文楷体 / 黑体) survives.
+    black text, and the CJK (eastAsia) font to 华文楷体 — so the whole document
+    is uniform (Times New Roman for Latin, 华文楷体 for Chinese) regardless of
+    what each merged section set, instead of the old 华文楷体 / 黑体 mix.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -1215,10 +1229,11 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     for r_el in doc.element.body.iter(qn("w:r")):
         rPr = r_el.get_or_add_rPr()
         rFonts = rPr.get_or_add_rFonts()
-        rFonts.set(qn("w:ascii"), "Times New Roman")
-        rFonts.set(qn("w:hAnsi"), "Times New Roman")
-        rFonts.set(qn("w:cs"),    "Times New Roman")
-        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
         color = rPr.get_or_add_color()
@@ -1255,8 +1270,7 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     # Paragraph-mark rPr (w:pPr/w:rPr) controls how list numbers/bullets are
     # rendered when the numbering level itself names no font — e.g. the CN AR
     # "a." items showed in 黑体 because the mark carried eastAsia=黑体 and no
-    # ascii font. Force Times New Roman Latin + black there as well; the
-    # eastAsia font is again left untouched.
+    # ascii font. Force Times New Roman Latin + 华文楷体 CJK + black here too.
     _mark_tail_tags = (qn("w:sectPr"), qn("w:pPrChange"))
     for pPr in doc.element.body.iter(qn("w:pPr")):
         rPr = pPr.find(qn("w:rPr"))
@@ -1275,10 +1289,11 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
                 rStyle.addnext(rFonts)
             else:
                 rPr.insert(0, rFonts)
-        rFonts.set(qn("w:ascii"), "Times New Roman")
-        rFonts.set(qn("w:hAnsi"), "Times New Roman")
-        rFonts.set(qn("w:cs"),    "Times New Roman")
-        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme"):
+        rFonts.set(qn("w:ascii"),    "Times New Roman")
+        rFonts.set(qn("w:hAnsi"),    "Times New Roman")
+        rFonts.set(qn("w:cs"),       "Times New Roman")
+        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
         color = rPr.find(qn("w:color"))
@@ -1716,11 +1731,11 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
 
 FONT_LATIN   = "Times New Roman"
-FONT_CHINESE = "黑体"
+FONT_CHINESE = "华文楷体"
 
 
 def _apply_fonts(run):
-    """Set Times New Roman for Latin characters, 黑体 for Chinese characters.
+    """Set Times New Roman for Latin characters, 华文楷体 for Chinese characters.
     Word automatically picks the right one per character based on Unicode range."""
     rPr = run._r.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
@@ -1734,7 +1749,8 @@ def _apply_fonts(run):
 
 
 def _set_style_fonts(style):
-    """Apply the same dual-font setting at the paragraph-style level."""
+    """Apply the same dual-font setting (Times New Roman + 华文楷体) at the
+    paragraph-style level."""
     rPr = style.element.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
