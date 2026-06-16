@@ -1,9 +1,8 @@
 @echo off
-setlocal
 :: ============================================================
 ::  Build script for SOC Report Generator Windows EXE
 ::  Run this file on a Windows machine to produce the .exe
-::  Output: C:\DIFY_build\dist\SOC_Report_Generator\SOC_Report_Generator.exe
+::  Output: dist\SOC_Report_Generator\SOC_Report_Generator.exe
 :: ============================================================
 
 echo ============================================================
@@ -19,72 +18,43 @@ if errorlevel 1 (
     exit /b 1
 )
 
-:: Local, non-OneDrive staging folder for the build source.
-set "SRC=C:\DIFY_src"
-
-echo [1/4] Staging source to a local folder (%SRC%)...
-:: PyInstaller fails with "OSError: [Errno 22] Invalid argument" when it reads
-:: source files that live on a OneDrive "Files On-Demand" path: online-only
-:: placeholders are not real local files and the read fails. Copying the project
-:: to a plain local folder forces OneDrive to download (hydrate) every file and
-:: hands PyInstaller real files to read. It also keeps source paths short, which
-:: avoids the Windows 260-char MAX_PATH limit during analysis.
-if exist "%SRC%" rmdir /s /q "%SRC%"
-robocopy "%~dp0." "%SRC%" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP ^
-    /XD .git venv .venv __pycache__ .idea build dist
-:: robocopy uses a bitmask exit code: 0-7 = success, 8+ = real failure.
-if errorlevel 8 (
-    echo [ERROR] Failed to stage source to %SRC%.
-    echo         If files are online-only, open OneDrive and choose
-    echo         "Always keep on this device" for the project folder, then retry.
-    pause
-    exit /b 1
-)
-
-:: Everything from here runs against the local copy.
-pushd "%SRC%"
-
-echo.
-echo [2/4] Installing / upgrading dependencies...
+echo [1/3] Installing / upgrading dependencies...
 python -m pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org
 python -m pip install pyinstaller --upgrade --trusted-host pypi.org --trusted-host files.pythonhosted.org
 if errorlevel 1 (
     echo [ERROR] pip install failed.
-    popd
     pause
     exit /b 1
 )
 
 echo.
-echo [3/4] Cleaning previous build artifacts...
+echo [2/3] Cleaning previous build artifacts...
 if exist C:\DIFY_build\dist   rmdir /s /q C:\DIFY_build\dist
 if exist C:\DIFY_build\work   rmdir /s /q C:\DIFY_build\work
 
 echo.
-echo [4/4] Building executable with PyInstaller...
-:: Short output path also avoids the 260-char MAX_PATH limit when Streamlit's
-:: deeply nested asset paths are appended to dist\.
+echo [3/3] Building executable with PyInstaller...
+:: Use a short output path to avoid Windows 260-char MAX_PATH limit.
+:: The project is inside a long OneDrive path; Streamlit's nested asset
+:: paths would otherwise exceed the limit when appended to dist\.
 python -m PyInstaller app-win.spec --distpath C:\DIFY_build\dist --workpath C:\DIFY_build\work
-set "BUILD_ERR=%errorlevel%"
-popd
-if not "%BUILD_ERR%"=="0" (
+if errorlevel 1 (
     echo [ERROR] PyInstaller build failed. See output above.
     pause
     exit /b 1
 )
 
-:: Copy .env.example next to the exe so users can rename it to .env.
-:: Source files come from the hydrated local copy in %SRC%, not OneDrive.
-copy /Y "%SRC%\.env.example" C:\DIFY_build\dist\SOC_Report_Generator\.env.example >nul 2>&1
+:: Copy .env.example next to the exe so users can rename it to .env
+copy /Y .env.example C:\DIFY_build\dist\SOC_Report_Generator\.env.example >nul 2>&1
 
 :: Copy template files next to the exe (app.py reads them from sys.executable's folder when frozen)
 echo Copying template files...
-copy /Y "%SRC%\template_index.xlsx" C:\DIFY_build\dist\SOC_Report_Generator\template_index.xlsx >nul 2>&1
-if exist "%SRC%\AR_template" (
-    xcopy /E /I /Y "%SRC%\AR_template" C:\DIFY_build\dist\SOC_Report_Generator\AR_template >nul 2>&1
+copy /Y template_index.xlsx C:\DIFY_build\dist\SOC_Report_Generator\template_index.xlsx >nul 2>&1
+if exist AR_template (
+    xcopy /E /I /Y AR_template C:\DIFY_build\dist\SOC_Report_Generator\AR_template >nul 2>&1
 )
-if exist "%SRC%\MA_template" (
-    xcopy /E /I /Y "%SRC%\MA_template" C:\DIFY_build\dist\SOC_Report_Generator\MA_template >nul 2>&1
+if exist MA_template (
+    xcopy /E /I /Y MA_template C:\DIFY_build\dist\SOC_Report_Generator\MA_template >nul 2>&1
 )
 
 echo.
@@ -100,4 +70,3 @@ echo    (Templates are included in the folder alongside the exe)
 echo ============================================================
 echo.
 pause
-endlocal
