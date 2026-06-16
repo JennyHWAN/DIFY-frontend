@@ -2618,7 +2618,14 @@ def build_final_document(result_text, ui, tc):
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
-if not final_done:
+# The input form is rendered on every run — even after a report is generated —
+# so the user's selections and uploaded files stay put. Streamlit garbage-
+# collects widget state for widgets that aren't rendered in a run; hiding the
+# form after generation was what made Reset come back empty. Keeping it rendered
+# means the values (and the file-uploader contents) persist naturally, so Reset
+# only has to clear the generated result. The finished report renders in the
+# FINAL RESULT block below this one.
+if True:
 
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
@@ -2632,6 +2639,7 @@ if not final_done:
     uploaded_files = st.file_uploader(
         "Upload files (Excel, PDF, Word, etc.)",
         accept_multiple_files=True,
+        key="uploaded_files",
     )
 
     # ── Required fields ───────────────────────────────────────────────────────
@@ -3287,9 +3295,9 @@ if final_done:
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    # ── Inputs used — kept visible so the user can review what produced this
-    #    report. The input form itself is hidden once final_done is True, so this
-    #    read-only summary is the only place the chosen values survive.
+    # ── Inputs used — a collapsed read-only summary of exactly what produced
+    #    this report. The live form above stays populated now, but this snapshot
+    #    reflects the values at generation time even if the form is later edited.
     with st.expander("📋 Inputs used for this report", expanded=False):
         _flag = lambda v: "✓" if v else "—"
         _g = lambda k, d="": ui.get(k, d)
