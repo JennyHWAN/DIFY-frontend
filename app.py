@@ -1241,16 +1241,29 @@ _IMG_CONTENT_TYPES = {
 def _extract_letterhead_parts(letterhead_path):
     """Read the header parts (and their images) + sectPr from a letterhead .docx.
 
-    Returns (sectpr_xml, headers) where *headers* maps the header type
-    ('default' / 'first') to {'xml', 'rels', 'images': {orig_target: bytes}}.
-    Footers are intentionally ignored (header-only injection)."""
+    Returns (sectpr_xml, headers, support) where *headers* maps the header type
+    ('default' / 'first') to {'xml', 'rels', 'images': {orig_target: bytes}} and
+    *support* carries the letterhead's font and paragraph-style definitions
+    ({'fonts': [<w:font> xml...], 'styles': [<w:style> xml...]}).  The fonts and
+    styles must travel with the header: 'EYInterstate Light' is a named weight of
+    the EYInterstate family, so without the matching font-table entry Word can't
+    resolve the weighted name to the installed font and substitutes a default —
+    even on a machine that has the font.  Footers are ignored (header-only)."""
     with zipfile.ZipFile(letterhead_path, "r") as z:
         names   = set(z.namelist())
         doc_xml = z.read("word/document.xml").decode("utf-8")
         m = re.search(r"<w:sectPr\b.*?</w:sectPr>", doc_xml, re.S)
         if not m:
-            return None, {}
+            return None, {}, {"fonts": [], "styles": []}
         sectpr = m.group(0)
+
+        support = {"fonts": [], "styles": []}
+        if "word/fontTable.xml" in names:
+            ft = z.read("word/fontTable.xml").decode("utf-8")
+            support["fonts"] = re.findall(r"<w:font\b[^>]*?/>|<w:font\b.*?</w:font>", ft, re.S)
+        if "word/styles.xml" in names:
+            sx = z.read("word/styles.xml").decode("utf-8")
+            support["styles"] = re.findall(r"<w:style\b.*?</w:style>", sx, re.S)
 
         rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
         rid_target = dict(re.findall(r'Id="([^"]+)"[^>]*?Target="([^"]+)"', rels))
@@ -1278,7 +1291,7 @@ def _extract_letterhead_parts(letterhead_path):
                 if ipart in names:
                     images[itarget] = z.read(ipart)
             headers[htype] = {"xml": hxml, "rels": hrels, "images": images}
-        return sectpr, headers
+        return sectpr, headers, support
 
 
 def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
@@ -1291,16 +1304,46 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
     page via the 'first' header, continuation header on later pages). Footers
     are not injected. Requires the document to have been merged with
     split_sections=True so one sectPr corresponds to the AR section."""
-    sectpr_src, headers = _extract_letterhead_parts(letterhead_path)
+    sectpr_src, headers, support = _extract_letterhead_parts(letterhead_path)
     if not sectpr_src or not headers:
         return docx_bytes
 
     buf_in  = io.BytesIO(docx_bytes)
     buf_out = io.BytesIO()
     with zipfile.ZipFile(buf_in, "r") as zin:
+        names    = set(zin.namelist())
         doc_xml  = zin.read("word/document.xml").decode("utf-8")
         rels_xml = zin.read("word/_rels/document.xml.rels").decode("utf-8")
         ct_xml   = zin.read("[Content_Types].xml").decode("utf-8")
+
+        # Transplant the letterhead's font declarations and paragraph styles
+        # that the merged document is missing, so the header runs resolve
+        # 'EYInterstate Light' (a named weight) to the installed font instead
+        # of being substituted. Only names/ids not already present are added.
+        def _missing(blocks, id_attr, have):
+            out = []
+            for blk in blocks:
+                m = re.search(id_attr + r'="([^"]+)"', blk)
+                if m and m.group(1) not in have:
+                    have.add(m.group(1))   # also de-dupes within the added set
+                    out.append(blk)
+            return out
+
+        font_table_xml = None
+        if "word/fontTable.xml" in names and support["fonts"]:
+            ft   = zin.read("word/fontTable.xml").decode("utf-8")
+            have = set(re.findall(r'<w:font\b[^>]*\bw:name="([^"]+)"', ft))
+            add  = _missing(support["fonts"], "w:name", have)
+            if add and "</w:fonts>" in ft:
+                font_table_xml = ft.replace("</w:fonts>", "".join(add) + "</w:fonts>")
+
+        styles_xml = None
+        if "word/styles.xml" in names and support["styles"]:
+            sx   = zin.read("word/styles.xml").decode("utf-8")
+            have = set(re.findall(r'w:styleId="([^"]+)"', sx))
+            add  = _missing(support["styles"], "w:styleId", have)
+            if add and "</w:styles>" in sx:
+                styles_xml = sx.replace("</w:styles>", "".join(add) + "</w:styles>")
 
         # Allocate rIds that don't clash with the existing document rels
         used    = [int(n) for n in re.findall(r'Id="rId(\d+)"', rels_xml)]
@@ -1389,6 +1432,10 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
                     data = rels_xml.encode("utf-8")
                 elif fn == "[Content_Types].xml":
                     data = ct_xml.encode("utf-8")
+                elif fn == "word/fontTable.xml" and font_table_xml is not None:
+                    data = font_table_xml.encode("utf-8")
+                elif fn == "word/styles.xml" and styles_xml is not None:
+                    data = styles_xml.encode("utf-8")
                 else:
                     data = zin.read(fn)
                 zout.writestr(info, data)
