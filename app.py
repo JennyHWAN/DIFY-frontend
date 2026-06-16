@@ -2874,16 +2874,62 @@ if True:
              "Generated from the control matrix.")
 
     st.markdown("---")
-    run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
+
+    # ── Signature of every form input — lets us tell whether the form has been
+    #    edited since the current report was generated. While a report exists and
+    #    the form still matches it, the Run / MA+AR buttons are hidden (only the
+    #    preview + download remain); editing any field brings them back, rendered
+    #    beneath the download button in the FINAL RESULT block below.
+    _form_sig = (
+        report_type, output_language, scope_of_report, industry,
+        company_name, co_short_name, system_name, service_description,
+        period_start, period_end, subservice_org, systems_function,
+        system_extra, domain, co_website,
+        is_security, is_availability, is_processing_integrity,
+        is_confidentiality, is_privacy, is_cuec, is_uer,
+        generate_complete, standard, report_date, signing_city,
+        addressee_choice, cuec_choice, sso_cc_choice,
+        has_transaction_processing, single_user_entity,
+        has_ai_scope_exclusion, has_other_information, letterhead_path,
+        tuple((f.name, getattr(f, "size", None)) for f in (uploaded_files or [])),
+    )
+    # Only flag a change when we have a recorded signature to compare against —
+    # a restored/legacy session with no signature keeps the buttons hidden.
+    form_changed = (
+        final_done
+        and "_gen_sig" in st.session_state
+        and st.session_state["_gen_sig"] != _form_sig
+    )
+
+    # Buttons a) Run All Steps and b) Generate MA + AR only live at the top only
+    # until a report exists. Once `final_done` they vanish here; if the form is
+    # later edited they reappear below the download button (see FINAL RESULT).
+    run_main = False
+    run_ma_ar_only = False
+    if not final_done:
+        run_main = st.button(
+            "▶ Run All Steps (1 → 2 → 3)", type="primary",
+            use_container_width=True, key="btn_run_main_top",
+        )
+        if generate_complete:
+            run_ma_ar_only = st.button(
+                "🧪 Generate MA + AR only (templates, no Dify)",
+                use_container_width=True, key="btn_run_ma_ar_top",
+                help="Fills the Section I + II templates using the fields above "
+                     "without running the Dify workflow.",
+            )
+
+    # The bottom buttons (rendered in FINAL RESULT when the form is edited after
+    # generation) report their click via this flag + a rerun, so the heavy
+    # handlers below run from one place regardless of which button was used.
+    _pending = st.session_state.pop("_pending_action", None)
+    if _pending == "run_main":
+        run_main = True
+    elif _pending == "run_ma_ar":
+        run_ma_ar_only = True
 
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
-        run_ma_ar_only = st.button(
-            "🧪 Generate MA + AR only (templates, no Dify)",
-            use_container_width=True,
-            help="Fills the Section I + II templates using the fields above without "
-                 "running the Dify workflow.",
-        )
         if run_ma_ar_only:
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
@@ -2975,6 +3021,14 @@ if True:
                 except Exception as _exc:
                     st.session_state.pop("ma_ar_only", None)
                     st.error(f"MA + AR generation failed: {_exc}")
+                else:
+                    # Success: replace the on-screen result with just this MA+AR
+                    # download — drop any previously generated complete report so
+                    # its "Report is ready" bar / preview / inputs / download
+                    # don't linger alongside it. Rerun so `final_done` re-evaluates.
+                    for _k in ("final_result", "final_bytes", "final_filename", "_gen_sig"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
 
         # Clicking "Run All Steps" starts a Dify run; hide any pending MA+AR
         # download so its stale data can't be re-downloaded mid-workflow (a second
@@ -3265,6 +3319,9 @@ if True:
             )
             st.session_state["final_bytes"]    = _built
             st.session_state["final_filename"] = _fname
+            # Remember the form state that produced this report so the Run /
+            # MA+AR buttons stay hidden until the user edits something.
+            st.session_state["_gen_sig"]       = _form_sig
 
         status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
         st.rerun()
@@ -3371,3 +3428,26 @@ if final_done:
         type="primary",
         use_container_width=True,
     )
+
+    # When the form has been edited since this report was generated, bring the
+    # Run / MA+AR buttons back here — beneath the download button — so the user
+    # can regenerate. They post their click via a flag + rerun (picked up at the
+    # top of the form block) so the existing handlers run from one place. The
+    # download/preview above disappear as soon as a regenerate begins.
+    if form_changed:
+        st.markdown("---")
+        st.caption("⚠️ Form inputs changed since this report was generated — regenerate below.")
+        if st.button(
+            "▶ Run All Steps (1 → 2 → 3)", type="primary",
+            use_container_width=True, key="btn_run_main_bottom",
+        ):
+            st.session_state["_pending_action"] = "run_main"
+            st.rerun()
+        if generate_complete and st.button(
+            "🧪 Generate MA + AR only (templates, no Dify)",
+            use_container_width=True, key="btn_run_ma_ar_bottom",
+            help="Fills the Section I + II templates using the fields above "
+                 "without running the Dify workflow.",
+        ):
+            st.session_state["_pending_action"] = "run_ma_ar"
+            st.rerun()
