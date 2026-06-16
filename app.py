@@ -2862,13 +2862,23 @@ if not final_done:
                     st.session_state.pop("ma_ar_only", None)
                     st.error(f"MA + AR generation failed: {_exc}")
 
+        # Clicking "Run All Steps" starts a Dify run; hide any pending MA+AR
+        # download so its stale data can't be re-downloaded mid-workflow (a second
+        # click on the download button interrupts the running workflow).
+        if run_main:
+            st.session_state.pop("ma_ar_only", None)
+
         if st.session_state.get("ma_ar_only"):
-            st.download_button(
+            _ma_ar_downloaded = st.download_button(
                 label="⬇ Download MA + AR (.docx)",
                 data=st.session_state["ma_ar_only"]["bytes"],
                 file_name=st.session_state["ma_ar_only"]["filename"],
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
+            if _ma_ar_downloaded:
+                # One-shot download: drop the cached doc so the button disappears.
+                st.session_state.pop("ma_ar_only", None)
+                st.rerun()
 
     if run_main:
         errors = []
