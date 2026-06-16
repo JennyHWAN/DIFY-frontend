@@ -70,7 +70,11 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs", "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
+        # Clear only the generated results — leave the user's input intact so it
+        # doesn't have to be re-entered. The form widgets persist on their own;
+        # `user_inputs` (main form) and `template_config` (Complete Report
+        # Settings) are the input snapshots and are deliberately kept.
+        for k in ["main_outputs", "sub1_outputs", "final_result", "ma_ar_only", "final_bytes", "final_filename"]:
             st.session_state.pop(k, None)
         st.rerun()
 
