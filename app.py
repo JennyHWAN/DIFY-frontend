@@ -29,7 +29,26 @@ else:
 TEMPLATE_INDEX  = os.path.join(_TEMPLATE_BASE, "template_index.xlsx")
 AR_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
 MA_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
+# EY office letterhead .docx files (downloaded from the EY Templates Word add-in,
+# grouped + centred in Word). The header on the Auditor's Report pages is taken
+# from whichever one the user picks. Listed at runtime, so end users can add or
+# remove office letterheads next to the .exe without a rebuild.
+LETTERHEAD_DIR  = os.path.join(AR_TEMPLATE_DIR, "letterheads")
 EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
+
+
+def list_letterheads():
+    """Return the sorted list of letterhead .docx filenames in LETTERHEAD_DIR.
+
+    Read fresh on every call so the dropdown reflects whatever files currently
+    sit in the folder (alongside the .exe when frozen)."""
+    try:
+        return sorted(
+            f for f in os.listdir(LETTERHEAD_DIR)
+            if f.lower().endswith(".docx") and not f.startswith("~$")
+        )
+    except (FileNotFoundError, NotADirectoryError):
+        return []
 
 API_BASE_URL  = os.getenv("DIFY_API_BASE_URL", "https://api.dify.ai/v1")
 API_KEY_MAIN  = os.getenv("DIFY_API_KEY_MAIN", "")
@@ -1126,7 +1145,7 @@ def _inject_numbering(merged_bytes, extra_bytes):
     return buf_out.read()
 
 
-def merge_docx_sections(*docs_bytes):
+def merge_docx_sections(*docs_bytes, split_sections=False):
     """
     Merge multiple docx byte strings into one document with page breaks between
     sections.
@@ -1136,6 +1155,14 @@ def merge_docx_sections(*docs_bytes):
     extra definitions are injected into the merged file's numbering.xml.  This
     preserves the original list styles (bullets stay bullets, alpha lists stay
     alpha lists) across section boundaries.
+
+    When *split_sections* is True, each document boundary becomes a real Word
+    *section break* (a paragraph carrying a clone of the base section
+    properties) instead of a plain page break, so the merged document ends up
+    with one Word section per input document.  This is what lets a single
+    section (e.g. the Auditor's Report) carry its own header — see
+    inject_ar_letterhead(), which overwrites that section's sectPr afterwards.
+    The visual result is the same (each section still starts on a new page).
     """
     base_bytes = docs_bytes[0]
 
@@ -1154,15 +1181,29 @@ def merge_docx_sections(*docs_bytes):
     base = Document(io.BytesIO(base_bytes))
     body = base.element.body
     last_sectPr = body.find(qn("w:sectPr"))
+    # Source for cloned section-break properties (geometry/headers of the base
+    # document). Each break that precedes an extra closes the *previous*
+    # document's section; inject_ar_letterhead() later replaces the one section
+    # that needs the EY letterhead.
+    sect_props_src = last_sectPr
 
     for extra_bytes in extras_remapped:
-        # Insert a page break before the next section
-        p_br = OxmlElement("w:p")
-        r_br = OxmlElement("w:r")
-        br   = OxmlElement("w:br")
-        br.set(qn("w:type"), "page")
-        r_br.append(br)
-        p_br.append(r_br)
+        if split_sections and sect_props_src is not None:
+            # Section break: empty paragraph whose pPr carries a clone of the
+            # base section properties. Starts a new page like a page break, but
+            # also closes the preceding document's Word section.
+            p_br = OxmlElement("w:p")
+            pPr  = OxmlElement("w:pPr")
+            pPr.append(deepcopy(sect_props_src))
+            p_br.append(pPr)
+        else:
+            # Plain page break before the next section
+            p_br = OxmlElement("w:p")
+            r_br = OxmlElement("w:r")
+            br   = OxmlElement("w:br")
+            br.set(qn("w:type"), "page")
+            r_br.append(br)
+            p_br.append(r_br)
         if last_sectPr is not None:
             body.insert(list(body).index(last_sectPr), p_br)
         else:
@@ -1185,6 +1226,180 @@ def merge_docx_sections(*docs_bytes):
         merged_bytes = _inject_numbering(merged_bytes, extra_bytes)
 
     return merged_bytes
+
+
+# Relationship / content-type strings for injected header parts
+_REL_HEADER = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/header"
+_CT_HEADER  = "application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"
+_IMG_CONTENT_TYPES = {
+    "png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg",
+    "gif": "image/gif", "bmp": "image/bmp", "tiff": "image/tiff",
+    "emf": "image/x-emf", "wmf": "image/x-wmf", "svg": "image/svg+xml",
+}
+
+
+def _extract_letterhead_parts(letterhead_path):
+    """Read the header parts (and their images) + sectPr from a letterhead .docx.
+
+    Returns (sectpr_xml, headers) where *headers* maps the header type
+    ('default' / 'first') to {'xml', 'rels', 'images': {orig_target: bytes}}.
+    Footers are intentionally ignored (header-only injection)."""
+    with zipfile.ZipFile(letterhead_path, "r") as z:
+        names   = set(z.namelist())
+        doc_xml = z.read("word/document.xml").decode("utf-8")
+        m = re.search(r"<w:sectPr\b.*?</w:sectPr>", doc_xml, re.S)
+        if not m:
+            return None, {}
+        sectpr = m.group(0)
+
+        rels = z.read("word/_rels/document.xml.rels").decode("utf-8")
+        rid_target = dict(re.findall(r'Id="([^"]+)"[^>]*?Target="([^"]+)"', rels))
+
+        headers = {}
+        for htype, rid in re.findall(
+            r'<w:headerReference\s+w:type="([^"]+)"\s+r:id="([^"]+)"', sectpr
+        ):
+            target = rid_target.get(rid)
+            if not target:
+                continue
+            part = "word/" + target.lstrip("./")
+            if part not in names:
+                continue
+            hxml    = z.read(part)
+            relname = "word/_rels/" + target.lstrip("./") + ".rels"
+            hrels   = z.read(relname).decode("utf-8") if relname in names else (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<Relationships xmlns="http://schemas.openxmlformats.org/'
+                'package/2006/relationships"></Relationships>'
+            )
+            images = {}
+            for _iid, itarget in re.findall(r'Id="([^"]+)"[^>]*?Target="([^"]+)"', hrels):
+                ipart = "word/" + itarget.lstrip("./")
+                if ipart in names:
+                    images[itarget] = z.read(ipart)
+            headers[htype] = {"xml": hxml, "rels": hrels, "images": images}
+        return sectpr, headers
+
+
+def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
+    """Give the AR section of a merged document its own EY letterhead header.
+
+    Copies the letterhead's header part(s) + logo image into the merged package
+    and overwrites the ar_index-th sectPr (0-based, in document order) with the
+    letterhead's section geometry + header references, so the Auditor's Report
+    pages — and only those — carry the letterhead (full letterhead on the first
+    page via the 'first' header, continuation header on later pages). Footers
+    are not injected. Requires the document to have been merged with
+    split_sections=True so one sectPr corresponds to the AR section."""
+    sectpr_src, headers = _extract_letterhead_parts(letterhead_path)
+    if not sectpr_src or not headers:
+        return docx_bytes
+
+    buf_in  = io.BytesIO(docx_bytes)
+    buf_out = io.BytesIO()
+    with zipfile.ZipFile(buf_in, "r") as zin:
+        doc_xml  = zin.read("word/document.xml").decode("utf-8")
+        rels_xml = zin.read("word/_rels/document.xml.rels").decode("utf-8")
+        ct_xml   = zin.read("[Content_Types].xml").decode("utf-8")
+
+        # Allocate rIds that don't clash with the existing document rels
+        used    = [int(n) for n in re.findall(r'Id="rId(\d+)"', rels_xml)]
+        next_id = (max(used) + 1) if used else 1
+
+        img_map      = {}   # orig target -> new media target (relative to word/)
+        media_writes = {}   # new word/media/... path -> bytes
+        header_parts = {}   # htype -> {part, relpart, rid, xml, rels(bytes)}
+        new_rels_entries = []
+        new_ct_overrides = []
+        img_n = 1
+
+        for htype, h in headers.items():
+            new_rels = h["rels"]
+            for orig_target, data in h["images"].items():
+                if orig_target not in img_map:
+                    ext = (os.path.splitext(orig_target)[1] or ".png")
+                    new_media = "media/lh_letterhead_img%d%s" % (img_n, ext)
+                    img_map[orig_target] = new_media
+                    media_writes["word/" + new_media] = data
+                    img_n += 1
+                for variant in (orig_target, "./" + orig_target):
+                    new_rels = new_rels.replace(
+                        'Target="%s"' % variant, 'Target="%s"' % img_map[orig_target]
+                    )
+            base_name = "lh_header_%s.xml" % htype
+            rid       = "rId%d" % next_id
+            next_id  += 1
+            header_parts[htype] = {
+                "part":    "word/" + base_name,
+                "relpart": "word/_rels/" + base_name + ".rels",
+                "rid":     rid,
+                "xml":     h["xml"],
+                "rels":    new_rels.encode("utf-8"),
+            }
+            new_rels_entries.append(
+                '<Relationship Id="%s" Type="%s" Target="%s"/>'
+                % (rid, _REL_HEADER, base_name)
+            )
+            new_ct_overrides.append(
+                '<Override PartName="/word/%s" ContentType="%s"/>' % (base_name, _CT_HEADER)
+            )
+
+        # Build the AR section properties from the letterhead's sectPr:
+        # drop footers, repoint the header references to the injected parts.
+        new_sectpr = re.sub(r"<w:footerReference\b[^>]*/>", "", sectpr_src)
+
+        def _repoint(m):
+            htype = m.group(1)
+            if htype in header_parts:
+                return '<w:headerReference w:type="%s" r:id="%s"/>' % (
+                    htype, header_parts[htype]["rid"])
+            return ""   # a header type we couldn't extract — drop the reference
+
+        new_sectpr = re.sub(
+            r'<w:headerReference\s+w:type="([^"]+)"\s+r:id="[^"]+"\s*/>',
+            _repoint, new_sectpr,
+        )
+
+        # Replace the ar_index-th sectPr in document order
+        sectprs = list(re.finditer(r"<w:sectPr\b.*?</w:sectPr>", doc_xml, re.S))
+        if ar_index >= len(sectprs):
+            return docx_bytes   # structure unexpected — leave document untouched
+        tgt = sectprs[ar_index]
+        doc_xml = doc_xml[:tgt.start()] + new_sectpr + doc_xml[tgt.end():]
+
+        # Register the new relationships, content types, and image defaults
+        rels_xml = rels_xml.replace(
+            "</Relationships>", "".join(new_rels_entries) + "</Relationships>"
+        )
+        for media_path in media_writes:
+            ext = os.path.splitext(media_path)[1].lstrip(".").lower()
+            if ext and ('Extension="%s"' % ext) not in ct_xml:
+                ct = _IMG_CONTENT_TYPES.get(ext, "application/octet-stream")
+                ct_xml = ct_xml.replace(
+                    "</Types>", '<Default Extension="%s" ContentType="%s"/></Types>' % (ext, ct)
+                )
+        ct_xml = ct_xml.replace("</Types>", "".join(new_ct_overrides) + "</Types>")
+
+        with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for info in zin.infolist():
+                fn = info.filename
+                if fn == "word/document.xml":
+                    data = doc_xml.encode("utf-8")
+                elif fn == "word/_rels/document.xml.rels":
+                    data = rels_xml.encode("utf-8")
+                elif fn == "[Content_Types].xml":
+                    data = ct_xml.encode("utf-8")
+                else:
+                    data = zin.read(fn)
+                zout.writestr(info, data)
+            for hp in header_parts.values():
+                zout.writestr(hp["part"], hp["xml"])
+                zout.writestr(hp["relpart"], hp["rels"])
+            for path, data in media_writes.items():
+                zout.writestr(path, data)
+
+    buf_out.seek(0)
+    return buf_out.read()
 
 
 def enforce_line_spacing(docx_bytes, spacing=1.15):
@@ -2221,12 +2436,17 @@ def build_final_document(result_text, ui, tc):
         subs  = build_substitutions(ui, tc)
         flags = build_flags(tc)
         _lang = ui.get("Output_language", "English")
+        _lh_path = tc.get("letterhead_path")
+        _use_lh  = bool(_lh_path) and os.path.isfile(_lh_path)
         try:
             ma_bytes = fill_and_process_template(tc["ma_template_path"], subs, flags, _lang)
             ar_bytes = fill_and_process_template(tc["ar_template_path"], subs, flags, _lang)
+            # Order is MA, AR, Dify → the AR section is the 2nd (index 1).
             built = enforce_line_spacing(
-                merge_docx_sections(ma_bytes, ar_bytes, dify_bytes)
+                merge_docx_sections(ma_bytes, ar_bytes, dify_bytes, split_sections=_use_lh)
             )
+            if _use_lh:
+                built = inject_ar_letterhead(built, _lh_path, ar_index=1)
             fname = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
@@ -2270,7 +2490,7 @@ if not final_done:
         company_name        = st.text_input("Company Name",         max_chars=256)
         co_short_name       = st.text_input("Company Short Name",   max_chars=48)
         system_name         = st.text_input("Service / System Name",max_chars=256)
-        period_start    = st.text_input("Report Period Start (as of date if SOC1)", placeholder="e.g. 2025-01-01")
+        period_start    = st.text_input("Report Period Start (as of date if Type1)", placeholder="e.g. 2025-01-01")
         scope_of_report = st.selectbox("Subservice Organization Testing Strategy",
             ["None", "All carve out", "Inclusive"], key="form_scope_of_report")
         industry = st.selectbox("Industry",
@@ -2322,6 +2542,29 @@ if not final_done:
                          "Other text is inserted into the report as-is.",
                 )
                 signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+
+                _lh_files = list_letterheads()
+                _lh_options = ["(None — no letterhead)"] + _lh_files
+                letterhead_choice = st.selectbox(
+                    "AR Letterhead (EY office)",
+                    _lh_options,
+                    index=0,
+                    key="cr_letterhead",
+                    help="EY office letterhead applied to the Auditor's Report (Section II) "
+                         "pages only — full letterhead on the first page, continuation header "
+                         "after. Files are read from AR_template/letterheads/ (next to the .exe "
+                         "when packaged); group + centre the header in Word before saving each "
+                         "file. Choose (None) to omit the letterhead.",
+                )
+                letterhead_path = (
+                    os.path.join(LETTERHEAD_DIR, letterhead_choice)
+                    if letterhead_choice in _lh_files else None
+                )
+                if not _lh_files:
+                    st.caption(
+                        "ℹ️ No letterhead files found in AR_template/letterheads/. "
+                        "Add EY office letterhead .docx files there to enable the letterhead."
+                    )
 
             with cr2:
                 addressee_choice = st.radio(
@@ -2408,6 +2651,7 @@ if not final_done:
         has_ai_scope_exclusion     = False
         has_other_information      = True
         addressee_choice           = "Management"
+        letterhead_path            = None
         _ar_path                   = None
         _ma_path                   = None
 
@@ -2553,7 +2797,13 @@ if not final_done:
                         _t_flags = build_flags(_test_tc)
                         _t_ma    = fill_and_process_template(_ma_path_t, _t_subs, _t_flags, output_language)
                         _t_ar    = fill_and_process_template(_ar_path_t, _t_subs, _t_flags, output_language)
-                        _t_merged = enforce_line_spacing(merge_docx_sections(_t_ma, _t_ar))
+                        _t_use_lh = bool(letterhead_path) and os.path.isfile(letterhead_path)
+                        # Order is MA, AR → the AR section is the 2nd (index 1).
+                        _t_merged = enforce_line_spacing(
+                            merge_docx_sections(_t_ma, _t_ar, split_sections=_t_use_lh)
+                        )
+                        if _t_use_lh:
+                            _t_merged = inject_ar_letterhead(_t_merged, letterhead_path, ar_index=1)
                     st.session_state["ma_ar_only"] = {
                         "bytes": _t_merged,
                         "filename": (
@@ -2695,6 +2945,7 @@ if not final_done:
             "addressee_choice":           addressee_choice,
             "ar_template_path":           _ar_path_final,
             "ma_template_path":           _ma_path_final,
+            "letterhead_path":            letterhead_path,
         }
 
         inputs_main = {

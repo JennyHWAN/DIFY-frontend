@@ -128,6 +128,7 @@ When enabled, the **Complete Report Settings** panel drives the templates:
 | Subject matter includes AI technology | Adds the paragraph noting AI is used but excluded from audit scope |
 | Report includes 'Other Information' section | When unchecked, removes paragraphs that reference the Other Information section |
 | SSO Complementary Controls | Identified / Not Identified (shown only when a Subservice Organization testing strategy other than *None* is selected) |
+| AR Letterhead (EY office) | EY office letterhead applied to the **Auditor's Report (Section II) pages only**. Choose `(None)` to omit it. |
 
 The panel also shows a **live template-resolution preview** indicating which MA/AR `.docx` will be used for the chosen Report Type / Standard / SSO / Language combination, or a warning if none matches.
 
@@ -155,6 +156,14 @@ Section I (Management Assertion) and Section II (Independent Auditor's Report) a
 - Section II → AR sheet → WP `13.1` → `AR_template/13.1 AR_SOC2 Type II_SSAE18_IL503_EN（none SSO）.docx`
 
 **When no template matches:** if the combination has no row (or the row's WP cell is blank, e.g. an `N/A`/"No template" entry), the live preview shows a warning and that section is skipped. Not every Report Type × Standard × SSO × Language combination has an authored template — the MA and AR sheets define exactly which ones do. To support a new combination, add the template `.docx` to the right folder (prefixed with a new WP number) and add the matching row to the spreadsheet.
+
+#### AR letterhead (EY office header)
+
+The **AR Letterhead (EY office)** dropdown adds an EY office letterhead to the **Auditor's Report (Section II) pages only** — the full letterhead on the first page and the continuation header on later pages. The Dify body and the Management Assertion are left without a letterhead.
+
+Letterhead files are EY office `.docx` files downloaded from the **EY Templates** Word add-in. Before saving each one into `AR_template/letterheads/`, **group and centre the letterhead in Word** — the app injects it verbatim, so its position in the file is exactly what appears in the report. The dropdown lists whatever `.docx` files are in that folder, read **at runtime** (so users can add or remove office letterheads next to the `.exe` without rebuilding). Because there can be several letterheads per city, the dropdown is an explicit choice rather than an automatic match.
+
+The Auditor's Report section adopts the chosen letterhead's page geometry (A4 with EY's tall top margin) so the floating logo and address blocks land where EY authored them; the report body text reflows to that page setup. Footers are not injected. Note the letterhead uses EY's proprietary `EYInterstate` font, which is not embedded — on machines without it the header text falls back to another font.
 
 ### Upload & form fields
 
