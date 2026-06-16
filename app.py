@@ -1403,12 +1403,47 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
             _repoint, new_sectpr,
         )
 
-        # Replace the ar_index-th sectPr in document order
         sectprs = list(re.finditer(r"<w:sectPr\b.*?</w:sectPr>", doc_xml, re.S))
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
-        tgt = sectprs[ar_index]
-        doc_xml = doc_xml[:tgt.start()] + new_sectpr + doc_xml[tgt.end():]
+
+        # Word propagates a section's header forward: a later section with no
+        # headerReference of its own inherits the previous section's header. So
+        # the AR letterhead would bleed onto the report body after it. Give every
+        # section *after* AR an explicit blank header (for the types it doesn't
+        # already define) to break that inheritance.
+        post = list(range(ar_index + 1, len(sectprs)))
+        blank_part = None
+        if post:
+            blank_rid  = "rId%d" % next_id
+            next_id   += 1
+            blank_part = "lh_header_blank.xml"
+            new_rels_entries.append(
+                '<Relationship Id="%s" Type="%s" Target="%s"/>'
+                % (blank_rid, _REL_HEADER, blank_part)
+            )
+            new_ct_overrides.append(
+                '<Override PartName="/word/%s" ContentType="%s"/>' % (blank_part, _CT_HEADER)
+            )
+
+        replacements = {ar_index: new_sectpr}
+        for i in post:
+            seg = sectprs[i].group(0)
+            mo  = re.match(r"<w:sectPr\b[^>]*>", seg)
+            if not mo:
+                continue
+            have_types = set(re.findall(r'<w:headerReference\s+w:type="([^"]+)"', seg))
+            adds = "".join(
+                '<w:headerReference w:type="%s" r:id="%s"/>' % (htype, blank_rid)
+                for htype in ("default", "first") if htype not in have_types
+            )
+            if adds:
+                replacements[i] = mo.group(0) + adds + seg[mo.end():]
+
+        # Splice replacements in right-to-left so earlier match offsets stay valid
+        for i in sorted(replacements, reverse=True):
+            sp = sectprs[i]
+            doc_xml = doc_xml[:sp.start()] + replacements[i] + doc_xml[sp.end():]
 
         # Register the new relationships, content types, and image defaults
         rels_xml = rels_xml.replace(
@@ -1444,6 +1479,13 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
                 zout.writestr(hp["relpart"], hp["rels"])
             for path, data in media_writes.items():
                 zout.writestr(path, data)
+            if blank_part:
+                zout.writestr(
+                    "word/" + blank_part,
+                    '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/'
+                    'wordprocessingml/2006/main"><w:p/></w:hdr>',
+                )
 
     buf_out.seek(0)
     return buf_out.read()
