@@ -54,6 +54,16 @@ with open("_bundled_config.py", "w") as _f:
     )
 datas += [("_bundled_config.py", ".")]
 
+# ── Generate the protobuf runtime hook at build time ───────────────────────────
+# PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION must be set before protobuf is imported
+# in the frozen app. Writing the hook here (instead of relying on a committed
+# rthook_protobuf.py being present) makes the build self-healing: it never fails
+# with "FileNotFoundError: rthook_protobuf.py" when the source folder is a
+# OneDrive copy that hasn't synced that file down yet.
+with open("rthook_protobuf.py", "w") as _f:
+    _f.write('import os\n')
+    _f.write('os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"\n')
+
 # ── Analysis ───────────────────────────────────────────────────────────────────
 a = Analysis(
     ["launcher-win.py"],
