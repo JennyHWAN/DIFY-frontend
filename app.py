@@ -1495,6 +1495,64 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
     return buf_out.read()
 
 
+def strip_page_top_empty_paragraphs(docx_bytes):
+    """Remove blank paragraphs at the top of each page that begins
+    *deterministically* — the document start and immediately after an explicit
+    page break or section break (e.g. the blank lines an EY template left at the
+    top of the Auditor's Report to make room for a letterhead, now redundant
+    once the letterhead sits in the header + page margin).
+
+    Soft page breaks (where text naturally flows onto the next page) are decided
+    by Word at render time and are not recorded in the file, so blank lines at
+    the top of those pages cannot be detected here — only break-initiated page
+    tops can. Operates on body-level paragraphs only; the break/section
+    paragraphs themselves are preserved (they carry the page break / sectPr)."""
+    doc  = Document(io.BytesIO(docx_bytes))
+    body = doc.element.body
+    paras = body.findall(qn("w:p"))
+
+    def _has_sectpr(p):
+        pPr = p.find(qn("w:pPr"))
+        return pPr is not None and pPr.find(qn("w:sectPr")) is not None
+
+    def _has_pagebreak(p):
+        return any(br.get(qn("w:type")) == "page" for br in p.iter(qn("w:br")))
+
+    def _is_break(p):
+        return _has_sectpr(p) or _has_pagebreak(p)
+
+    def _is_blank(p):
+        if _has_sectpr(p) or _has_pagebreak(p):
+            return False
+        for tag in ("w:drawing", "w:pict", "w:object"):
+            if p.find(".//" + qn(tag)) is not None:
+                return False
+        return "".join(t.text or "" for t in p.iter(qn("w:t"))).strip() == ""
+
+    to_remove = []
+    # Leading blanks at the very start of the document
+    i = 0
+    while i < len(paras) and _is_blank(paras[i]):
+        to_remove.append(paras[i])
+        i += 1
+    # Blanks immediately after each explicit page/section break
+    for k, p in enumerate(paras):
+        if _is_break(p):
+            j = k + 1
+            while j < len(paras) and _is_blank(paras[j]):
+                to_remove.append(paras[j])
+                j += 1
+
+    for p in to_remove:
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
 def enforce_line_spacing(docx_bytes, spacing=1.15):
     """
     Final pass over the finished document: set every paragraph (body and
@@ -2538,6 +2596,7 @@ def build_final_document(result_text, ui, tc):
             built = enforce_line_spacing(
                 merge_docx_sections(ma_bytes, ar_bytes, dify_bytes, split_sections=_use_lh)
             )
+            built = strip_page_top_empty_paragraphs(built)
             if _use_lh:
                 built = inject_ar_letterhead(built, _lh_path, ar_index=1)
             fname = (
@@ -2548,7 +2607,7 @@ def build_final_document(result_text, ui, tc):
         except Exception as exc:
             st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
 
-    built = enforce_line_spacing(dify_bytes)
+    built = strip_page_top_empty_paragraphs(enforce_line_spacing(dify_bytes))
     fname = (
         f"{ui.get('Co_short_name', 'Report')}_"
         f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
@@ -2895,6 +2954,7 @@ if not final_done:
                         _t_merged = enforce_line_spacing(
                             merge_docx_sections(_t_ma, _t_ar, split_sections=_t_use_lh)
                         )
+                        _t_merged = strip_page_top_empty_paragraphs(_t_merged)
                         if _t_use_lh:
                             _t_merged = inject_ar_letterhead(_t_merged, letterhead_path, ar_index=1)
                     st.session_state["ma_ar_only"] = {
