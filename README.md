@@ -131,6 +131,31 @@ When enabled, the **Complete Report Settings** panel drives the templates:
 
 The panel also shows a **live template-resolution preview** indicating which MA/AR `.docx` will be used for the chosen Report Type / Standard / SSO / Language combination, or a warning if none matches.
 
+#### How Section I & II templates are chosen
+
+Section I (Management Assertion) and Section II (Independent Auditor's Report) are **not** AI-generated — each is filled from a pre-authored EY Word template. The app picks the right `.docx` per section by looking your form selections up in `template_index.xlsx`, then matching the resulting work-paper number to a file on disk.
+
+**1. Your UI choices are mapped to the spreadsheet's vocabulary** (`resolve_template()` in `app.py`):
+
+| Form selection | Lookup column | Mapped value |
+|---|---|---|
+| Report Type | `Category` | `SOC1 *` → `SOC 1`, `SOC2 *` → `SOC 2` |
+| Report Type | `Type` | `* TYPE1` → `Type I`, `* TYPE2` → `Type II` |
+| Standard | `Standards` | passed through (`SSAE 18`, `ISAE 3402`, `ISAE 3000`); any "Combined" choice → `Combined` |
+| Subservice Org Testing Strategy | `Sub-service Organization (SSO)` | `None` → `none`, `All carve out` → `all carve out`, `Inclusive` → `Inclusive` |
+| Output Language | `Language` | `English` → `EN`, `中文` → `CN` |
+
+**2. The spreadsheet returns a work-paper number.** `template_index.xlsx` has one sheet per section — **`MA`** and **`AR`** — each row being a unique combination of the five columns above plus a **WP number** (e.g. `1.1`, `13.2`). The app scans the matching sheet for the row where all five mapped values match and reads its WP number. (The `.1`/`.2` suffix tracks EN/CN.)
+
+**3. The WP number selects the actual Word file.** The app lists `MA_template/` (for Section I) or `AR_template/` (for Section II) and picks the `.docx` whose filename **starts with that WP number followed by a space** — so WP `13.1` resolves to `AR_template/13.1 AR_SOC2 Type II_SSAE18_IL503_EN（none SSO）.docx`. The rest of the filename is just a human-readable description; only the leading number is matched.
+
+**Worked example** — _SOC2 TYPE2 · SSAE 18 · None SSO · English_ resolves to:
+
+- Section I → MA sheet → WP `11.1` → `MA_template/11.1 MA_SOC2 Type II_IL508_EN（none SSO）.docx`
+- Section II → AR sheet → WP `13.1` → `AR_template/13.1 AR_SOC2 Type II_SSAE18_IL503_EN（none SSO）.docx`
+
+**When no template matches:** if the combination has no row (or the row's WP cell is blank, e.g. an `N/A`/"No template" entry), the live preview shows a warning and that section is skipped. Not every Report Type × Standard × SSO × Language combination has an authored template — the MA and AR sheets define exactly which ones do. To support a new combination, add the template `.docx` to the right folder (prefixed with a new WP number) and add the matching row to the spreadsheet.
+
 ### Upload & form fields
 
 **Upload:** One or more Excel, PDF, or Word files containing the control matrix and supporting data.
