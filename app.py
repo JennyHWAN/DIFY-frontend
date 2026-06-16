@@ -811,7 +811,7 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
             doc.element.body.remove(body_children[idx])
 
     # ── Step 6: font standardisation ───────────────────────────────────────
-    cjk_font = "华文楷体" if language == "中文" else "Times New Roman"
+    cjk_font = FONT_CHINESE if language == "中文" else "Times New Roman"
 
     # Paragraphs whose text matches these patterns keep their bold intact.
     # Checked against the paragraph's full text AFTER substitution.
@@ -1192,9 +1192,9 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
     Final pass over the finished document: set every paragraph (body and
     table cells, including nested tables) to the given multiple line spacing,
     and normalise every run to Times New Roman Latin/complex-script fonts and
-    black text, and the CJK (eastAsia) font to 华文楷体 — so the whole document
-    is uniform (Times New Roman for Latin, 华文楷体 for Chinese) regardless of
-    what each merged section set, instead of the old 华文楷体 / 黑体 mix.
+    black text, and the CJK (eastAsia) font to 黑体 — so the whole document
+    is uniform (Times New Roman for Latin, 黑体 for Chinese) regardless of
+    what each merged section set.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -1731,7 +1731,7 @@ def run_workflow(inputs, api_base, api_key, status_placeholder=None):
 
 
 FONT_LATIN   = "Times New Roman"
-FONT_CHINESE = "华文楷体"
+FONT_CHINESE = "黑体"
 
 
 def _apply_fonts(run):
@@ -2134,6 +2134,36 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
 
         i += 1
 
+    # ── Disable "Snap to grid when document grid is defined" on every paragraph ──
+    # When a document grid is defined, Word snaps each line to the grid by
+    # default (the checkbox is ticked), which distorts line spacing in the
+    # generated body. Explicitly add <w:snapToGrid w:val="0"/> to each
+    # paragraph so the box is unticked throughout the Dify sections.
+    def _disable_snap_to_grid(para):
+        pPr = para._p.get_or_add_pPr()
+        snap = pPr.find(qn("w:snapToGrid"))
+        if snap is None:
+            snap = OxmlElement("w:snapToGrid")
+            # Per the CT_PPr schema, snapToGrid precedes these elements.
+            anchor = None
+            for _tag in ("w:spacing", "w:ind", "w:jc", "w:rPr", "w:sectPr", "w:pPrChange"):
+                anchor = pPr.find(qn(_tag))
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchor.addprevious(snap)
+            else:
+                pPr.append(snap)
+        snap.set(qn("w:val"), "0")
+
+    for para in doc.paragraphs:
+        _disable_snap_to_grid(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _disable_snap_to_grid(para)
+
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
@@ -2453,26 +2483,52 @@ if not final_done:
         if run_ma_ar_only:
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
+            # Require the same form fields as "Run All Steps", minus the Dify-only
+            # inputs (file upload and API key are not needed to fill the templates).
+            ma_ar_errors = []
+            if not company_name:        ma_ar_errors.append("Company Name is required.")
+            if not co_short_name:       ma_ar_errors.append("Company Short Name is required.")
+            if not system_name:         ma_ar_errors.append("Service/System Name is required.")
+            if not service_description: ma_ar_errors.append("Service Description is required.")
+            if not period_start:        ma_ar_errors.append("Report Period Start is required.")
+            if report_type.endswith("TYPE2") and not period_end:
+                ma_ar_errors.append("Report Period End is required for Type 2 reports.")
             if report_type.startswith("SOC2") and not any([
                 is_security, is_availability, is_processing_integrity,
                 is_confidentiality, is_privacy,
             ]):
-                st.error("At least one Trust Service Criteria must be selected for SOC2 reports.")
-            elif not (_ar_path_t and os.path.isfile(_ar_path_t)):
-                st.error(f"AR template not available: {_ar_path_t or 'no matching template found'}")
-            elif not (_ma_path_t and os.path.isfile(_ma_path_t)):
-                st.error(f"MA template not available: {_ma_path_t or 'no matching template found'}")
+                ma_ar_errors.append("At least one Trust Service Criteria must be selected for SOC2 reports.")
+            if len(subservice_org) > 256:
+                ma_ar_errors.append("Subservice Organization exceeds 256 characters")
+            if (scope_of_report != "None") and (not subservice_org):
+                ma_ar_errors.append("Please input Subservice Organizations and its service provided")
+            if not report_date:
+                ma_ar_errors.append("Report Signing Date is required when generating a complete report.")
+            if not signing_city:
+                ma_ar_errors.append("Signing City is required when generating a complete report.")
+            if not has_transaction_processing and not systems_function:
+                ma_ar_errors.append(
+                    "Systems Function is required when 'Includes transaction processing wording' "
+                    "is unchecked — please fill in the Systems Function field."
+                )
+            if not (_ar_path_t and os.path.isfile(_ar_path_t)):
+                ma_ar_errors.append(f"AR template not available: {_ar_path_t or 'no matching template found'}")
+            if not (_ma_path_t and os.path.isfile(_ma_path_t)):
+                ma_ar_errors.append(f"MA template not available: {_ma_path_t or 'no matching template found'}")
+            if ma_ar_errors:
+                for _e in ma_ar_errors:
+                    st.error(_e)
             else:
                 _test_ui = {
-                    "Company_name":           company_name        or "Test Organization",
-                    "Co_short_name":          co_short_name       or "TestOrg",
-                    "System_or_service_name": system_name         or "Test System",
-                    "Service_description":    service_description or "test services",
-                    "Period_start":           period_start        or "2024-01-01",
-                    "Period_end":             period_end          or "2024-12-31",
+                    "Company_name":           company_name,
+                    "Co_short_name":          co_short_name,
+                    "System_or_service_name": system_name,
+                    "Service_description":    service_description,
+                    "Period_start":           period_start,
+                    "Period_end":             period_end,
                     "Report_type":            report_type,
                     "Output_language":        output_language,
-                    "Subservice_org":         subservice_org      or "None",
+                    "Subservice_org":         subservice_org,
                     "Systems_function":       systems_function    or "",
                     "is_Security":             is_security,
                     "is_Availability":         is_availability,
@@ -2481,8 +2537,8 @@ if not final_done:
                     "is_Privacy":              is_privacy,
                 }
                 _test_tc = {
-                    "report_date":                report_date  or "2025-01-01",
-                    "signing_city":               signing_city or "Shanghai",
+                    "report_date":                report_date,
+                    "signing_city":               signing_city,
                     "cuec_identified":            cuec_choice == "Identified",
                     "sso_cc_identified":          sso_cc_choice == "Identified",
                     "has_transaction_processing": has_transaction_processing,
