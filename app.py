@@ -2134,6 +2134,36 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
 
         i += 1
 
+    # ── Disable "Snap to grid when document grid is defined" on every paragraph ──
+    # When a document grid is defined, Word snaps each line to the grid by
+    # default (the checkbox is ticked), which distorts line spacing in the
+    # generated body. Explicitly add <w:snapToGrid w:val="0"/> to each
+    # paragraph so the box is unticked throughout the Dify sections.
+    def _disable_snap_to_grid(para):
+        pPr = para._p.get_or_add_pPr()
+        snap = pPr.find(qn("w:snapToGrid"))
+        if snap is None:
+            snap = OxmlElement("w:snapToGrid")
+            # Per the CT_PPr schema, snapToGrid precedes these elements.
+            anchor = None
+            for _tag in ("w:spacing", "w:ind", "w:jc", "w:rPr", "w:sectPr", "w:pPrChange"):
+                anchor = pPr.find(qn(_tag))
+                if anchor is not None:
+                    break
+            if anchor is not None:
+                anchor.addprevious(snap)
+            else:
+                pPr.append(snap)
+        snap.set(qn("w:val"), "0")
+
+    for para in doc.paragraphs:
+        _disable_snap_to_grid(para)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    _disable_snap_to_grid(para)
+
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
