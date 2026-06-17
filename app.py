@@ -5,6 +5,7 @@ import io
 import re
 import json
 import zipfile
+import traceback
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from docx import Document
@@ -70,12 +71,23 @@ with st.sidebar:
     st.markdown("AI-Driven Report Generation")
     st.markdown("---")
     if st.button("🔄 Reset All Steps", use_container_width=True):
-        # Clear only the generated results — leave the user's input intact so it
-        # doesn't have to be re-entered. The form widgets persist on their own;
-        # `user_inputs` (main form) and `template_config` (Complete Report
-        # Settings) are the input snapshots and are deliberately kept.
-        for k in ["main_outputs", "sub1_outputs", "final_result", "ma_ar_only", "final_bytes", "final_filename"]:
+        # Clear the generated results and input snapshots. Once they're gone the
+        # form re-renders empty (it lives under `if not final_done`, so its widget
+        # state was discarded while the report was on screen) and the user starts
+        # fresh.
+        _was_complete = "final_result" in st.session_state
+        for k in ["main_outputs", "sub1_outputs", "final_result", "user_inputs",
+                  "template_config", "ma_ar_only", "final_bytes", "final_filename"]:
             st.session_state.pop(k, None)
+        # CUEC/UER keep a shadow `pref_…` copy so the selection survives a Reset
+        # done mid-run or after a MA+AR-only file (the form is still on screen, like
+        # every other field). After a COMPLETE report the form was hidden and all
+        # other fields reset, so here — and only here — drop the CUEC/UER shadows
+        # and widget keys too, so they default along with everything else.
+        if _was_complete:
+            for k in [k for k in st.session_state
+                      if "form_is_cuec" in k or "form_is_uer" in k]:
+                st.session_state.pop(k, None)
         st.rerun()
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
@@ -2660,14 +2672,10 @@ def build_final_document(result_text, ui, tc):
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
-# The input form is rendered on every run — even after a report is generated —
-# so the user's selections and uploaded files stay put. Streamlit garbage-
-# collects widget state for widgets that aren't rendered in a run; hiding the
-# form after generation was what made Reset come back empty. Keeping it rendered
-# means the values (and the file-uploader contents) persist naturally, so Reset
-# only has to clear the generated result. The finished report renders in the
-# FINAL RESULT block below this one.
-if True:
+# The input form is shown only until a report exists. Once a report is generated
+# (`final_done`) the whole form is hidden and the finished report renders in the
+# FINAL RESULT block below; the user clicks Reset to start a new report.
+if not final_done:
 
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
@@ -2681,7 +2689,6 @@ if True:
     uploaded_files = st.file_uploader(
         "Upload files (Excel, PDF, Word, etc.)",
         accept_multiple_files=True,
-        key="uploaded_files",
     )
 
     # ── Required fields ───────────────────────────────────────────────────────
@@ -2743,7 +2750,7 @@ if True:
                          "\"2026年1月30日\" in Chinese reports. "
                          "Other text is inserted into the report as-is.",
                 )
-                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai/上海", key="cr_signing_city")
 
                 _lh_files = list_letterheads()
                 _lh_options = ["(None — no letterhead)"] + _lh_files
@@ -2890,31 +2897,29 @@ if True:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
-    # Defaults are seeded into session_state once per report type (the key embeds
-    # report_type, so switching types applies that type's fresh default the first
-    # time it is seen). The checkboxes are then rendered WITHOUT a `value=` arg so
-    # a user's manual toggle is read straight from session_state and never
-    # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
+    # Streamlit drops a widget's key from session_state whenever the widget isn't
+    # rendered on a run — including the Reset rerun (the form isn't rendered before
+    # st.rerun() fires) — so a plain keyed checkbox re-seeds to the report-type
+    # default on a MA+AR-only Reset while every other field is kept. We keep a
+    # shadow copy in a plain (non-widget) key the GC can't touch: seed it with the
+    # report-type default, mirror every toggle into it via on_change, and seed the
+    # checkbox from it through `value=`. The selection then survives a MA+AR-only /
+    # mid-run Reset. After a COMPLETE report the form is hidden and everything else
+    # resets, so the Reset handler clears these shadows in that case only (sidebar).
+    #
+    # IMPORTANT: we never write the widget key ourselves (`st.session_state[_cuec_key]
+    # = …`). Doing that alongside on_change made clicking UER reset CUEC. `value=`
+    # is only applied on first render (and after a GC) and is ignored once the key
+    # exists, so a normal rerun keeps each box's own state. The key embeds
+    # report_type so switching types applies that type's default.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
-    # The checkbox value lived ONLY in its widget key. Streamlit garbage-collects
-    # widget-key state when a widget isn't rendered on a run, so after Reset the
-    # key could be gone and the seeding below would re-apply the report-type
-    # default (for SOC2: CUEC off / UER on — i.e. a both-selected choice silently
-    # became "only UER"). Fix: keep a shadow copy in a plain (non-widget) key that
-    # Reset never clears and the GC can't touch, mirror every toggle into it via
-    # on_change, and seed the widget from the shadow. The user's exact selection
-    # now survives Reset and any rerun.
     _cuec_pref = "pref_" + _cuec_key
     _uer_pref  = "pref_" + _uer_key
     if _cuec_pref not in st.session_state:
         st.session_state[_cuec_pref] = report_type.startswith("SOC1")
     if _uer_pref not in st.session_state:
         st.session_state[_uer_pref] = report_type.startswith("SOC2")
-    if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = st.session_state[_cuec_pref]
-    if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = st.session_state[_uer_pref]
 
     def _mirror_pref(widget_key):
         st.session_state["pref_" + widget_key] = st.session_state[widget_key]
@@ -2924,12 +2929,14 @@ if True:
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
+        value=st.session_state[_cuec_pref],
         key=_cuec_key,
         on_change=_mirror_pref, args=(_cuec_key,),
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
+        value=st.session_state[_uer_pref],
         key=_uer_key,
         on_change=_mirror_pref, args=(_uer_key,),
         help="User Entity Responsibilities — default on for SOC2 reports. "
@@ -2937,58 +2944,18 @@ if True:
 
     st.markdown("---")
 
-    # ── Signature of every form input — lets us tell whether the form has been
-    #    edited since the current report was generated. While a report exists and
-    #    the form still matches it, the Run / MA+AR buttons are hidden (only the
-    #    preview + download remain); editing any field brings them back, rendered
-    #    beneath the download button in the FINAL RESULT block below.
-    _form_sig = (
-        report_type, output_language, scope_of_report, industry,
-        company_name, co_short_name, system_name, service_description,
-        period_start, period_end, subservice_org, systems_function,
-        system_extra, domain, co_website,
-        is_security, is_availability, is_processing_integrity,
-        is_confidentiality, is_privacy, is_cuec, is_uer,
-        generate_complete, standard, report_date, signing_city,
-        addressee_choice, cuec_choice, sso_cc_choice,
-        has_transaction_processing, single_user_entity,
-        has_ai_scope_exclusion, has_other_information, letterhead_path,
-        tuple((f.name, getattr(f, "size", None)) for f in (uploaded_files or [])),
+    run_main = st.button(
+        "▶ Run All Steps (1 → 2 → 3)", type="primary",
+        use_container_width=True,
     )
-    # Only flag a change when we have a recorded signature to compare against —
-    # a restored/legacy session with no signature keeps the buttons hidden.
-    form_changed = (
-        final_done
-        and "_gen_sig" in st.session_state
-        and st.session_state["_gen_sig"] != _form_sig
-    )
-
-    # Buttons a) Run All Steps and b) Generate MA + AR only live at the top only
-    # until a report exists. Once `final_done` they vanish here; if the form is
-    # later edited they reappear below the download button (see FINAL RESULT).
-    run_main = False
     run_ma_ar_only = False
-    if not final_done:
-        run_main = st.button(
-            "▶ Run All Steps (1 → 2 → 3)", type="primary",
-            use_container_width=True, key="btn_run_main_top",
+    if generate_complete:
+        run_ma_ar_only = st.button(
+            "🧪 Generate MA + AR only (templates, no Dify)",
+            use_container_width=True,
+            help="Fills the Section I + II templates using the fields above "
+                 "without running the Dify workflow.",
         )
-        if generate_complete:
-            run_ma_ar_only = st.button(
-                "🧪 Generate MA + AR only (templates, no Dify)",
-                use_container_width=True, key="btn_run_ma_ar_top",
-                help="Fills the Section I + II templates using the fields above "
-                     "without running the Dify workflow.",
-            )
-
-    # The bottom buttons (rendered in FINAL RESULT when the form is edited after
-    # generation) report their click via this flag + a rerun, so the heavy
-    # handlers below run from one place regardless of which button was used.
-    _pending = st.session_state.pop("_pending_action", None)
-    if _pending == "run_main":
-        run_main = True
-    elif _pending == "run_ma_ar":
-        run_ma_ar_only = True
 
     # Live Run-All status placeholders — the "⏳ Step N — Running…" banner and the
     # "Nodes completed…" line. Created at a fixed position every run so they stay
@@ -3099,14 +3066,8 @@ if True:
                 except Exception as _exc:
                     st.session_state.pop("ma_ar_only", None)
                     st.error(f"MA + AR generation failed: {_exc}")
-                else:
-                    # Success: replace the on-screen result with just this MA+AR
-                    # download — drop any previously generated complete report so
-                    # its "Report is ready" bar / preview / inputs / download
-                    # don't linger alongside it. Rerun so `final_done` re-evaluates.
-                    for _k in ("final_result", "final_bytes", "final_filename", "_gen_sig"):
-                        st.session_state.pop(_k, None)
-                    st.rerun()
+                    with st.expander("Show error details (traceback)", expanded=True):
+                        st.code(traceback.format_exc())
 
         # Clicking "Run All Steps" starts a Dify run; hide any pending MA+AR
         # download so its stale data can't be re-downloaded mid-workflow (a second
@@ -3116,17 +3077,15 @@ if True:
 
         # Render the download into its fixed placeholder so it sits in a stable
         # slot that the clear-block above can wipe the instant a new run starts.
+        # The button persists across downloads — it only disappears when a new
+        # "Run All Steps" / "Generate MA + AR only" click starts fresh processing.
         if st.session_state.get("ma_ar_only"):
-            _ma_ar_downloaded = ma_ar_dl.download_button(
+            ma_ar_dl.download_button(
                 label="⬇ Download MA + AR (.docx)",
                 data=st.session_state["ma_ar_only"]["bytes"],
                 file_name=st.session_state["ma_ar_only"]["filename"],
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
-            if _ma_ar_downloaded:
-                # One-shot download: drop the cached doc so the button disappears.
-                st.session_state.pop("ma_ar_only", None)
-                st.rerun()
 
     if run_main:
         errors = []
@@ -3398,9 +3357,6 @@ if True:
             )
             st.session_state["final_bytes"]    = _built
             st.session_state["final_filename"] = _fname
-            # Remember the form state that produced this report so the Run /
-            # MA+AR buttons stay hidden until the user edits something.
-            st.session_state["_gen_sig"]       = _form_sig
 
         status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
         st.rerun()
@@ -3432,8 +3388,8 @@ if final_done:
         st.markdown(result_text)
 
     # ── Inputs used — a collapsed read-only summary of exactly what produced
-    #    this report. The live form above stays populated now, but this snapshot
-    #    reflects the values at generation time even if the form is later edited.
+    #    this report. The input form is hidden once a report exists, so this
+    #    read-only snapshot is the only place the chosen values survive.
     with st.expander("📋 Inputs used for this report", expanded=False):
         _flag = lambda v: "✓" if v else "—"
         _g = lambda k, d="": ui.get(k, d)
@@ -3507,26 +3463,3 @@ if final_done:
         type="primary",
         use_container_width=True,
     )
-
-    # When the form has been edited since this report was generated, bring the
-    # Run / MA+AR buttons back here — beneath the download button — so the user
-    # can regenerate. They post their click via a flag + rerun (picked up at the
-    # top of the form block) so the existing handlers run from one place. The
-    # download/preview above disappear as soon as a regenerate begins.
-    if form_changed:
-        st.markdown("---")
-        st.caption("⚠️ Form inputs changed since this report was generated — regenerate below.")
-        if st.button(
-            "▶ Run All Steps (1 → 2 → 3)", type="primary",
-            use_container_width=True, key="btn_run_main_bottom",
-        ):
-            st.session_state["_pending_action"] = "run_main"
-            st.rerun()
-        if generate_complete and st.button(
-            "🧪 Generate MA + AR only (templates, no Dify)",
-            use_container_width=True, key="btn_run_ma_ar_bottom",
-            help="Fills the Section I + II templates using the fields above "
-                 "without running the Dify workflow.",
-        ):
-            st.session_state["_pending_action"] = "run_ma_ar"
-            st.rerun()
