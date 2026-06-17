@@ -1442,17 +1442,20 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
 
-        # The letterhead's sectPr replaces the whole AR page geometry. Keep the
-        # letterhead's own left/right margins: its banner, logo and address
-        # blocks are an absolutely-positioned drawing group anchored to the text
-        # column (i.e. the left margin), so the EY designer sized everything for
-        # the letterhead's specific side margins (e.g. Shanghai 1368/1282).
-        # Overwriting them with the report's wider margins (e.g. 1800/1800)
-        # shifts the whole banner sideways and cramps the right-hand Tel/Fax box
-        # against the page edge — the "letterhead doesn't fit the page" defect.
-        # We therefore preserve the letterhead's side margins exactly as the EY
-        # AR template authored them (no override, no adjustment).
+        # The letterhead's sectPr replaces the whole AR page geometry. We only
+        # want its enlarged top margin (to clear the banner); the side margins
+        # should stay as the AR template authored them (~1800), so the AR body
+        # text keeps the same width/indent as the rest of the report rather than
+        # inheriting the letterhead's own narrow side margins (e.g. Shanghai
+        # 1368/1282). Restore the AR section's original left/right (and gutter)
+        # margins onto the letterhead-derived sectPr. This runs for both output
+        # modes — complete report and "MA + AR only" — since both build the AR
+        # page through this same function.
         orig_ar = sectprs[ar_index].group(0)
+        for _side in ("left", "right", "gutter"):
+            _orig = _pgmar_attr(orig_ar, _side)
+            if _orig is not None:
+                new_sectpr = _set_pgmar_attr(new_sectpr, _side, _orig)
 
         # The letterhead also carries its own (small) bottom margin, which leaves
         # the last line uncomfortably close to the page edge. Keep the AR
