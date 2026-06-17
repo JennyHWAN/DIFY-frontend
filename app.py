@@ -2886,34 +2886,30 @@ if not final_done:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
-    # Defaults are seeded into session_state once per report type (the key embeds
-    # report_type, so switching types applies that type's fresh default the first
-    # time it is seen). The checkboxes are rendered WITHOUT a `value=` arg so a
-    # user's manual toggle is read straight from session_state and never
-    # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
-    #
-    # These are plain widget keys, like every other field: while the form is on
-    # screen the toggle persists, but once a report is generated the form is
-    # hidden, Streamlit garbage-collects the key, and a post-generation Reset
-    # re-seeds the report-type default — so CUEC/UER reset along with everything
-    # else instead of lingering.
+    # These are ordinary keyed checkboxes, exactly like the Trust Service Criteria
+    # boxes above — the `value=` is only the first-render default for a given report
+    # type and is ignored once the key exists, so a manual toggle sticks (and
+    # toggling UER never resets CUEC). Crucially we do NOT write the key into
+    # session_state ourselves: a manually-seeded widget key gets dropped during the
+    # Reset rerun (the form isn't rendered then), which made CUEC/UER reset on a
+    # MA+AR-only Reset while every other field was kept. As plain widget keys they
+    # now persist while the form is on screen and reset to default only once a
+    # report is generated and the form is hidden — matching all the other fields.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
-    if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = report_type.startswith("SOC1")
-    if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = report_type.startswith("SOC2")
 
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
+        value=report_type.startswith("SOC1"),
         key=_cuec_key,
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
+        value=report_type.startswith("SOC2"),
         key=_uer_key,
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
