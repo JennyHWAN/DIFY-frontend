@@ -2928,9 +2928,20 @@ if True:
     elif _pending == "run_ma_ar":
         run_ma_ar_only = True
 
+    # Live Run-All status placeholders — the "⏳ Step N — Running…" banner and the
+    # "Nodes completed…" line. Created at a fixed position every run so they stay
+    # empty (invisible) unless a Dify run writes to them, and so the MA+AR-only
+    # path can explicitly clear any banner left over from an interrupted Run-All.
+    step_label  = st.empty()
+    node_status = st.empty()
+
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
         if run_ma_ar_only:
+            # Clicking MA+AR only mid-run interrupts Run All Steps — drop its
+            # "⏳ Step 1 — Running…" banner so it doesn't linger over the output.
+            step_label.empty()
+            node_status.empty()
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
             # Require the same form fields as "Run All Steps", minus the Dify-only
@@ -3179,8 +3190,7 @@ if True:
             "File_input": file_ids,
         }
 
-        step_label  = st.empty()
-        node_status = st.empty()
+        # step_label / node_status are the shared placeholders created above.
         if True:
             # ── Step 1 ────────────────────────────────────────────────────────
             step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
