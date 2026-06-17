@@ -1242,6 +1242,25 @@ _IMG_CONTENT_TYPES = {
 }
 
 
+def _pgmar_attr(sectpr, attr):
+    """Return the integer value (in twips) of a <w:pgMar> attribute such as
+    'top' or 'bottom' from a sectPr string, or None if absent."""
+    m = re.search(r"<w:pgMar\b[^>]*>", sectpr)
+    if not m:
+        return None
+    v = re.search(r'\bw:%s="(-?\d+)"' % attr, m.group(0))
+    return int(v.group(1)) if v else None
+
+
+def _set_pgmar_attr(sectpr, attr, value):
+    """Return *sectpr* with the <w:pgMar> *attr* set to *value* (twips). If the
+    attribute isn't present the sectPr is returned unchanged."""
+    def repl(m):
+        tag = m.group(0)
+        return re.sub(r'\bw:%s="-?\d+"' % attr, 'w:%s="%d"' % (attr, value), tag)
+    return re.sub(r"<w:pgMar\b[^>]*>", repl, sectpr, count=1)
+
+
 def _extract_letterhead_parts(letterhead_path):
     """Read the header parts (and their images) + sectPr from a letterhead .docx.
 
@@ -1411,6 +1430,29 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
 
+        # The letterhead's sectPr replaces the whole AR page geometry. We only
+        # want its enlarged top margin (to clear the header); the side margins
+        # should stay as the EY template intended, so the body text keeps the
+        # same width/indent as the rest of the report. Restore the original
+        # left/right (and gutter) margins onto the letterhead-derived sectPr.
+        orig_ar = sectprs[ar_index].group(0)
+        for _side in ("left", "right", "gutter"):
+            _orig = _pgmar_attr(orig_ar, _side)
+            if _orig is not None:
+                new_sectpr = _set_pgmar_attr(new_sectpr, _side, _orig)
+
+        # The letterhead also carries its own (small) bottom margin, which leaves
+        # the last line uncomfortably close to the page edge. Keep the AR
+        # section's bottom margin close to the EY template's original value (the
+        # one that looks fine without a letterhead) — allow at most a 10%
+        # reduction — so there's reasonable breathing room at the page bottom.
+        orig_bottom = _pgmar_attr(orig_ar, "bottom")
+        lh_bottom   = _pgmar_attr(new_sectpr, "bottom")
+        if orig_bottom and lh_bottom is not None:
+            min_bottom = int(round(orig_bottom * 0.9))
+            if lh_bottom < min_bottom:
+                new_sectpr = _set_pgmar_attr(new_sectpr, "bottom", min_bottom)
+
         # Word propagates a section's header forward: a later section with no
         # headerReference of its own inherits the previous section's header. So
         # the AR letterhead would bleed onto the report body after it. Give every
@@ -1493,6 +1535,64 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
 
     buf_out.seek(0)
     return buf_out.read()
+
+
+def strip_page_top_empty_paragraphs(docx_bytes):
+    """Remove blank paragraphs at the top of each page that begins
+    *deterministically* — the document start and immediately after an explicit
+    page break or section break (e.g. the blank lines an EY template left at the
+    top of the Auditor's Report to make room for a letterhead, now redundant
+    once the letterhead sits in the header + page margin).
+
+    Soft page breaks (where text naturally flows onto the next page) are decided
+    by Word at render time and are not recorded in the file, so blank lines at
+    the top of those pages cannot be detected here — only break-initiated page
+    tops can. Operates on body-level paragraphs only; the break/section
+    paragraphs themselves are preserved (they carry the page break / sectPr)."""
+    doc  = Document(io.BytesIO(docx_bytes))
+    body = doc.element.body
+    paras = body.findall(qn("w:p"))
+
+    def _has_sectpr(p):
+        pPr = p.find(qn("w:pPr"))
+        return pPr is not None and pPr.find(qn("w:sectPr")) is not None
+
+    def _has_pagebreak(p):
+        return any(br.get(qn("w:type")) == "page" for br in p.iter(qn("w:br")))
+
+    def _is_break(p):
+        return _has_sectpr(p) or _has_pagebreak(p)
+
+    def _is_blank(p):
+        if _has_sectpr(p) or _has_pagebreak(p):
+            return False
+        for tag in ("w:drawing", "w:pict", "w:object"):
+            if p.find(".//" + qn(tag)) is not None:
+                return False
+        return "".join(t.text or "" for t in p.iter(qn("w:t"))).strip() == ""
+
+    to_remove = []
+    # Leading blanks at the very start of the document
+    i = 0
+    while i < len(paras) and _is_blank(paras[i]):
+        to_remove.append(paras[i])
+        i += 1
+    # Blanks immediately after each explicit page/section break
+    for k, p in enumerate(paras):
+        if _is_break(p):
+            j = k + 1
+            while j < len(paras) and _is_blank(paras[j]):
+                to_remove.append(paras[j])
+                j += 1
+
+    for p in to_remove:
+        parent = p.getparent()
+        if parent is not None:
+            parent.remove(p)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
 
 
 def enforce_line_spacing(docx_bytes, spacing=1.15):
@@ -2538,6 +2638,7 @@ def build_final_document(result_text, ui, tc):
             built = enforce_line_spacing(
                 merge_docx_sections(ma_bytes, ar_bytes, dify_bytes, split_sections=_use_lh)
             )
+            built = strip_page_top_empty_paragraphs(built)
             if _use_lh:
                 built = inject_ar_letterhead(built, _lh_path, ar_index=1)
             fname = (
@@ -2548,7 +2649,7 @@ def build_final_document(result_text, ui, tc):
         except Exception as exc:
             st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
 
-    built = enforce_line_spacing(dify_bytes)
+    built = strip_page_top_empty_paragraphs(enforce_line_spacing(dify_bytes))
     fname = (
         f"{ui.get('Co_short_name', 'Report')}_"
         f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
@@ -2559,7 +2660,14 @@ def build_final_document(result_text, ui, tc):
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 1 — Report Parameters & MAIN Workflow
 # ══════════════════════════════════════════════════════════════════════════════
-if not final_done:
+# The input form is rendered on every run — even after a report is generated —
+# so the user's selections and uploaded files stay put. Streamlit garbage-
+# collects widget state for widgets that aren't rendered in a run; hiding the
+# form after generation was what made Reset come back empty. Keeping it rendered
+# means the values (and the file-uploader contents) persist naturally, so Reset
+# only has to clear the generated result. The finished report renders in the
+# FINAL RESULT block below this one.
+if True:
 
     st.subheader("Upload Control Matrix File(s)")
     st.caption(
@@ -2573,6 +2681,7 @@ if not final_done:
     uploaded_files = st.file_uploader(
         "Upload files (Excel, PDF, Word, etc.)",
         accept_multiple_files=True,
+        key="uploaded_files",
     )
 
     # ── Required fields ───────────────────────────────────────────────────────
@@ -2788,35 +2897,117 @@ if not final_done:
     # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
+    # The checkbox value lived ONLY in its widget key. Streamlit garbage-collects
+    # widget-key state when a widget isn't rendered on a run, so after Reset the
+    # key could be gone and the seeding below would re-apply the report-type
+    # default (for SOC2: CUEC off / UER on — i.e. a both-selected choice silently
+    # became "only UER"). Fix: keep a shadow copy in a plain (non-widget) key that
+    # Reset never clears and the GC can't touch, mirror every toggle into it via
+    # on_change, and seed the widget from the shadow. The user's exact selection
+    # now survives Reset and any rerun.
+    _cuec_pref = "pref_" + _cuec_key
+    _uer_pref  = "pref_" + _uer_key
+    if _cuec_pref not in st.session_state:
+        st.session_state[_cuec_pref] = report_type.startswith("SOC1")
+    if _uer_pref not in st.session_state:
+        st.session_state[_uer_pref] = report_type.startswith("SOC2")
     if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = report_type.startswith("SOC1")
+        st.session_state[_cuec_key] = st.session_state[_cuec_pref]
     if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = report_type.startswith("SOC2")
+        st.session_state[_uer_key] = st.session_state[_uer_pref]
+
+    def _mirror_pref(widget_key):
+        st.session_state["pref_" + widget_key] = st.session_state[widget_key]
+
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
         key=_cuec_key,
+        on_change=_mirror_pref, args=(_cuec_key,),
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
         key=_uer_key,
+        on_change=_mirror_pref, args=(_uer_key,),
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
 
     st.markdown("---")
-    run_main = st.button("▶ Run All Steps (1 → 2 → 3)", type="primary", use_container_width=True)
+
+    # ── Signature of every form input — lets us tell whether the form has been
+    #    edited since the current report was generated. While a report exists and
+    #    the form still matches it, the Run / MA+AR buttons are hidden (only the
+    #    preview + download remain); editing any field brings them back, rendered
+    #    beneath the download button in the FINAL RESULT block below.
+    _form_sig = (
+        report_type, output_language, scope_of_report, industry,
+        company_name, co_short_name, system_name, service_description,
+        period_start, period_end, subservice_org, systems_function,
+        system_extra, domain, co_website,
+        is_security, is_availability, is_processing_integrity,
+        is_confidentiality, is_privacy, is_cuec, is_uer,
+        generate_complete, standard, report_date, signing_city,
+        addressee_choice, cuec_choice, sso_cc_choice,
+        has_transaction_processing, single_user_entity,
+        has_ai_scope_exclusion, has_other_information, letterhead_path,
+        tuple((f.name, getattr(f, "size", None)) for f in (uploaded_files or [])),
+    )
+    # Only flag a change when we have a recorded signature to compare against —
+    # a restored/legacy session with no signature keeps the buttons hidden.
+    form_changed = (
+        final_done
+        and "_gen_sig" in st.session_state
+        and st.session_state["_gen_sig"] != _form_sig
+    )
+
+    # Buttons a) Run All Steps and b) Generate MA + AR only live at the top only
+    # until a report exists. Once `final_done` they vanish here; if the form is
+    # later edited they reappear below the download button (see FINAL RESULT).
+    run_main = False
+    run_ma_ar_only = False
+    if not final_done:
+        run_main = st.button(
+            "▶ Run All Steps (1 → 2 → 3)", type="primary",
+            use_container_width=True, key="btn_run_main_top",
+        )
+        if generate_complete:
+            run_ma_ar_only = st.button(
+                "🧪 Generate MA + AR only (templates, no Dify)",
+                use_container_width=True, key="btn_run_ma_ar_top",
+                help="Fills the Section I + II templates using the fields above "
+                     "without running the Dify workflow.",
+            )
+
+    # The bottom buttons (rendered in FINAL RESULT when the form is edited after
+    # generation) report their click via this flag + a rerun, so the heavy
+    # handlers below run from one place regardless of which button was used.
+    _pending = st.session_state.pop("_pending_action", None)
+    if _pending == "run_main":
+        run_main = True
+    elif _pending == "run_ma_ar":
+        run_ma_ar_only = True
+
+    # Live Run-All status placeholders — the "⏳ Step N — Running…" banner and the
+    # "Nodes completed…" line. Created at a fixed position every run so they stay
+    # empty (invisible) unless a Dify run writes to them, and so the MA+AR-only
+    # path can explicitly clear any banner left over from an interrupted Run-All.
+    step_label  = st.empty()
+    node_status = st.empty()
+    ma_ar_dl    = st.empty()   # holds the "⬇ Download MA + AR" button
+
+    # A click on Run All Steps or Generate MA + AR only starts new (blocking)
+    # processing — immediately clear any leftover Run-All banner and stale MA+AR
+    # download button so they don't linger on screen while it runs.
+    if run_main or run_ma_ar_only:
+        step_label.empty()
+        node_status.empty()
+        ma_ar_dl.empty()
 
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
-        run_ma_ar_only = st.button(
-            "🧪 Generate MA + AR only (templates, no Dify)",
-            use_container_width=True,
-            help="Fills the Section I + II templates using the fields above without "
-                 "running the Dify workflow.",
-        )
         if run_ma_ar_only:
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
@@ -2895,6 +3086,7 @@ if not final_done:
                         _t_merged = enforce_line_spacing(
                             merge_docx_sections(_t_ma, _t_ar, split_sections=_t_use_lh)
                         )
+                        _t_merged = strip_page_top_empty_paragraphs(_t_merged)
                         if _t_use_lh:
                             _t_merged = inject_ar_letterhead(_t_merged, letterhead_path, ar_index=1)
                     st.session_state["ma_ar_only"] = {
@@ -2907,6 +3099,14 @@ if not final_done:
                 except Exception as _exc:
                     st.session_state.pop("ma_ar_only", None)
                     st.error(f"MA + AR generation failed: {_exc}")
+                else:
+                    # Success: replace the on-screen result with just this MA+AR
+                    # download — drop any previously generated complete report so
+                    # its "Report is ready" bar / preview / inputs / download
+                    # don't linger alongside it. Rerun so `final_done` re-evaluates.
+                    for _k in ("final_result", "final_bytes", "final_filename", "_gen_sig"):
+                        st.session_state.pop(_k, None)
+                    st.rerun()
 
         # Clicking "Run All Steps" starts a Dify run; hide any pending MA+AR
         # download so its stale data can't be re-downloaded mid-workflow (a second
@@ -2914,8 +3114,10 @@ if not final_done:
         if run_main:
             st.session_state.pop("ma_ar_only", None)
 
+        # Render the download into its fixed placeholder so it sits in a stable
+        # slot that the clear-block above can wipe the instant a new run starts.
         if st.session_state.get("ma_ar_only"):
-            _ma_ar_downloaded = st.download_button(
+            _ma_ar_downloaded = ma_ar_dl.download_button(
                 label="⬇ Download MA + AR (.docx)",
                 data=st.session_state["ma_ar_only"]["bytes"],
                 file_name=st.session_state["ma_ar_only"]["filename"],
@@ -3057,8 +3259,7 @@ if not final_done:
             "File_input": file_ids,
         }
 
-        step_label  = st.empty()
-        node_status = st.empty()
+        # step_label / node_status are the shared placeholders created above.
         if True:
             # ── Step 1 ────────────────────────────────────────────────────────
             step_label.info("⏳ Step 1 — Running MAIN workflow — this may take several minutes…")
@@ -3197,6 +3398,9 @@ if not final_done:
             )
             st.session_state["final_bytes"]    = _built
             st.session_state["final_filename"] = _fname
+            # Remember the form state that produced this report so the Run /
+            # MA+AR buttons stay hidden until the user edits something.
+            st.session_state["_gen_sig"]       = _form_sig
 
         status_bar.markdown(_status_html("✅", "✅", "✅"), unsafe_allow_html=True)
         st.rerun()
@@ -3227,9 +3431,9 @@ if final_done:
     with st.expander("📖 Preview Report (Dify sections)", expanded=True):
         st.markdown(result_text)
 
-    # ── Inputs used — kept visible so the user can review what produced this
-    #    report. The input form itself is hidden once final_done is True, so this
-    #    read-only summary is the only place the chosen values survive.
+    # ── Inputs used — a collapsed read-only summary of exactly what produced
+    #    this report. The live form above stays populated now, but this snapshot
+    #    reflects the values at generation time even if the form is later edited.
     with st.expander("📋 Inputs used for this report", expanded=False):
         _flag = lambda v: "✓" if v else "—"
         _g = lambda k, d="": ui.get(k, d)
@@ -3303,3 +3507,26 @@ if final_done:
         type="primary",
         use_container_width=True,
     )
+
+    # When the form has been edited since this report was generated, bring the
+    # Run / MA+AR buttons back here — beneath the download button — so the user
+    # can regenerate. They post their click via a flag + rerun (picked up at the
+    # top of the form block) so the existing handlers run from one place. The
+    # download/preview above disappear as soon as a regenerate begins.
+    if form_changed:
+        st.markdown("---")
+        st.caption("⚠️ Form inputs changed since this report was generated — regenerate below.")
+        if st.button(
+            "▶ Run All Steps (1 → 2 → 3)", type="primary",
+            use_container_width=True, key="btn_run_main_bottom",
+        ):
+            st.session_state["_pending_action"] = "run_main"
+            st.rerun()
+        if generate_complete and st.button(
+            "🧪 Generate MA + AR only (templates, no Dify)",
+            use_container_width=True, key="btn_run_ma_ar_bottom",
+            help="Fills the Section I + II templates using the fields above "
+                 "without running the Dify workflow.",
+        ):
+            st.session_state["_pending_action"] = "run_ma_ar"
+            st.rerun()
