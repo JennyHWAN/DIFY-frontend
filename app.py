@@ -2888,32 +2888,21 @@ if not final_done:
     ue_cols = st.columns(2)
     # Defaults are seeded into session_state once per report type (the key embeds
     # report_type, so switching types applies that type's fresh default the first
-    # time it is seen). The checkboxes are then rendered WITHOUT a `value=` arg so
-    # a user's manual toggle is read straight from session_state and never
+    # time it is seen). The checkboxes are rendered WITHOUT a `value=` arg so a
+    # user's manual toggle is read straight from session_state and never
     # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
+    #
+    # These are plain widget keys, like every other field: while the form is on
+    # screen the toggle persists, but once a report is generated the form is
+    # hidden, Streamlit garbage-collects the key, and a post-generation Reset
+    # re-seeds the report-type default — so CUEC/UER reset along with everything
+    # else instead of lingering.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
-    # The checkbox value lived ONLY in its widget key. Streamlit garbage-collects
-    # widget-key state when a widget isn't rendered on a run, so after Reset the
-    # key could be gone and the seeding below would re-apply the report-type
-    # default (for SOC2: CUEC off / UER on — i.e. a both-selected choice silently
-    # became "only UER"). Fix: keep a shadow copy in a plain (non-widget) key that
-    # Reset never clears and the GC can't touch, mirror every toggle into it via
-    # on_change, and seed the widget from the shadow. The user's exact selection
-    # now survives Reset and any rerun.
-    _cuec_pref = "pref_" + _cuec_key
-    _uer_pref  = "pref_" + _uer_key
-    if _cuec_pref not in st.session_state:
-        st.session_state[_cuec_pref] = report_type.startswith("SOC1")
-    if _uer_pref not in st.session_state:
-        st.session_state[_uer_pref] = report_type.startswith("SOC2")
     if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = st.session_state[_cuec_pref]
+        st.session_state[_cuec_key] = report_type.startswith("SOC1")
     if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = st.session_state[_uer_pref]
-
-    def _mirror_pref(widget_key):
-        st.session_state["pref_" + widget_key] = st.session_state[widget_key]
+        st.session_state[_uer_key] = report_type.startswith("SOC2")
 
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
@@ -2921,13 +2910,11 @@ if not final_done:
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
         key=_cuec_key,
-        on_change=_mirror_pref, args=(_cuec_key,),
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
         key=_uer_key,
-        on_change=_mirror_pref, args=(_uer_key,),
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
 
