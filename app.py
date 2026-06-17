@@ -1450,17 +1450,9 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         # Overwriting them with the report's wider margins (e.g. 1800/1800)
         # shifts the whole banner sideways and cramps the right-hand Tel/Fax box
         # against the page edge — the "letterhead doesn't fit the page" defect.
-        # We therefore preserve the letterhead side margins, only nudging them
-        # inward by a small amount (capped at 5% of the letterhead's own value)
-        # so the body text isn't flush against the banner edges. A bump this
-        # small doesn't visibly shift the absolutely-positioned banner group.
+        # We therefore preserve the letterhead's side margins exactly as the EY
+        # AR template authored them (no override, no adjustment).
         orig_ar = sectprs[ar_index].group(0)
-        for _side in ("left", "right"):
-            _lh = _pgmar_attr(new_sectpr, _side)
-            if _lh is not None:
-                new_sectpr = _set_pgmar_attr(
-                    new_sectpr, _side, int(round(_lh * 1.05))
-                )
 
         # The letterhead also carries its own (small) bottom margin, which leaves
         # the last line uncomfortably close to the page edge. Keep the AR
