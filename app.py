@@ -1242,6 +1242,25 @@ _IMG_CONTENT_TYPES = {
 }
 
 
+def _pgmar_attr(sectpr, attr):
+    """Return the integer value (in twips) of a <w:pgMar> attribute such as
+    'top' or 'bottom' from a sectPr string, or None if absent."""
+    m = re.search(r"<w:pgMar\b[^>]*>", sectpr)
+    if not m:
+        return None
+    v = re.search(r'\bw:%s="(-?\d+)"' % attr, m.group(0))
+    return int(v.group(1)) if v else None
+
+
+def _set_pgmar_attr(sectpr, attr, value):
+    """Return *sectpr* with the <w:pgMar> *attr* set to *value* (twips). If the
+    attribute isn't present the sectPr is returned unchanged."""
+    def repl(m):
+        tag = m.group(0)
+        return re.sub(r'\bw:%s="-?\d+"' % attr, 'w:%s="%d"' % (attr, value), tag)
+    return re.sub(r"<w:pgMar\b[^>]*>", repl, sectpr, count=1)
+
+
 def _extract_letterhead_parts(letterhead_path):
     """Read the header parts (and their images) + sectPr from a letterhead .docx.
 
@@ -1410,6 +1429,19 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         sectprs = list(re.finditer(r"<w:sectPr\b.*?</w:sectPr>", doc_xml, re.S))
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
+
+        # The letterhead's sectPr enlarges the top margin to clear the header,
+        # but it also carries the letterhead's own (small) bottom margin, which
+        # leaves the last line uncomfortably close to the page edge. Keep the AR
+        # section's bottom margin close to the EY template's original value (the
+        # one that looks fine without a letterhead) — allow at most a 10%
+        # reduction — so there's reasonable breathing room at the page bottom.
+        orig_bottom = _pgmar_attr(sectprs[ar_index].group(0), "bottom")
+        lh_bottom   = _pgmar_attr(new_sectpr, "bottom")
+        if orig_bottom and lh_bottom is not None:
+            min_bottom = int(round(orig_bottom * 0.9))
+            if lh_bottom < min_bottom:
+                new_sectpr = _set_pgmar_attr(new_sectpr, "bottom", min_bottom)
 
         # Word propagates a section's header forward: a later section with no
         # headerReference of its own inherits the previous section's header. So
@@ -2855,21 +2887,41 @@ if True:
     # re-applied/clobbered on a later rerun — e.g. toggling UER must not reset CUEC.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
+    # The checkbox value lived ONLY in its widget key. Streamlit garbage-collects
+    # widget-key state when a widget isn't rendered on a run, so after Reset the
+    # key could be gone and the seeding below would re-apply the report-type
+    # default (for SOC2: CUEC off / UER on — i.e. a both-selected choice silently
+    # became "only UER"). Fix: keep a shadow copy in a plain (non-widget) key that
+    # Reset never clears and the GC can't touch, mirror every toggle into it via
+    # on_change, and seed the widget from the shadow. The user's exact selection
+    # now survives Reset and any rerun.
+    _cuec_pref = "pref_" + _cuec_key
+    _uer_pref  = "pref_" + _uer_key
+    if _cuec_pref not in st.session_state:
+        st.session_state[_cuec_pref] = report_type.startswith("SOC1")
+    if _uer_pref not in st.session_state:
+        st.session_state[_uer_pref] = report_type.startswith("SOC2")
     if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = report_type.startswith("SOC1")
+        st.session_state[_cuec_key] = st.session_state[_cuec_pref]
     if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = report_type.startswith("SOC2")
+        st.session_state[_uer_key] = st.session_state[_uer_pref]
+
+    def _mirror_pref(widget_key):
+        st.session_state["pref_" + widget_key] = st.session_state[widget_key]
+
     # Labels are kept short (acronym only) so they stay on a single line within the
     # half-width column — otherwise the long CUEC label wraps and its help "?" icon
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
         key=_cuec_key,
+        on_change=_mirror_pref, args=(_cuec_key,),
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
         key=_uer_key,
+        on_change=_mirror_pref, args=(_uer_key,),
         help="User Entity Responsibilities — default on for SOC2 reports. "
              "Generated from the control matrix.")
 
