@@ -1430,13 +1430,23 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
 
-        # The letterhead's sectPr enlarges the top margin to clear the header,
-        # but it also carries the letterhead's own (small) bottom margin, which
-        # leaves the last line uncomfortably close to the page edge. Keep the AR
+        # The letterhead's sectPr replaces the whole AR page geometry. We only
+        # want its enlarged top margin (to clear the header); the side margins
+        # should stay as the EY template intended, so the body text keeps the
+        # same width/indent as the rest of the report. Restore the original
+        # left/right (and gutter) margins onto the letterhead-derived sectPr.
+        orig_ar = sectprs[ar_index].group(0)
+        for _side in ("left", "right", "gutter"):
+            _orig = _pgmar_attr(orig_ar, _side)
+            if _orig is not None:
+                new_sectpr = _set_pgmar_attr(new_sectpr, _side, _orig)
+
+        # The letterhead also carries its own (small) bottom margin, which leaves
+        # the last line uncomfortably close to the page edge. Keep the AR
         # section's bottom margin close to the EY template's original value (the
         # one that looks fine without a letterhead) — allow at most a 10%
         # reduction — so there's reasonable breathing room at the page bottom.
-        orig_bottom = _pgmar_attr(sectprs[ar_index].group(0), "bottom")
+        orig_bottom = _pgmar_attr(orig_ar, "bottom")
         lh_bottom   = _pgmar_attr(new_sectpr, "bottom")
         if orig_bottom and lh_bottom is not None:
             min_bottom = int(round(orig_bottom * 0.9))
