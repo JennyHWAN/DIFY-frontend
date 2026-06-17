@@ -2897,16 +2897,21 @@ if not final_done:
     # is baked into the widget key so the default re-applies when the report type
     # changes, while still letting the user override within a given type.
     ue_cols = st.columns(2)
-    # The checkbox value lives in its widget key, but Streamlit drops widget-key
-    # state whenever the widget isn't rendered on a run — including the Reset rerun
-    # (the form isn't rendered before st.rerun() fires) — so a plain key alone gets
-    # re-seeded to the report-type default on a MA+AR-only Reset while every other
-    # field is kept. Fix: keep a shadow copy in a plain (non-widget) key that the
-    # GC can't touch, mirror every toggle into it via on_change, and seed the
-    # widget from it. The selection then survives a MA+AR-only / mid-run Reset.
-    # After a COMPLETE report the form is hidden and everything else resets, so the
-    # Reset handler explicitly clears these shadows in that case only (see sidebar).
-    # The key embeds report_type so switching types applies that type's default.
+    # Streamlit drops a widget's key from session_state whenever the widget isn't
+    # rendered on a run — including the Reset rerun (the form isn't rendered before
+    # st.rerun() fires) — so a plain keyed checkbox re-seeds to the report-type
+    # default on a MA+AR-only Reset while every other field is kept. We keep a
+    # shadow copy in a plain (non-widget) key the GC can't touch: seed it with the
+    # report-type default, mirror every toggle into it via on_change, and seed the
+    # checkbox from it through `value=`. The selection then survives a MA+AR-only /
+    # mid-run Reset. After a COMPLETE report the form is hidden and everything else
+    # resets, so the Reset handler clears these shadows in that case only (sidebar).
+    #
+    # IMPORTANT: we never write the widget key ourselves (`st.session_state[_cuec_key]
+    # = …`). Doing that alongside on_change made clicking UER reset CUEC. `value=`
+    # is only applied on first render (and after a GC) and is ignored once the key
+    # exists, so a normal rerun keeps each box's own state. The key embeds
+    # report_type so switching types applies that type's default.
     _cuec_key = f"form_is_cuec_{report_type}"
     _uer_key  = f"form_is_uer_{report_type}"
     _cuec_pref = "pref_" + _cuec_key
@@ -2915,10 +2920,6 @@ if not final_done:
         st.session_state[_cuec_pref] = report_type.startswith("SOC1")
     if _uer_pref not in st.session_state:
         st.session_state[_uer_pref] = report_type.startswith("SOC2")
-    if _cuec_key not in st.session_state:
-        st.session_state[_cuec_key] = st.session_state[_cuec_pref]
-    if _uer_key not in st.session_state:
-        st.session_state[_uer_key] = st.session_state[_uer_pref]
 
     def _mirror_pref(widget_key):
         st.session_state["pref_" + widget_key] = st.session_state[widget_key]
@@ -2928,12 +2929,14 @@ if not final_done:
     # drops to the second line, misaligning it with UER's. Full names live in `help`.
     is_cuec = ue_cols[0].checkbox(
         "Include CUEC",
+        value=st.session_state[_cuec_pref],
         key=_cuec_key,
         on_change=_mirror_pref, args=(_cuec_key,),
         help="Complementary User Entity Controls — default on for SOC1 reports. "
              "Generated from the control matrix.")
     is_uer = ue_cols[1].checkbox(
         "Include UER",
+        value=st.session_state[_uer_pref],
         key=_uer_key,
         on_change=_mirror_pref, args=(_uer_key,),
         help="User Entity Responsibilities — default on for SOC2 reports. "
