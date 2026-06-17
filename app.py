@@ -1442,16 +1442,25 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
         if ar_index >= len(sectprs):
             return docx_bytes   # structure unexpected — leave document untouched
 
-        # The letterhead's sectPr replaces the whole AR page geometry. We only
-        # want its enlarged top margin (to clear the header); the side margins
-        # should stay as the EY template intended, so the body text keeps the
-        # same width/indent as the rest of the report. Restore the original
-        # left/right (and gutter) margins onto the letterhead-derived sectPr.
+        # The letterhead's sectPr replaces the whole AR page geometry. Keep the
+        # letterhead's own left/right margins: its banner, logo and address
+        # blocks are an absolutely-positioned drawing group anchored to the text
+        # column (i.e. the left margin), so the EY designer sized everything for
+        # the letterhead's specific side margins (e.g. Shanghai 1368/1282).
+        # Overwriting them with the report's wider margins (e.g. 1800/1800)
+        # shifts the whole banner sideways and cramps the right-hand Tel/Fax box
+        # against the page edge — the "letterhead doesn't fit the page" defect.
+        # We therefore preserve the letterhead side margins, only nudging them
+        # inward by a small amount (capped at 5% of the letterhead's own value)
+        # so the body text isn't flush against the banner edges. A bump this
+        # small doesn't visibly shift the absolutely-positioned banner group.
         orig_ar = sectprs[ar_index].group(0)
-        for _side in ("left", "right", "gutter"):
-            _orig = _pgmar_attr(orig_ar, _side)
-            if _orig is not None:
-                new_sectpr = _set_pgmar_attr(new_sectpr, _side, _orig)
+        for _side in ("left", "right"):
+            _lh = _pgmar_attr(new_sectpr, _side)
+            if _lh is not None:
+                new_sectpr = _set_pgmar_attr(
+                    new_sectpr, _side, int(round(_lh * 1.05))
+                )
 
         # The letterhead also carries its own (small) bottom margin, which leaves
         # the last line uncomfortably close to the page edge. Keep the AR
