@@ -2750,7 +2750,7 @@ if not final_done:
                          "\"2026年1月30日\" in Chinese reports. "
                          "Other text is inserted into the report as-is.",
                 )
-                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai", key="cr_signing_city")
+                signing_city = st.text_input("Signing City", placeholder="e.g. Shanghai/上海", key="cr_signing_city")
 
                 _lh_files = list_letterheads()
                 _lh_options = ["(None — no letterhead)"] + _lh_files
