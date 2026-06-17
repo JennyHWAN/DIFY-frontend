@@ -2934,14 +2934,19 @@ if True:
     # path can explicitly clear any banner left over from an interrupted Run-All.
     step_label  = st.empty()
     node_status = st.empty()
+    ma_ar_dl    = st.empty()   # holds the "⬇ Download MA + AR" button
+
+    # A click on Run All Steps or Generate MA + AR only starts new (blocking)
+    # processing — immediately clear any leftover Run-All banner and stale MA+AR
+    # download button so they don't linger on screen while it runs.
+    if run_main or run_ma_ar_only:
+        step_label.empty()
+        node_status.empty()
+        ma_ar_dl.empty()
 
     # ── MA + AR only: fill the templates from the fields above, no Dify run ────
     if generate_complete:
         if run_ma_ar_only:
-            # Clicking MA+AR only mid-run interrupts Run All Steps — drop its
-            # "⏳ Step 1 — Running…" banner so it doesn't linger over the output.
-            step_label.empty()
-            node_status.empty()
             _ar_wp_t, _ar_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "AR")
             _ma_wp_t, _ma_path_t = resolve_template(report_type, standard, scope_of_report, output_language, "MA")
             # Require the same form fields as "Run All Steps", minus the Dify-only
@@ -3047,8 +3052,10 @@ if True:
         if run_main:
             st.session_state.pop("ma_ar_only", None)
 
+        # Render the download into its fixed placeholder so it sits in a stable
+        # slot that the clear-block above can wipe the instant a new run starts.
         if st.session_state.get("ma_ar_only"):
-            _ma_ar_downloaded = st.download_button(
+            _ma_ar_downloaded = ma_ar_dl.download_button(
                 label="⬇ Download MA + AR (.docx)",
                 data=st.session_state["ma_ar_only"]["bytes"],
                 file_name=st.session_state["ma_ar_only"]["filename"],
