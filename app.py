@@ -5,6 +5,7 @@ import io
 import re
 import json
 import zipfile
+import traceback
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from docx import Document
@@ -3038,6 +3039,8 @@ if not final_done:
                 except Exception as _exc:
                     st.session_state.pop("ma_ar_only", None)
                     st.error(f"MA + AR generation failed: {_exc}")
+                    with st.expander("Show error details (traceback)", expanded=True):
+                        st.code(traceback.format_exc())
 
         # Clicking "Run All Steps" starts a Dify run; hide any pending MA+AR
         # download so its stale data can't be re-downloaded mid-workflow (a second
