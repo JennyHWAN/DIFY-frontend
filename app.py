@@ -1372,13 +1372,68 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
             if add and "</w:fonts>" in ft:
                 font_table_xml = ft.replace("</w:fonts>", "".join(add) + "</w:fonts>")
 
+        # Isolate the letterhead header's style chain from the merged document.
+        # The merged doc is based on the MA template, whose 'Normal' style is
+        # bold and whose 'Header' style has a bottom border. The letterhead's
+        # header paragraphs reference styles by id (Header, EYBusinessaddress, …
+        # → basedOn 'Normal'); sharing those ids with the host makes the header
+        # inherit the wrong weight and a stray black line. So copy every style
+        # the header depends on (following basedOn/link/next) under a private id
+        # namespace, repoint the copies' internal references, and rewrite the
+        # header XML (in the loop below) to use the private ids — the letterhead
+        # header then renders exactly as authored, independent of the host's
+        # styles. style_id_map (orig id -> private id) drives the header rewrite.
+        style_id_map = {}
         styles_xml = None
         if "word/styles.xml" in names and support["styles"]:
-            sx   = zin.read("word/styles.xml").decode("utf-8")
-            have = set(re.findall(r'w:styleId="([^"]+)"', sx))
-            add  = _missing(support["styles"], "w:styleId", have)
-            if add and "</w:styles>" in sx:
-                styles_xml = sx.replace("</w:styles>", "".join(add) + "</w:styles>")
+            sx       = zin.read("word/styles.xml").decode("utf-8")
+            existing = set(re.findall(r'w:styleId="([^"]+)"', sx))
+
+            lh_style = {}
+            for blk in support["styles"]:
+                m = re.search(r'w:styleId="([^"]+)"', blk)
+                if m:
+                    lh_style[m.group(1)] = blk
+
+            seed = set()
+            for h in headers.values():
+                hx = h["xml"].decode("utf-8") if isinstance(h["xml"], bytes) else h["xml"]
+                seed.update(re.findall(r'<w:(?:pStyle|rStyle|tblStyle) w:val="([^"]+)"', hx))
+
+            # Transitive closure over basedOn/link/next, restricted to styles the
+            # letterhead actually defines (a ref outside lh_style — e.g. a bare
+            # built-in id — is left to resolve against the host as a last resort).
+            closure, stack = set(), list(seed)
+            while stack:
+                sid = stack.pop()
+                if sid in closure or sid not in lh_style:
+                    continue
+                closure.add(sid)
+                stack.extend(re.findall(
+                    r'<w:(?:basedOn|link|next) w:val="([^"]+)"', lh_style[sid]))
+
+            def _uniq(name):
+                cand, i = name, 1
+                while cand in existing:
+                    cand, i = "%s%d" % (name, i), i + 1
+                existing.add(cand)
+                return cand
+            style_id_map = {sid: _uniq("LH" + sid) for sid in closure}
+
+            def _remap_ref(m):
+                return m.group(1) + style_id_map.get(m.group(2), m.group(2)) + m.group(3)
+
+            new_blocks = []
+            for sid, new_id in style_id_map.items():
+                blk = re.sub(r'(w:styleId=")[^"]+(")',
+                             lambda m, _i=new_id: m.group(1) + _i + m.group(2),
+                             lh_style[sid], count=1)
+                blk = re.sub(r'(<w:(?:basedOn|link|next) w:val=")([^"]+)(")',
+                             _remap_ref, blk)
+                new_blocks.append(blk)
+
+            if new_blocks and "</w:styles>" in sx:
+                styles_xml = sx.replace("</w:styles>", "".join(new_blocks) + "</w:styles>")
 
         # Allocate rIds that don't clash with the existing document rels
         used    = [int(n) for n in re.findall(r'Id="rId(\d+)"', rels_xml)]
@@ -1404,6 +1459,18 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
                     new_rels = new_rels.replace(
                         'Target="%s"' % variant, 'Target="%s"' % img_map[orig_target]
                     )
+            # Repoint the header's style references to the private copies added
+            # above, so it uses the letterhead's own (non-bold, borderless)
+            # styles rather than the host document's same-named ones.
+            hxml = h["xml"]
+            if style_id_map:
+                hs = hxml.decode("utf-8") if isinstance(hxml, bytes) else hxml
+                hs = re.sub(
+                    r'(<w:(?:pStyle|rStyle|tblStyle) w:val=")([^"]+)(")',
+                    lambda m: m.group(1) + style_id_map.get(m.group(2), m.group(2)) + m.group(3),
+                    hs,
+                )
+                hxml = hs.encode("utf-8")
             base_name = "lh_header_%s.xml" % htype
             rid       = "rId%d" % next_id
             next_id  += 1
@@ -1411,7 +1478,7 @@ def inject_ar_letterhead(docx_bytes, letterhead_path, ar_index):
                 "part":    "word/" + base_name,
                 "relpart": "word/_rels/" + base_name + ".rels",
                 "rid":     rid,
-                "xml":     h["xml"],
+                "xml":     hxml,
                 "rels":    new_rels.encode("utf-8"),
             }
             new_rels_entries.append(
@@ -2715,7 +2782,7 @@ if not final_done:
         output_language = st.selectbox("Output Language",
             ["English", "中文"], key="form_output_language")
         service_description = st.text_input("Service Description",  max_chars=256)
-        period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2024-12-31")
+        period_end = st.text_input("Report Period End (N/A for Type1)", placeholder="e.g. 2025-12-31")
         subservice_org = st.text_area(
                             "Subservice Organization (N/A if no subservice organization)",
                             placeholder="Alibaba Cloud | Alibaba Cloud | Elastic Cloud, Object Storage\nTencent Cloud | Tencent | Cloud Virtual Machine, TencentDB",
