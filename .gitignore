@@ -1,5 +1,5 @@
 env
-.claude
+.claude/settings.local.json
 .env
 _bundled_config.py
 /dist
