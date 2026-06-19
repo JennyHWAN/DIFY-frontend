@@ -55,8 +55,5 @@ silently does nothing or deletes the wrong thing.
 Use these in `assets/` as fixtures when changing the fill pipeline — diff new
 output against them to catch regressions:
 
-- `sample_soc1_type1_ma_ar.docx` — MA + AR only, the "Generate MA + AR only"
-  output for inspecting just the template fill.
 - `template_before.png` / `output_after.png` — before/after of a template fill,
   showing how placeholders and conditional markers resolve.
-- `screenshot_ui.png` — the Streamlit UI / complete-report settings.
