@@ -5,6 +5,7 @@ import io
 import re
 import json
 import zipfile
+import tempfile
 import traceback
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -28,13 +29,150 @@ else:
     _TEMPLATE_BASE = os.path.dirname(os.path.abspath(__file__))
 
 TEMPLATE_INDEX  = os.path.join(_TEMPLATE_BASE, "template_index.xlsx")
-AR_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
-MA_TEMPLATE_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
+
+# Bundled MA/AR templates that ship next to the .exe (or alongside app.py in dev).
+# These are the fallback used when the OneDrive-synced library isn't available.
+_BUNDLED_AR_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
+_BUNDLED_MA_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
+
+# EY keeps the authoritative MA/AR templates in the SharePoint library
+# "GCSOCR / Reporting files templates". Rather than ship static copies, the app can
+# pull the latest .docx straight from that library at startup so templates stay
+# current without rebuilding the exe. `TEMPLATE_SOURCE` selects where they come from:
+#
+#   bundled    (default) — use the .docx that ship next to the exe.
+#   sharepoint           — download from the online SharePoint library (see below).
+#   onedrive             — read from a locally synced/mapped copy at TEMPLATE_BASE_PATH.
+#
+# SharePoint notes: the library is gated behind each user's EY sign-in, so the app
+# does NOT store any credential or use an Azure AD app registration. Instead it reuses
+# the cookies of the browser the user is already signed in with on an internal machine
+# (best effort, via browser_cookie3), calls the SharePoint REST API, and caches the
+# .docx locally. If the fetch can't authenticate or the network is down, it falls back
+# to the bundled templates and shows a warning. This path must be verified on a real
+# EY-managed machine. Folder/site URLs default to the current library layout and can
+# be overridden via the SHAREPOINT_* env vars.
+TEMPLATE_SOURCE     = os.getenv("TEMPLATE_SOURCE", "bundled").strip().lower()
+
+# -- onedrive (locally synced / mapped folder) mode --
+TEMPLATE_BASE_PATH  = os.getenv("TEMPLATE_BASE_PATH", "").strip()
+MA_TEMPLATE_SUBPATH = os.getenv("MA_TEMPLATE_SUBPATH", "1.1 MA整理版").strip()
+AR_TEMPLATE_SUBPATH = os.getenv("AR_TEMPLATE_SUBPATH", "1.2 AR整理版/AR updated Verison").strip()
+
+# -- sharepoint (online library) mode --
+SP_SITE_URL  = os.getenv("SHAREPOINT_SITE_URL", "https://eychinamanaged.sharepoint.cn/sites/GCSOCR").rstrip("/")
+SP_MA_FOLDER = os.getenv("SHAREPOINT_MA_FOLDER", "/sites/GCSOCR/Reporting files templates/1.1 MA整理版")
+SP_AR_FOLDER = os.getenv("SHAREPOINT_AR_FOLDER", "/sites/GCSOCR/Reporting files templates/1.2 AR整理版/AR updated Verison")
+
+
+def _sp_session():
+    """A requests session that reuses the user's existing browser sign-in to
+    SharePoint, so no stored credential / app registration is needed. Best effort:
+    if browser_cookie3 is unavailable or finds no cookies we return a plain session
+    (the REST call then fails auth and we fall back to the bundled templates)."""
+    s = requests.Session()
+    s.verify = False  # internal use, consistent with the Dify client
+    try:
+        import browser_cookie3
+        host = SP_SITE_URL.split("//", 1)[-1].split("/", 1)[0]
+        s.cookies = browser_cookie3.load(domain_name=host)
+    except Exception:
+        pass
+    return s
+
+
+def _sp_list_docx(session, folder_server_relative):
+    """Return [(name, server_relative_url), …] for the .docx in a library folder."""
+    esc = folder_server_relative.replace("'", "''")
+    url = requests.utils.requote_uri(
+        f"{SP_SITE_URL}/_api/web/GetFolderByServerRelativePath(decodedurl='{esc}')"
+        f"/Files?$select=Name,ServerRelativeUrl")
+    r = session.get(url, headers={"Accept": "application/json;odata=nometadata"}, timeout=30)
+    r.raise_for_status()
+    payload = r.json()
+    # Tolerate both OData flavours: nometadata → {"value": [...]},
+    # verbose → {"d": {"results": [...]}}.
+    items = payload.get("value") or payload.get("d", {}).get("results", [])
+    out = []
+    for f in items:
+        name = f.get("Name", "")
+        if name.lower().endswith(".docx") and not name.startswith("~$"):
+            out.append((name, f.get("ServerRelativeUrl", "")))
+    return out
+
+
+def _sp_download(session, server_relative_url):
+    esc = server_relative_url.replace("'", "''")
+    url = requests.utils.requote_uri(
+        f"{SP_SITE_URL}/_api/web/GetFileByServerRelativePath(decodedurl='{esc}')/$value")
+    r = session.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+
+@st.cache_resource(show_spinner="Fetching latest MA/AR templates from SharePoint…")
+def _sync_sharepoint_templates():
+    """Download the MA/AR .docx from the SharePoint library into a local cache, once
+    per process (memoised by st.cache_resource). Returns
+    (ar_dir, ma_dir, source, warning|None); on any failure the dirs point back at the
+    bundled templates and a warning string is returned for the UI."""
+    cache_root = os.path.join(tempfile.gettempdir(), "soc_report_templates")
+    ar_dir = os.path.join(cache_root, "AR")
+    ma_dir = os.path.join(cache_root, "MA")
+    try:
+        session = _sp_session()
+        total = 0
+        for folder, dest in ((SP_AR_FOLDER, ar_dir), (SP_MA_FOLDER, ma_dir)):
+            files = _sp_list_docx(session, folder)
+            os.makedirs(dest, exist_ok=True)
+            for name, srurl in files:
+                data = _sp_download(session, srurl)
+                # A real .docx is a zip ("PK"). Anything else (e.g. an HTML sign-in
+                # page from an auth redirect) is rejected so we never feed the
+                # template pipeline garbage.
+                if not data.startswith(b"PK"):
+                    raise ValueError(f"'{name}' did not download as a .docx "
+                                     f"({len(data)} bytes; likely a sign-in redirect)")
+                with open(os.path.join(dest, name), "wb") as fh:
+                    fh.write(data)
+                total += 1
+        if total == 0:
+            raise ValueError("no .docx templates found in the SharePoint folders")
+        return (ar_dir, ma_dir, "sharepoint", None)
+    except Exception as e:
+        return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
+                f"Could not fetch templates from SharePoint ({e}). Using bundled "
+                "templates, which may be out of date.")
+
+
+def _resolve_template_dirs():
+    """Decide where MA/AR templates are read from this session.
+
+    Returns (ar_dir, ma_dir, source, warning|None). Honours TEMPLATE_SOURCE
+    ('sharepoint' / 'onedrive' / 'bundled'); any miss falls back to the bundled
+    templates with a warning string for the UI. NOTE: call this only after
+    st.set_page_config — the sharepoint path may render a cache spinner.
+    """
+    if TEMPLATE_SOURCE == "sharepoint":
+        return _sync_sharepoint_templates()
+    if TEMPLATE_SOURCE == "onedrive" and TEMPLATE_BASE_PATH:
+        ar = os.path.join(TEMPLATE_BASE_PATH, *AR_TEMPLATE_SUBPATH.replace("\\", "/").split("/"))
+        ma = os.path.join(TEMPLATE_BASE_PATH, *MA_TEMPLATE_SUBPATH.replace("\\", "/").split("/"))
+        missing = [p for p in (ar, ma) if not os.path.isdir(p)]
+        if not missing:
+            return (ar, ma, "onedrive", None)
+        return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
+                "Synced template folder not found — using bundled templates, which "
+                "may be out of date. Missing: " + "; ".join(missing))
+    return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled", None)
+
+
 # EY office letterhead .docx files (downloaded from the EY Templates Word add-in,
 # grouped + centred in Word). The header on the Auditor's Report pages is taken
 # from whichever one the user picks. Listed at runtime, so end users can add or
-# remove office letterheads next to the .exe without a rebuild.
-LETTERHEAD_DIR  = os.path.join(AR_TEMPLATE_DIR, "letterheads")
+# remove office letterheads next to the .exe without a rebuild. These are EY add-in
+# files, not part of the SharePoint library, so they always live next to the .exe.
+LETTERHEAD_DIR  = os.path.join(_BUNDLED_AR_DIR, "letterheads")
 EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
 
 
@@ -58,6 +196,11 @@ API_KEY_SUB2  = os.getenv("DIFY_API_KEY_SUB2", "")
 
 st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 st.title("AI-Driven SOC Report Generation")
+
+# Resolve where MA/AR templates come from this session (bundled / SharePoint /
+# synced folder). Done after set_page_config because the SharePoint path may show a
+# cache spinner. resolve_template() and the UI read these module globals.
+AR_TEMPLATE_DIR, MA_TEMPLATE_DIR, TEMPLATE_DIR_SOURCE, TEMPLATE_DIR_WARNING = _resolve_template_dirs()
 
 # ── API config — loaded from bundled .env, never shown in UI ──────────────────
 api_base = API_BASE_URL
@@ -89,6 +232,14 @@ with st.sidebar:
                       if "form_is_cuec" in k or "form_is_uer" in k]:
                 st.session_state.pop(k, None)
         st.rerun()
+
+    # The SharePoint fetch is memoised for the life of the process, so a long-running
+    # session won't pick up templates updated on SharePoint mid-run. This button
+    # drops the cache and re-downloads on the next render.
+    if TEMPLATE_SOURCE == "sharepoint":
+        if st.button("⬇️ Refresh templates from SharePoint", use_container_width=True):
+            _sync_sharepoint_templates.clear()
+            st.rerun()
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
 main_done  = "main_outputs"  in st.session_state
@@ -2919,6 +3070,16 @@ if not final_done:
 
             _show_template_status("AR template", _ar_wp, _ar_path, "AR_template")
             _show_template_status("MA template", _ma_wp, _ma_path, "MA_template")
+
+            # Where the MA/AR templates are being read from this session.
+            if TEMPLATE_DIR_WARNING:
+                st.warning(f"⚠️ {TEMPLATE_DIR_WARNING}")
+            elif TEMPLATE_DIR_SOURCE == "sharepoint":
+                st.caption(f"📂 Templates source: SharePoint library ({SP_SITE_URL}) — fetched this session")
+            elif TEMPLATE_DIR_SOURCE == "onedrive":
+                st.caption(f"📂 Templates source: synced SharePoint library ({TEMPLATE_BASE_PATH})")
+            else:
+                st.caption("📂 Templates source: bundled (set TEMPLATE_SOURCE=sharepoint to fetch the latest from SharePoint)")
 
     else:
         standard                  = ""
