@@ -64,6 +64,19 @@ SP_SITE_URL  = os.getenv("SHAREPOINT_SITE_URL", "https://eychinamanaged.sharepoi
 SP_MA_FOLDER = os.getenv("SHAREPOINT_MA_FOLDER", "/sites/GCSOCR/Reporting files templates/1.1 MA整理版")
 SP_AR_FOLDER = os.getenv("SHAREPOINT_AR_FOLDER", "/sites/GCSOCR/Reporting files templates/1.2 AR整理版/AR updated Verison")
 
+# -- feishu (Lark) Drive mode --
+# Auth is the app-credential model (App ID + App Secret → tenant_access_token), so no
+# per-user sign-in is needed: the app reads its own/shared Drive folders. Upload the
+# .docx into two Drive folders, share each folder with the app as a reader, and put
+# the folder tokens below. FEISHU_APP_SECRET is a secret — keep it out of any
+# distributed plaintext (bake it like the Dify keys before shipping). Use feishu.cn
+# (China) or larksuite.com (international) for FEISHU_API_BASE.
+FEISHU_API_BASE        = os.getenv("FEISHU_API_BASE", "https://open.feishu.cn/open-apis").rstrip("/")
+FEISHU_APP_ID          = os.getenv("FEISHU_APP_ID", "").strip()
+FEISHU_APP_SECRET      = os.getenv("FEISHU_APP_SECRET", "").strip()
+FEISHU_MA_FOLDER_TOKEN = os.getenv("FEISHU_MA_FOLDER_TOKEN", "").strip()
+FEISHU_AR_FOLDER_TOKEN = os.getenv("FEISHU_AR_FOLDER_TOKEN", "").strip()
+
 
 def _sp_session():
     """A requests session that reuses the user's existing browser sign-in to
@@ -186,14 +199,105 @@ def _sync_sharepoint_templates():
                 "Using bundled templates, which may be out of date.")
 
 
+# ── Feishu (Lark) Drive template source ─────────────────────────────────────────
+
+def _feishu_token():
+    """Exchange the app credentials for a tenant_access_token (the app's identity)."""
+    r = requests.post(f"{FEISHU_API_BASE}/auth/v3/tenant_access_token/internal",
+                      json={"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET},
+                      timeout=30, verify=False)
+    r.raise_for_status()
+    body = r.json()
+    if body.get("code") != 0 or not body.get("tenant_access_token"):
+        raise ValueError(f"token request failed: {body.get('code')} {body.get('msg')}")
+    return body["tenant_access_token"]
+
+
+def _feishu_list_docx(token, folder_token):
+    """Return [(name, file_token), …] for the .docx files in a Drive folder."""
+    headers = {"Authorization": f"Bearer {token}"}
+    out, page_token = [], None
+    while True:
+        params = {"folder_token": folder_token, "page_size": 200}
+        if page_token:
+            params["page_token"] = page_token
+        r = requests.get(f"{FEISHU_API_BASE}/drive/v1/files", headers=headers,
+                         params=params, timeout=30, verify=False)
+        r.raise_for_status()
+        body = r.json()
+        if body.get("code") != 0:
+            raise ValueError(f"list failed: {body.get('code')} {body.get('msg')}")
+        data = body.get("data", {})
+        for f in data.get("files", []):
+            name = f.get("name", "")
+            # Only raw uploaded Word files (type "file"); skip folders and native
+            # Feishu docs, which can't be downloaded byte-for-byte as .docx.
+            if (name.lower().endswith(".docx") and not name.startswith("~$")
+                    and f.get("type") == "file"):
+                out.append((name, f.get("token", "")))
+        if data.get("has_more") and data.get("next_page_token"):
+            page_token = data["next_page_token"]
+        else:
+            return out
+
+
+def _feishu_download(token, file_token):
+    headers = {"Authorization": f"Bearer {token}"}
+    r = requests.get(f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/download",
+                     headers=headers, timeout=60, verify=False)
+    r.raise_for_status()
+    return r.content
+
+
+@st.cache_resource(show_spinner="Fetching latest MA/AR templates from Feishu…")
+def _sync_feishu_templates():
+    """Download the MA/AR .docx from Feishu Drive into a local cache, once per process
+    (memoised). Returns (ar_dir, ma_dir, source, warning|None); on any failure the
+    dirs point back at the bundled templates with a warning for the UI."""
+    cache_root = os.path.join(tempfile.gettempdir(), "soc_report_templates")
+    ar_dir = os.path.join(cache_root, "AR")
+    ma_dir = os.path.join(cache_root, "MA")
+    try:
+        if not (FEISHU_APP_ID and FEISHU_APP_SECRET):
+            raise ValueError("FEISHU_APP_ID / FEISHU_APP_SECRET not set")
+        if not (FEISHU_AR_FOLDER_TOKEN and FEISHU_MA_FOLDER_TOKEN):
+            raise ValueError("FEISHU_AR_FOLDER_TOKEN / FEISHU_MA_FOLDER_TOKEN not set")
+        token = _feishu_token()
+        total = 0
+        for folder_token, dest in ((FEISHU_AR_FOLDER_TOKEN, ar_dir),
+                                   (FEISHU_MA_FOLDER_TOKEN, ma_dir)):
+            files = _feishu_list_docx(token, folder_token)
+            os.makedirs(dest, exist_ok=True)
+            for name, file_token in files:
+                data = _feishu_download(token, file_token)
+                # A real .docx is a zip ("PK"); reject anything else (e.g. an error
+                # JSON) so the template pipeline never gets garbage.
+                if not data.startswith(b"PK"):
+                    raise ValueError(f"'{name}' did not download as a .docx "
+                                     f"({len(data)} bytes)")
+                with open(os.path.join(dest, name), "wb") as fh:
+                    fh.write(data)
+                total += 1
+        if total == 0:
+            raise ValueError("no .docx templates found — check the folders are shared "
+                             "with the app and contain uploaded .docx files")
+        return (ar_dir, ma_dir, "feishu", None)
+    except Exception as e:
+        return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
+                f"Could not fetch templates from Feishu ({e}). Using bundled "
+                "templates, which may be out of date.")
+
+
 def _resolve_template_dirs():
     """Decide where MA/AR templates are read from this session.
 
     Returns (ar_dir, ma_dir, source, warning|None). Honours TEMPLATE_SOURCE
-    ('sharepoint' / 'onedrive' / 'bundled'); any miss falls back to the bundled
-    templates with a warning string for the UI. NOTE: call this only after
-    st.set_page_config — the sharepoint path may render a cache spinner.
+    ('sharepoint' / 'feishu' / 'onedrive' / 'bundled'); any miss falls back to the
+    bundled templates with a warning string for the UI. NOTE: call this only after
+    st.set_page_config — the online paths may render a cache spinner.
     """
+    if TEMPLATE_SOURCE == "feishu":
+        return _sync_feishu_templates()
     if TEMPLATE_SOURCE == "sharepoint":
         return _sync_sharepoint_templates()
     if TEMPLATE_SOURCE == "onedrive" and TEMPLATE_BASE_PATH:
@@ -274,12 +378,14 @@ with st.sidebar:
                 st.session_state.pop(k, None)
         st.rerun()
 
-    # The SharePoint fetch is memoised for the life of the process, so a long-running
-    # session won't pick up templates updated on SharePoint mid-run. This button
+    # The online fetch is memoised for the life of the process, so a long-running
+    # session won't pick up templates updated at the source mid-run. This button
     # drops the cache and re-downloads on the next render.
-    if TEMPLATE_SOURCE == "sharepoint":
-        if st.button("⬇️ Refresh templates from SharePoint", use_container_width=True):
-            _sync_sharepoint_templates.clear()
+    if TEMPLATE_SOURCE in ("sharepoint", "feishu"):
+        _src_label = "SharePoint" if TEMPLATE_SOURCE == "sharepoint" else "Feishu"
+        if st.button(f"⬇️ Refresh templates from {_src_label}", use_container_width=True):
+            (_sync_sharepoint_templates if TEMPLATE_SOURCE == "sharepoint"
+             else _sync_feishu_templates).clear()
             st.rerun()
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
@@ -3117,6 +3223,8 @@ if not final_done:
                 st.warning(f"⚠️ {TEMPLATE_DIR_WARNING}")
             elif TEMPLATE_DIR_SOURCE == "sharepoint":
                 st.caption(f"📂 Templates source: SharePoint library ({SP_SITE_URL}) — fetched this session")
+            elif TEMPLATE_DIR_SOURCE == "feishu":
+                st.caption("📂 Templates source: Feishu Drive — fetched this session")
             elif TEMPLATE_DIR_SOURCE == "onedrive":
                 st.caption(f"📂 Templates source: synced SharePoint library ({TEMPLATE_BASE_PATH})")
             else:
