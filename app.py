@@ -91,7 +91,7 @@ def _sp_session():
     # Try each browser separately and merge whatever we can read. Modern Chrome/Edge
     # on Windows use App-Bound Encryption, which browser_cookie3 frequently cannot
     # decrypt — that shows up here as 0 cookies loaded.
-    used, total = [], 0
+    used, total, names = [], 0, []
     for name in ("edge", "chrome", "chromium", "brave", "firefox"):
         fn = getattr(browser_cookie3, name, None)
         if not fn:
@@ -100,6 +100,7 @@ def _sp_session():
             n = 0
             for c in fn(domain_name=domain):
                 s.cookies.set_cookie(c)
+                names.append(c.name)
                 n += 1
             if n:
                 used.append(f"{name}={n}")
@@ -107,7 +108,13 @@ def _sp_session():
         except Exception:
             continue
     if total:
-        diag = f"loaded {total} {domain} cookie(s) from {', '.join(used)}"
+        # List the cookie names so a 401 can be diagnosed: SharePoint cookie auth
+        # needs FedAuth (and usually rtFa). If those aren't present the 6 we read are
+        # just tracking/consent cookies and the tenant sees us as signed out.
+        has_auth = any(c.lower() in ("fedauth", "rtfa") for c in names)
+        diag = (f"loaded {total} {domain} cookie(s) from {', '.join(used)}; "
+                f"names=[{', '.join(sorted(set(names)))}]; "
+                f"FedAuth/rtFa present={has_auth}")
     else:
         diag = (f"no {domain} cookies readable from any browser — sign in to the "
                 "library in your browser, or browser cookie encryption blocked access")
