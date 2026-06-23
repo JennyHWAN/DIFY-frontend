@@ -67,23 +67,51 @@ SP_AR_FOLDER = os.getenv("SHAREPOINT_AR_FOLDER", "/sites/GCSOCR/Reporting files 
 
 def _sp_session():
     """A requests session that reuses the user's existing browser sign-in to
-    SharePoint, so no stored credential / app registration is needed. Best effort:
-    if browser_cookie3 is unavailable or finds no cookies we return a plain session
-    (the REST call then fails auth and we fall back to the bundled templates)."""
+    SharePoint, so no stored credential / app registration is needed. Returns
+    (session, diag) where diag is a human-readable note about which/how many cookies
+    were loaded — surfaced in the UI warning so a 401 can be diagnosed. Best effort:
+    if no cookies are readable the REST call fails auth and we fall back to bundled.
+
+    verify=False is passed explicitly on each request below — setting it only on the
+    session is not enough: when the per-request verify is None, requests pulls
+    REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE from the environment (set on most corporate
+    machines) and that overrides the session value, re-enabling validation against a
+    bundle that lacks EY's TLS-inspecting-proxy CA. trust_env stays on so the
+    corporate HTTP(S) proxy env vars are still honoured for connectivity."""
     s = requests.Session()
-    # verify=False is passed explicitly on each request below — setting it only on
-    # the session is not enough: when the per-request verify is None, requests pulls
-    # REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE from the environment (set on most corporate
-    # machines) and that overrides the session value, re-enabling validation against
-    # a bundle that lacks EY's TLS-inspecting-proxy CA. trust_env stays on so the
-    # corporate HTTP(S) proxy env vars are still honoured for connectivity.
     try:
         import browser_cookie3
-        host = SP_SITE_URL.split("//", 1)[-1].split("/", 1)[0]
-        s.cookies = browser_cookie3.load(domain_name=host)
-    except Exception:
-        pass
-    return s
+    except Exception as e:
+        return s, f"browser_cookie3 unavailable ({e})"
+
+    # Match on the registrable domain so we catch the FedAuth/rtFa auth cookies
+    # regardless of which *.sharepoint.cn host they were set on.
+    host = SP_SITE_URL.split("//", 1)[-1].split("/", 1)[0]
+    domain = ".".join(host.split(".")[-2:])  # e.g. sharepoint.cn
+    # Try each browser separately and merge whatever we can read. Modern Chrome/Edge
+    # on Windows use App-Bound Encryption, which browser_cookie3 frequently cannot
+    # decrypt — that shows up here as 0 cookies loaded.
+    used, total = [], 0
+    for name in ("edge", "chrome", "chromium", "brave", "firefox"):
+        fn = getattr(browser_cookie3, name, None)
+        if not fn:
+            continue
+        try:
+            n = 0
+            for c in fn(domain_name=domain):
+                s.cookies.set_cookie(c)
+                n += 1
+            if n:
+                used.append(f"{name}={n}")
+                total += n
+        except Exception:
+            continue
+    if total:
+        diag = f"loaded {total} {domain} cookie(s) from {', '.join(used)}"
+    else:
+        diag = (f"no {domain} cookies readable from any browser — sign in to the "
+                "library in your browser, or browser cookie encryption blocked access")
+    return s, diag
 
 
 def _sp_list_docx(session, folder_server_relative):
@@ -125,8 +153,8 @@ def _sync_sharepoint_templates():
     cache_root = os.path.join(tempfile.gettempdir(), "soc_report_templates")
     ar_dir = os.path.join(cache_root, "AR")
     ma_dir = os.path.join(cache_root, "MA")
+    session, cookie_diag = _sp_session()
     try:
-        session = _sp_session()
         total = 0
         for folder, dest in ((SP_AR_FOLDER, ar_dir), (SP_MA_FOLDER, ma_dir)):
             files = _sp_list_docx(session, folder)
@@ -147,8 +175,8 @@ def _sync_sharepoint_templates():
         return (ar_dir, ma_dir, "sharepoint", None)
     except Exception as e:
         return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
-                f"Could not fetch templates from SharePoint ({e}). Using bundled "
-                "templates, which may be out of date.")
+                f"Could not fetch templates from SharePoint ({e}) [{cookie_diag}]. "
+                "Using bundled templates, which may be out of date.")
 
 
 def _resolve_template_dirs():
