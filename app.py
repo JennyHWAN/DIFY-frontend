@@ -71,7 +71,12 @@ def _sp_session():
     if browser_cookie3 is unavailable or finds no cookies we return a plain session
     (the REST call then fails auth and we fall back to the bundled templates)."""
     s = requests.Session()
-    s.verify = False  # internal use, consistent with the Dify client
+    # verify=False is passed explicitly on each request below — setting it only on
+    # the session is not enough: when the per-request verify is None, requests pulls
+    # REQUESTS_CA_BUNDLE/CURL_CA_BUNDLE from the environment (set on most corporate
+    # machines) and that overrides the session value, re-enabling validation against
+    # a bundle that lacks EY's TLS-inspecting-proxy CA. trust_env stays on so the
+    # corporate HTTP(S) proxy env vars are still honoured for connectivity.
     try:
         import browser_cookie3
         host = SP_SITE_URL.split("//", 1)[-1].split("/", 1)[0]
@@ -87,7 +92,8 @@ def _sp_list_docx(session, folder_server_relative):
     url = requests.utils.requote_uri(
         f"{SP_SITE_URL}/_api/web/GetFolderByServerRelativePath(decodedurl='{esc}')"
         f"/Files?$select=Name,ServerRelativeUrl")
-    r = session.get(url, headers={"Accept": "application/json;odata=nometadata"}, timeout=30)
+    r = session.get(url, headers={"Accept": "application/json;odata=nometadata"},
+                    timeout=30, verify=False)
     r.raise_for_status()
     payload = r.json()
     # Tolerate both OData flavours: nometadata → {"value": [...]},
@@ -105,7 +111,7 @@ def _sp_download(session, server_relative_url):
     esc = server_relative_url.replace("'", "''")
     url = requests.utils.requote_uri(
         f"{SP_SITE_URL}/_api/web/GetFileByServerRelativePath(decodedurl='{esc}')/$value")
-    r = session.get(url, timeout=60)
+    r = session.get(url, timeout=60, verify=False)
     r.raise_for_status()
     return r.content
 
