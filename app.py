@@ -8,6 +8,7 @@ import zipfile
 import tempfile
 import shutil
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from copy import deepcopy
 from docx import Document
@@ -264,12 +265,18 @@ def _feishu_download(token, file_token):
 def _feishu_fetch_into(token, folder_token, dest, exts):
     """Download every raw file in a Feishu folder matching *exts* into *dest*
     (cleared first so deletions at the source propagate). Returns (count,
-    inventory). Each payload must be a real Office file (zip → "PK")."""
+    inventory). Each payload must be a real Office file (zip → "PK").
+
+    Downloads run concurrently: each file is its own HTTPS round trip, so a
+    folder of dozens of templates is dominated by request latency, not bytes.
+    A small thread pool collapses those serial round trips into a few batches
+    (capped to stay well under Feishu's API rate limit). The first failure is
+    re-raised so the caller's all-or-nothing bundled fallback still applies."""
     files, inventory = _feishu_list_files(token, folder_token, exts)
     shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
-    n = 0
-    for name, file_token in files:
+
+    def _fetch_one(name, file_token):
         data = _feishu_download(token, file_token)
         # A real .docx/.xlsx is a zip ("PK"); reject anything else (e.g. an error
         # JSON) so the pipeline never gets garbage.
@@ -278,8 +285,14 @@ def _feishu_fetch_into(token, folder_token, dest, exts):
                              f"({len(data)} bytes)")
         with open(os.path.join(dest, name), "wb") as fh:
             fh.write(data)
-        n += 1
-    return n, inventory
+
+    if not files:
+        return 0, inventory
+    with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
+        futures = [pool.submit(_fetch_one, name, ft) for name, ft in files]
+        for fut in as_completed(futures):
+            fut.result()  # propagate the first download/validation error
+    return len(files), inventory
 
 
 @st.cache_resource(show_spinner=False)  # the caller renders a full-page loader instead
