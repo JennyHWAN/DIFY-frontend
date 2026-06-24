@@ -44,6 +44,13 @@ def main():
         os.environ.setdefault("DIFY_API_KEY_MAIN", _bundled_config.API_KEY_MAIN)
         os.environ.setdefault("DIFY_API_KEY_SUB1", _bundled_config.API_KEY_SUB1)
         os.environ.setdefault("DIFY_API_KEY_SUB2", _bundled_config.API_KEY_SUB2)
+        # Also load an optional .env next to the .exe so end users can configure
+        # per-machine settings (e.g. TEMPLATE_SOURCE / TEMPLATE_BASE_PATH for the
+        # OneDrive-synced templates). override=False keeps the baked API keys above.
+        env_file = os.path.join(exe_dir, ".env")
+        if os.path.exists(env_file):
+            from dotenv import load_dotenv
+            load_dotenv(env_file, override=False)
     else:
         env_file = os.path.join(base_dir, ".env")
         if os.path.exists(env_file):

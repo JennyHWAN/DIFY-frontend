@@ -28,6 +28,18 @@ for pkg in ("docx", "altair", "pyarrow", "pydeck"):
     except Exception:
         pass
 
+# browser_cookie3 (optional; only used for TEMPLATE_SOURCE=sharepoint). collect_all
+# pulls in its crypto/lz4 backends so the frozen exe can read browser cookies. Guarded
+# so the build still works if the package isn't installed — the app falls back to
+# bundled templates when it's missing.
+try:
+    _bc = collect_all("browser_cookie3")
+    datas += _bc[0]
+    binaries += _bc[1]
+    hiddenimports += _bc[2]
+except Exception:
+    pass
+
 # ── Include app source files ───────────────────────────────────────────────────
 datas += [("app.py", ".")]
 

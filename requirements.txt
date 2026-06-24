@@ -5,3 +5,7 @@ python-docx>=1.1.0
 python-dotenv>=1.0.0
 openpyxl>=3.1.0
 pyinstaller>=6.0.0
+# Optional: only used when TEMPLATE_SOURCE=sharepoint, to reuse the user's existing
+# browser sign-in so templates can be fetched without a stored credential. The app
+# runs fine without it (it just falls back to bundled templates).
+browser-cookie3>=0.19.1
