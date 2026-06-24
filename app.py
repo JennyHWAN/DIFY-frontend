@@ -6,6 +6,7 @@ import re
 import json
 import zipfile
 import tempfile
+import shutil
 import traceback
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -76,6 +77,12 @@ FEISHU_APP_ID          = os.getenv("FEISHU_APP_ID", "").strip()
 FEISHU_APP_SECRET      = os.getenv("FEISHU_APP_SECRET", "").strip()
 FEISHU_MA_FOLDER_TOKEN = os.getenv("FEISHU_MA_FOLDER_TOKEN", "").strip()
 FEISHU_AR_FOLDER_TOKEN = os.getenv("FEISHU_AR_FOLDER_TOKEN", "").strip()
+# Optional: letterheads and template_index.xlsx also change over time, so they can be
+# sourced from Feishu too. Each is a folder shared with the app: the letterhead folder
+# holds the office letterhead .docx files, the index folder holds template_index.xlsx.
+# Leave blank to keep using the bundled copies for these.
+FEISHU_LETTERHEAD_FOLDER_TOKEN    = os.getenv("FEISHU_LETTERHEAD_FOLDER_TOKEN", "").strip()
+FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN = os.getenv("FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN", "").strip()
 
 
 def _sp_session():
@@ -213,10 +220,13 @@ def _feishu_token():
     return body["tenant_access_token"]
 
 
-def _feishu_list_docx(token, folder_token):
+def _feishu_list_files(token, folder_token, exts=(".docx",)):
     """Return (matched, inventory) for a Drive folder, where matched is
-    [(name, file_token), …] for raw uploaded .docx files and inventory is a
-    ["name(type)", …] summary of *every* entry seen (for diagnostics)."""
+    [(name, file_token), …] for raw uploaded files (type "file") whose name ends in
+    one of *exts*, and inventory is a ["name(type)", …] summary of *every* entry
+    seen (for diagnostics). Native Feishu docs/sheets are skipped — only raw
+    uploads download byte-for-byte."""
+    exts = tuple(e.lower() for e in exts)
     headers = {"Authorization": f"Bearer {token}"}
     out, inventory, page_token = [], [], None
     while True:
@@ -234,9 +244,7 @@ def _feishu_list_docx(token, folder_token):
             name = f.get("name", "")
             ftype = f.get("type", "")
             inventory.append(f"{name}({ftype})")
-            # Only raw uploaded Word files (type "file"); skip folders and native
-            # Feishu docs, which can't be downloaded byte-for-byte as .docx.
-            if (name.lower().endswith(".docx") and not name.startswith("~$")
+            if (name.lower().endswith(exts) and not name.startswith("~$")
                     and ftype == "file"):
                 out.append((name, f.get("token", "")))
         if data.get("has_more") and data.get("next_page_token"):
@@ -253,79 +261,127 @@ def _feishu_download(token, file_token):
     return r.content
 
 
-@st.cache_resource(show_spinner="Fetching latest MA/AR templates from Feishu…")
+def _feishu_fetch_into(token, folder_token, dest, exts):
+    """Download every raw file in a Feishu folder matching *exts* into *dest*
+    (cleared first so deletions at the source propagate). Returns (count,
+    inventory). Each payload must be a real Office file (zip → "PK")."""
+    files, inventory = _feishu_list_files(token, folder_token, exts)
+    shutil.rmtree(dest, ignore_errors=True)
+    os.makedirs(dest, exist_ok=True)
+    n = 0
+    for name, file_token in files:
+        data = _feishu_download(token, file_token)
+        # A real .docx/.xlsx is a zip ("PK"); reject anything else (e.g. an error
+        # JSON) so the pipeline never gets garbage.
+        if not data.startswith(b"PK"):
+            raise ValueError(f"'{name}' did not download as a valid Office file "
+                             f"({len(data)} bytes)")
+        with open(os.path.join(dest, name), "wb") as fh:
+            fh.write(data)
+        n += 1
+    return n, inventory
+
+
+@st.cache_resource(show_spinner="Fetching latest templates from Feishu…")
 def _sync_feishu_templates():
-    """Download the MA/AR .docx from Feishu Drive into a local cache, once per process
-    (memoised). Returns (ar_dir, ma_dir, source, warning|None); on any failure the
-    dirs point back at the bundled templates with a warning for the UI."""
+    """Download the MA/AR .docx (and, if configured, the letterheads and
+    template_index.xlsx) from Feishu Drive into a local cache, once per process
+    (memoised). Returns (ar_dir, ma_dir, source, warning|None, letterhead_dir|None,
+    index_path|None). The last two are None unless their folder tokens are set and
+    fetched successfully — the caller then keeps the bundled copies. On a MA/AR
+    failure everything points back at the bundled templates with a warning."""
     cache_root = os.path.join(tempfile.gettempdir(), "soc_report_templates")
-    ar_dir = os.path.join(cache_root, "AR")
-    ma_dir = os.path.join(cache_root, "MA")
+    ar_dir  = os.path.join(cache_root, "AR")
+    ma_dir  = os.path.join(cache_root, "MA")
+    lh_dir  = os.path.join(cache_root, "letterheads")
+    idx_dir = os.path.join(cache_root, "index")
     try:
         if not (FEISHU_APP_ID and FEISHU_APP_SECRET):
             raise ValueError("FEISHU_APP_ID / FEISHU_APP_SECRET not set")
         if not (FEISHU_AR_FOLDER_TOKEN and FEISHU_MA_FOLDER_TOKEN):
             raise ValueError("FEISHU_AR_FOLDER_TOKEN / FEISHU_MA_FOLDER_TOKEN not set")
         token = _feishu_token()
-        total = 0
-        diag = []
+        total, diag = 0, []
         for label, folder_token, dest in (("AR", FEISHU_AR_FOLDER_TOKEN, ar_dir),
                                           ("MA", FEISHU_MA_FOLDER_TOKEN, ma_dir)):
-            files, inventory = _feishu_list_docx(token, folder_token)
+            n, inventory = _feishu_fetch_into(token, folder_token, dest, (".docx",))
+            total += n
             diag.append(f"{label}: {len(inventory)} item(s) "
                         + ("[" + ", ".join(inventory[:10]) + "]" if inventory else "[empty]"))
-            os.makedirs(dest, exist_ok=True)
-            for name, file_token in files:
-                data = _feishu_download(token, file_token)
-                # A real .docx is a zip ("PK"); reject anything else (e.g. an error
-                # JSON) so the template pipeline never gets garbage.
-                if not data.startswith(b"PK"):
-                    raise ValueError(f"'{name}' did not download as a .docx "
-                                     f"({len(data)} bytes)")
-                with open(os.path.join(dest, name), "wb") as fh:
-                    fh.write(data)
-                total += 1
         if total == 0:
             raise ValueError("no uploaded .docx files found — Feishu may have converted "
                              "your Word files to native docs (need type 'file', not 'docx'/'doc'), "
                              "or the folder token is wrong / not shared with the app. "
                              "Folder contents — " + "; ".join(diag))
-        return (ar_dir, ma_dir, "feishu", None)
+
+        # Optional extras. Best effort: a failure here keeps the MA/AR result and
+        # falls back to the bundled copy for just that asset, noted in the warning.
+        lh_ret, idx_ret, extra = None, None, []
+        if FEISHU_LETTERHEAD_FOLDER_TOKEN:
+            try:
+                n, inv = _feishu_fetch_into(token, FEISHU_LETTERHEAD_FOLDER_TOKEN, lh_dir, (".docx",))
+                if n:
+                    lh_ret = lh_dir
+                else:
+                    extra.append("letterheads: no uploaded .docx found ("
+                                 + (", ".join(inv[:10]) if inv else "empty") + ")")
+            except Exception as e:
+                extra.append(f"letterheads: {e}")
+        if FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN:
+            try:
+                n, inv = _feishu_fetch_into(token, FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN, idx_dir, (".xlsx",))
+                if n:
+                    xs = [f for f in os.listdir(idx_dir) if f.lower().endswith(".xlsx")]
+                    pick = "template_index.xlsx" if "template_index.xlsx" in xs else xs[0]
+                    idx_ret = os.path.join(idx_dir, pick)
+                else:
+                    extra.append("template_index: no uploaded .xlsx found ("
+                                 + (", ".join(inv[:10]) if inv else "empty") + ")")
+            except Exception as e:
+                extra.append(f"template_index: {e}")
+
+        warning = ("Loaded MA/AR from Feishu, but " + "; ".join(extra)
+                   + " — using bundled copies for those.") if extra else None
+        return (ar_dir, ma_dir, "feishu", warning, lh_ret, idx_ret)
     except Exception as e:
         return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
                 f"Could not fetch templates from Feishu ({e}). Using bundled "
-                "templates, which may be out of date.")
+                "templates, which may be out of date.", None, None)
 
 
 def _resolve_template_dirs():
     """Decide where MA/AR templates are read from this session.
 
-    Returns (ar_dir, ma_dir, source, warning|None). Honours TEMPLATE_SOURCE
-    ('sharepoint' / 'feishu' / 'onedrive' / 'bundled'); any miss falls back to the
-    bundled templates with a warning string for the UI. NOTE: call this only after
-    st.set_page_config — the online paths may render a cache spinner.
+    Returns (ar_dir, ma_dir, source, warning|None, letterhead_dir|None,
+    index_path|None). The last two are non-None only when Feishu supplies them;
+    otherwise the caller keeps the bundled letterheads / template_index.xlsx.
+    Honours TEMPLATE_SOURCE ('sharepoint' / 'feishu' / 'onedrive' / 'bundled'); any
+    miss falls back to the bundled templates with a warning string for the UI. NOTE:
+    call this only after st.set_page_config — the online paths may render a spinner.
     """
     if TEMPLATE_SOURCE == "feishu":
         return _sync_feishu_templates()
     if TEMPLATE_SOURCE == "sharepoint":
-        return _sync_sharepoint_templates()
+        ar, ma, src, warn = _sync_sharepoint_templates()
+        return (ar, ma, src, warn, None, None)
     if TEMPLATE_SOURCE == "onedrive" and TEMPLATE_BASE_PATH:
         ar = os.path.join(TEMPLATE_BASE_PATH, *AR_TEMPLATE_SUBPATH.replace("\\", "/").split("/"))
         ma = os.path.join(TEMPLATE_BASE_PATH, *MA_TEMPLATE_SUBPATH.replace("\\", "/").split("/"))
         missing = [p for p in (ar, ma) if not os.path.isdir(p)]
         if not missing:
-            return (ar, ma, "onedrive", None)
+            return (ar, ma, "onedrive", None, None, None)
         return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
                 "Synced template folder not found — using bundled templates, which "
-                "may be out of date. Missing: " + "; ".join(missing))
-    return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled", None)
+                "may be out of date. Missing: " + "; ".join(missing), None, None)
+    return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled", None, None, None)
 
 
 # EY office letterhead .docx files (downloaded from the EY Templates Word add-in,
 # grouped + centred in Word). The header on the Auditor's Report pages is taken
 # from whichever one the user picks. Listed at runtime, so end users can add or
-# remove office letterheads next to the .exe without a rebuild. These are EY add-in
-# files, not part of the SharePoint library, so they always live next to the .exe.
+# remove office letterheads next to the .exe without a rebuild. This is the bundled
+# default; TEMPLATE_SOURCE=feishu can override it below if a letterhead folder token
+# is configured.
 LETTERHEAD_DIR  = os.path.join(_BUNDLED_AR_DIR, "letterheads")
 EY_FIRM_NAME    = "Ernst & Young Hua Ming LLP"
 
@@ -352,9 +408,16 @@ st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 st.title("AI-Driven SOC Report Generation")
 
 # Resolve where MA/AR templates come from this session (bundled / SharePoint /
-# synced folder). Done after set_page_config because the SharePoint path may show a
-# cache spinner. resolve_template() and the UI read these module globals.
-AR_TEMPLATE_DIR, MA_TEMPLATE_DIR, TEMPLATE_DIR_SOURCE, TEMPLATE_DIR_WARNING = _resolve_template_dirs()
+# Feishu / synced folder). Done after set_page_config because the online paths may
+# show a cache spinner. resolve_template() and the UI read these module globals.
+# Feishu mode may also override the letterhead dir and template_index.xlsx path; any
+# value it leaves None keeps the bundled copy set above.
+(AR_TEMPLATE_DIR, MA_TEMPLATE_DIR, TEMPLATE_DIR_SOURCE, TEMPLATE_DIR_WARNING,
+ _FE_LETTERHEAD_DIR, _FE_INDEX_PATH) = _resolve_template_dirs()
+if _FE_LETTERHEAD_DIR:
+    LETTERHEAD_DIR = _FE_LETTERHEAD_DIR
+if _FE_INDEX_PATH:
+    TEMPLATE_INDEX = _FE_INDEX_PATH
 
 # ── API config — loaded from bundled .env, never shown in UI ──────────────────
 api_base = API_BASE_URL
