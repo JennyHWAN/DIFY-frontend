@@ -412,17 +412,36 @@ st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 # template_index.xlsx path; any value it leaves None keeps the bundled copy.
 #
 # The online sources (Feishu / SharePoint) download at startup, which can take a
-# few seconds. We hold back the rest of the page behind a clean full-screen loader
-# until that's done — otherwise the form renders on top of the fetch spinner
-# (noisy). The result is stashed in session_state so it's resolved only once per
-# session; bundled / onedrive resolve instantly and never show the loader.
+# few seconds. The fetch blocks the script, and Streamlit keeps the *previous*
+# render on screen (dimmed) while it blocks — so a plain spinner ends up sitting on
+# top of the old form (noisy, see appear.png). Instead we paint a full-viewport
+# overlay just before the blocking call: it covers everything underneath, then we
+# remove it once templates are ready and let the page render. Stashed in
+# session_state so the overlay shows only on the first resolve of the session;
+# bundled / onedrive resolve instantly and never show it.
 if TEMPLATE_SOURCE in ("feishu", "sharepoint") and "_template_dirs" not in st.session_state:
     _src_label = "SharePoint" if TEMPLATE_SOURCE == "sharepoint" else "Feishu"
-    st.title("AI-Driven SOC Report Generation")
-    with st.spinner(f"Fetching the latest templates from {_src_label}… "
-                    "the report form will appear once they're ready."):
-        st.session_state["_template_dirs"] = _resolve_template_dirs()
-    st.rerun()  # re-run with the cache warm so the full page renders cleanly
+    _overlay = st.empty()
+    _overlay.markdown(
+        f"""
+        <style>@keyframes soc-spin {{ to {{ transform: rotate(360deg); }} }}</style>
+        <div style="position:fixed; inset:0; z-index:2147483647;
+                    display:flex; flex-direction:column; gap:1.1rem;
+                    align-items:center; justify-content:center; text-align:center;
+                    background:var(--background-color, #0e1117);
+                    color:var(--text-color, #fafafa);">
+          <div style="width:46px; height:46px; border-radius:50%;
+                      border:4px solid rgba(128,128,128,.35); border-top-color:#ff4b4b;
+                      animation:soc-spin 1s linear infinite;"></div>
+          <div style="font-size:1.15rem; font-weight:600;">
+            Fetching the latest templates from {_src_label}…</div>
+          <div style="opacity:.7;">The report form will appear once they're ready.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.session_state["_template_dirs"] = _resolve_template_dirs()
+    _overlay.empty()  # drop the overlay; the page renders below in this same run
 
 st.title("AI-Driven SOC Report Generation")
 
