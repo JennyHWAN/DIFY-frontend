@@ -258,7 +258,17 @@ def _feishu_download(token, file_token):
     headers = {"Authorization": f"Bearer {token}"}
     r = requests.get(f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/download",
                      headers=headers, timeout=60, verify=False)
-    r.raise_for_status()
+    # A successful download is raw bytes; an error is a JSON body carrying the real
+    # Feishu code/msg (e.g. 1062002 unsupported file type). raise_for_status() would
+    # hide that behind a bare HTTP status, so surface the body instead.
+    if r.status_code != 200:
+        detail = r.text[:300]
+        try:
+            b = r.json()
+            detail = f"code={b.get('code')} msg={b.get('msg')}"
+        except ValueError:
+            pass
+        raise ValueError(f"download failed (HTTP {r.status_code}; {detail})")
     return r.content
 
 
@@ -298,7 +308,10 @@ def _feishu_fetch_into(token, folder_token, dest, exts):
              or manifest.get(name) != current[name]]
 
     def _fetch_one(name, file_token):
-        data = _feishu_download(token, file_token)
+        try:
+            data = _feishu_download(token, file_token)
+        except Exception as e:
+            raise ValueError(f"'{name}': {e}")
         # A real .docx/.xlsx is a zip ("PK"); reject anything else (e.g. an error
         # JSON) so the pipeline never gets garbage.
         if not data.startswith(b"PK"):
