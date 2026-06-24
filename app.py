@@ -214,9 +214,11 @@ def _feishu_token():
 
 
 def _feishu_list_docx(token, folder_token):
-    """Return [(name, file_token), …] for the .docx files in a Drive folder."""
+    """Return (matched, inventory) for a Drive folder, where matched is
+    [(name, file_token), …] for raw uploaded .docx files and inventory is a
+    ["name(type)", …] summary of *every* entry seen (for diagnostics)."""
     headers = {"Authorization": f"Bearer {token}"}
-    out, page_token = [], None
+    out, inventory, page_token = [], [], None
     while True:
         params = {"folder_token": folder_token, "page_size": 200}
         if page_token:
@@ -230,15 +232,17 @@ def _feishu_list_docx(token, folder_token):
         data = body.get("data", {})
         for f in data.get("files", []):
             name = f.get("name", "")
+            ftype = f.get("type", "")
+            inventory.append(f"{name}({ftype})")
             # Only raw uploaded Word files (type "file"); skip folders and native
             # Feishu docs, which can't be downloaded byte-for-byte as .docx.
             if (name.lower().endswith(".docx") and not name.startswith("~$")
-                    and f.get("type") == "file"):
+                    and ftype == "file"):
                 out.append((name, f.get("token", "")))
         if data.get("has_more") and data.get("next_page_token"):
             page_token = data["next_page_token"]
         else:
-            return out
+            return out, inventory
 
 
 def _feishu_download(token, file_token):
@@ -264,9 +268,12 @@ def _sync_feishu_templates():
             raise ValueError("FEISHU_AR_FOLDER_TOKEN / FEISHU_MA_FOLDER_TOKEN not set")
         token = _feishu_token()
         total = 0
-        for folder_token, dest in ((FEISHU_AR_FOLDER_TOKEN, ar_dir),
-                                   (FEISHU_MA_FOLDER_TOKEN, ma_dir)):
-            files = _feishu_list_docx(token, folder_token)
+        diag = []
+        for label, folder_token, dest in (("AR", FEISHU_AR_FOLDER_TOKEN, ar_dir),
+                                          ("MA", FEISHU_MA_FOLDER_TOKEN, ma_dir)):
+            files, inventory = _feishu_list_docx(token, folder_token)
+            diag.append(f"{label}: {len(inventory)} item(s) "
+                        + ("[" + ", ".join(inventory[:10]) + "]" if inventory else "[empty]"))
             os.makedirs(dest, exist_ok=True)
             for name, file_token in files:
                 data = _feishu_download(token, file_token)
@@ -279,8 +286,10 @@ def _sync_feishu_templates():
                     fh.write(data)
                 total += 1
         if total == 0:
-            raise ValueError("no .docx templates found — check the folders are shared "
-                             "with the app and contain uploaded .docx files")
+            raise ValueError("no uploaded .docx files found — Feishu may have converted "
+                             "your Word files to native docs (need type 'file', not 'docx'/'doc'), "
+                             "or the folder token is wrong / not shared with the app. "
+                             "Folder contents — " + "; ".join(diag))
         return (ar_dir, ma_dir, "feishu", None)
     except Exception as e:
         return (_BUNDLED_AR_DIR, _BUNDLED_MA_DIR, "bundled-fallback",
