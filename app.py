@@ -171,7 +171,7 @@ def _sp_download(session, server_relative_url):
     return r.content
 
 
-@st.cache_resource(show_spinner="Fetching latest MA/AR templates from SharePoint…")
+@st.cache_resource(show_spinner=False)  # the caller renders a full-page loader instead
 def _sync_sharepoint_templates():
     """Download the MA/AR .docx from the SharePoint library into a local cache, once
     per process (memoised by st.cache_resource). Returns
@@ -282,7 +282,7 @@ def _feishu_fetch_into(token, folder_token, dest, exts):
     return n, inventory
 
 
-@st.cache_resource(show_spinner="Fetching latest templates from Feishu…")
+@st.cache_resource(show_spinner=False)  # the caller renders a full-page loader instead
 def _sync_feishu_templates():
     """Download the MA/AR .docx (and, if configured, the letterheads and
     template_index.xlsx) from Feishu Drive into a local cache, once per process
@@ -405,15 +405,30 @@ API_KEY_SUB1  = os.getenv("DIFY_API_KEY_SUB1", "")
 API_KEY_SUB2  = os.getenv("DIFY_API_KEY_SUB2", "")
 
 st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
-st.title("AI-Driven SOC Report Generation")
 
 # Resolve where MA/AR templates come from this session (bundled / SharePoint /
-# Feishu / synced folder). Done after set_page_config because the online paths may
-# show a cache spinner. resolve_template() and the UI read these module globals.
-# Feishu mode may also override the letterhead dir and template_index.xlsx path; any
-# value it leaves None keeps the bundled copy set above.
+# Feishu / synced folder). resolve_template() and the UI read the module globals
+# set below. Feishu mode may also override the letterhead dir and
+# template_index.xlsx path; any value it leaves None keeps the bundled copy.
+#
+# The online sources (Feishu / SharePoint) download at startup, which can take a
+# few seconds. We hold back the rest of the page behind a clean full-screen loader
+# until that's done — otherwise the form renders on top of the fetch spinner
+# (noisy). The result is stashed in session_state so it's resolved only once per
+# session; bundled / onedrive resolve instantly and never show the loader.
+if TEMPLATE_SOURCE in ("feishu", "sharepoint") and "_template_dirs" not in st.session_state:
+    _src_label = "SharePoint" if TEMPLATE_SOURCE == "sharepoint" else "Feishu"
+    st.title("AI-Driven SOC Report Generation")
+    with st.spinner(f"Fetching the latest templates from {_src_label}… "
+                    "the report form will appear once they're ready."):
+        st.session_state["_template_dirs"] = _resolve_template_dirs()
+    st.rerun()  # re-run with the cache warm so the full page renders cleanly
+
+st.title("AI-Driven SOC Report Generation")
+
 (AR_TEMPLATE_DIR, MA_TEMPLATE_DIR, TEMPLATE_DIR_SOURCE, TEMPLATE_DIR_WARNING,
- _FE_LETTERHEAD_DIR, _FE_INDEX_PATH) = _resolve_template_dirs()
+ _FE_LETTERHEAD_DIR, _FE_INDEX_PATH) = st.session_state.get(
+    "_template_dirs") or _resolve_template_dirs()
 if _FE_LETTERHEAD_DIR:
     LETTERHEAD_DIR = _FE_LETTERHEAD_DIR
 if _FE_INDEX_PATH:
@@ -458,6 +473,7 @@ with st.sidebar:
         if st.button(f"⬇️ Refresh templates from {_src_label}", use_container_width=True):
             (_sync_sharepoint_templates if TEMPLATE_SOURCE == "sharepoint"
              else _sync_feishu_templates).clear()
+            st.session_state.pop("_template_dirs", None)  # re-show the fetch loader
             st.rerun()
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
