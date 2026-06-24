@@ -6,7 +6,6 @@ import re
 import json
 import zipfile
 import tempfile
-import shutil
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
@@ -223,10 +222,11 @@ def _feishu_token():
 
 def _feishu_list_files(token, folder_token, exts=(".docx",)):
     """Return (matched, inventory) for a Drive folder, where matched is
-    [(name, file_token), …] for raw uploaded files (type "file") whose name ends in
-    one of *exts*, and inventory is a ["name(type)", …] summary of *every* entry
-    seen (for diagnostics). Native Feishu docs/sheets are skipped — only raw
-    uploads download byte-for-byte."""
+    [(name, file_token, modified_time), …] for raw uploaded files (type "file")
+    whose name ends in one of *exts*, and inventory is a ["name(type)", …] summary
+    of *every* entry seen (for diagnostics). modified_time keys the incremental
+    skip-unchanged check in _feishu_fetch_into. Native Feishu docs/sheets are
+    skipped — only raw uploads download byte-for-byte."""
     exts = tuple(e.lower() for e in exts)
     headers = {"Authorization": f"Bearer {token}"}
     out, inventory, page_token = [], [], None
@@ -247,7 +247,7 @@ def _feishu_list_files(token, folder_token, exts=(".docx",)):
             inventory.append(f"{name}({ftype})")
             if (name.lower().endswith(exts) and not name.startswith("~$")
                     and ftype == "file"):
-                out.append((name, f.get("token", "")))
+                out.append((name, f.get("token", ""), str(f.get("modified_time", ""))))
         if data.get("has_more") and data.get("next_page_token"):
             page_token = data["next_page_token"]
         else:
@@ -263,18 +263,39 @@ def _feishu_download(token, file_token):
 
 
 def _feishu_fetch_into(token, folder_token, dest, exts):
-    """Download every raw file in a Feishu folder matching *exts* into *dest*
-    (cleared first so deletions at the source propagate). Returns (count,
-    inventory). Each payload must be a real Office file (zip → "PK").
+    """Sync the raw files matching *exts* from a Feishu folder into *dest*.
+    Returns (count, inventory) where count is the number of matched files now
+    present. Each payload must be a real Office file (zip → "PK").
 
-    Downloads run concurrently: each file is its own HTTPS round trip, so a
-    folder of dozens of templates is dominated by request latency, not bytes.
-    A small thread pool collapses those serial round trips into a few batches
-    (capped to stay well under Feishu's API rate limit). The first failure is
-    re-raised so the caller's all-or-nothing bundled fallback still applies."""
+    Incremental: a .manifest.json in *dest* records each file's token +
+    modified_time, so files already present and unchanged are skipped — only
+    new/changed templates download. Files removed at the source are deleted
+    locally, so deletions still propagate. What does need downloading runs
+    concurrently (each file is its own HTTPS round trip, so the work is
+    dominated by request latency, not bytes); a small thread pool collapses
+    those serial round trips into a few batches (capped to stay under Feishu's
+    API rate limit). The first failure is re-raised so the caller's
+    all-or-nothing bundled fallback still applies."""
     files, inventory = _feishu_list_files(token, folder_token, exts)
-    shutil.rmtree(dest, ignore_errors=True)
     os.makedirs(dest, exist_ok=True)
+    manifest_path = os.path.join(dest, ".manifest.json")
+    try:
+        with open(manifest_path) as fh:
+            manifest = json.load(fh)
+    except (OSError, ValueError):
+        manifest = {}
+
+    current = {name: {"token": ft, "mtime": mtime} for name, ft, mtime in files}
+
+    # Drop local files the source no longer has, so deletions propagate.
+    for fn in os.listdir(dest):
+        if fn != ".manifest.json" and fn not in current:
+            os.remove(os.path.join(dest, fn))
+
+    # Only fetch what's missing locally or whose token/modified_time changed.
+    stale = [(name, ft) for name, ft, _ in files
+             if not os.path.isfile(os.path.join(dest, name))
+             or manifest.get(name) != current[name]]
 
     def _fetch_one(name, file_token):
         data = _feishu_download(token, file_token)
@@ -286,12 +307,16 @@ def _feishu_fetch_into(token, folder_token, dest, exts):
         with open(os.path.join(dest, name), "wb") as fh:
             fh.write(data)
 
-    if not files:
-        return 0, inventory
-    with ThreadPoolExecutor(max_workers=min(8, len(files))) as pool:
-        futures = [pool.submit(_fetch_one, name, ft) for name, ft in files]
-        for fut in as_completed(futures):
-            fut.result()  # propagate the first download/validation error
+    if stale:
+        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+            futures = [pool.submit(_fetch_one, name, ft) for name, ft in stale]
+            for fut in as_completed(futures):
+                fut.result()  # propagate the first download/validation error
+
+    # Persist the manifest only after every download succeeded; on a failure the
+    # exception above skips this, so the stale files retry next run.
+    with open(manifest_path, "w") as fh:
+        json.dump(current, fh)
     return len(files), inventory
 
 
