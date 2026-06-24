@@ -7,6 +7,8 @@ import json
 import zipfile
 import tempfile
 import traceback
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -254,22 +256,32 @@ def _feishu_list_files(token, folder_token, exts=(".docx",)):
             return out, inventory
 
 
-def _feishu_download(token, file_token):
+def _feishu_download(token, file_token, attempts=6):
+    """Download one Drive file's bytes. Retries on Feishu's rate-limit response
+    (code 99991400 "request trigger frequency limit", or HTTP 429) with
+    exponential backoff + jitter, since concurrent downloads can briefly exceed
+    the per-app frequency cap. Any other error surfaces the real code/msg."""
     headers = {"Authorization": f"Bearer {token}"}
-    r = requests.get(f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/download",
-                     headers=headers, timeout=60, verify=False)
-    # A successful download is raw bytes; an error is a JSON body carrying the real
-    # Feishu code/msg (e.g. 1062002 unsupported file type). raise_for_status() would
-    # hide that behind a bare HTTP status, so surface the body instead.
-    if r.status_code != 200:
-        detail = r.text[:300]
+    for attempt in range(attempts):
+        r = requests.get(f"{FEISHU_API_BASE}/drive/v1/files/{file_token}/download",
+                         headers=headers, timeout=60, verify=False)
+        # A successful download is raw bytes; an error is a JSON body carrying the
+        # real code/msg. raise_for_status() would hide that behind a bare HTTP
+        # status, so parse the body instead.
+        if r.status_code == 200:
+            return r.content
+        code, msg = None, r.text[:300]
         try:
             b = r.json()
-            detail = f"code={b.get('code')} msg={b.get('msg')}"
+            code, msg = b.get("code"), b.get("msg")
         except ValueError:
             pass
-        raise ValueError(f"download failed (HTTP {r.status_code}; {detail})")
-    return r.content
+        if (code == 99991400 or r.status_code == 429) and attempt < attempts - 1:
+            # Back off and retry: 0.5, 1, 2, 4, 8s (capped) plus jitter so the
+            # pooled downloads don't all retry in lockstep.
+            time.sleep(min(0.5 * 2 ** attempt, 8) + random.uniform(0, 0.5))
+            continue
+        raise ValueError(f"download failed (HTTP {r.status_code}; code={code} msg={msg})")
 
 
 def _feishu_fetch_into(token, folder_token, dest, exts):
@@ -321,7 +333,7 @@ def _feishu_fetch_into(token, folder_token, dest, exts):
             fh.write(data)
 
     if stale:
-        with ThreadPoolExecutor(max_workers=min(8, len(stale))) as pool:
+        with ThreadPoolExecutor(max_workers=min(4, len(stale))) as pool:
             futures = [pool.submit(_fetch_one, name, ft) for name, ft in stale]
             for fut in as_completed(futures):
                 fut.result()  # propagate the first download/validation error
