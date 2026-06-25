@@ -51,6 +51,12 @@ def main():
         if os.path.exists(env_file):
             from dotenv import load_dotenv
             load_dotenv(env_file, override=False)
+        # Apply the template/Feishu settings baked from the build-time .env as
+        # defaults. setdefault runs *after* the runtime .env, so a per-machine .env
+        # still wins for the non-secret settings, while the baked values (incl. the
+        # Feishu app secret) make the exe work out of the box like dev.
+        for _k, _v in getattr(_bundled_config, "RUNTIME_ENV", {}).items():
+            os.environ.setdefault(_k, _v)
     else:
         env_file = os.path.join(base_dir, ".env")
         if os.path.exists(env_file):

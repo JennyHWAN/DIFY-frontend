@@ -57,13 +57,29 @@ for _key in ("DIFY_API_KEY_MAIN", "DIFY_API_KEY_SUB1", "DIFY_API_KEY_SUB2"):
     if not _env.get(_key):
         raise ValueError(f"{_key} is missing or empty in .env")
 
+# Per-machine / template settings (incl. the Feishu app secret) are baked too, so
+# the shipped exe behaves like dev without a plaintext .env beside it — and the
+# secret lives in bytecode, not a readable file. Only keys actually present in .env
+# are written; a runtime .env can still override the non-secret ones (the launcher
+# loads it before applying these as defaults). API keys stay baked-wins.
+_OPTIONAL = (
+    "TEMPLATE_SOURCE", "TEMPLATE_BASE_PATH", "MA_TEMPLATE_SUBPATH", "AR_TEMPLATE_SUBPATH",
+    "FEISHU_API_BASE", "FEISHU_APP_ID", "FEISHU_APP_SECRET",
+    "FEISHU_MA_FOLDER_TOKEN", "FEISHU_AR_FOLDER_TOKEN",
+    "FEISHU_LETTERHEAD_FOLDER_TOKEN", "FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN",
+    "SHAREPOINT_SITE_URL", "SHAREPOINT_MA_FOLDER", "SHAREPOINT_AR_FOLDER",
+)
+_runtime_env = {k: _env[k] for k in _OPTIONAL if _env.get(k)}
+
 with open("_bundled_config.py", "w") as _f:
     _f.write(
         f"API_BASE_URL = {repr(_env.get('DIFY_API_BASE_URL', 'https://api.dify.ai/v1'))}\n"
         f"API_KEY_MAIN = {repr(_env.get('DIFY_API_KEY_MAIN', ''))}\n"
         f"API_KEY_SUB1 = {repr(_env.get('DIFY_API_KEY_SUB1', ''))}\n"
         f"API_KEY_SUB2 = {repr(_env.get('DIFY_API_KEY_SUB2', ''))}\n"
+        f"RUNTIME_ENV = {repr(_runtime_env)}\n"
     )
+print(f"[spec] baked template settings: {sorted(_runtime_env)}")
 datas += [("_bundled_config.py", ".")]
 
 # ── Generate the protobuf runtime hook at build time ───────────────────────────
