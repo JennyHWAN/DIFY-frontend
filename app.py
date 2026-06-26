@@ -3343,6 +3343,10 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     # sequences the LLM produced.  Start True so leading blank lines are
     # silently dropped.
     last_was_blank = True
+    # Track whether the previous emitted line was a signature line (firm name or
+    # date) so a trailing city/country line is recognised as part of the same
+    # signature block and de-bulleted too (see the bullet branch below).
+    last_was_signature = False
 
     while i < len(lines):
         line = lines[i]
@@ -3386,19 +3390,49 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             last_was_blank = True
 
         # ── Bullet lists ───────────────────────────────────────────────────
-        elif re.match(r"^[-*+] ", line):
-            p = doc.add_paragraph(style="List Bullet")
-            _inline_bullet(p, line[2:].strip())
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            _pin_list_numpr(p, doc)
-            last_was_blank = False
+        elif re.match(r"^[-*+] ", line) or re.match(r"^[•·]\s+", line):
+            if re.match(r"^[-*+] ", line):
+                content = line[2:].strip()
+            else:
+                content = re.sub(r"^[•·]\s+", "", line).strip()
 
-        elif re.match(r"^[•·]\s+", line):
+            # An empty bullet ("- " with no text) is layout filler from the LLM,
+            # not a real list item — emit a single blank line instead of a stray
+            # black dot. Keep last_was_signature so "firm / date / blanks / city"
+            # still reads as one signature block.
+            if not content:
+                if not last_was_blank:
+                    blank = doc.add_paragraph()
+                    blank.paragraph_format.space_after  = Pt(0)
+                    blank.paragraph_format.space_before = Pt(0)
+                    last_was_blank = True
+                i += 1
+                continue
+
+            # A signature line (firm name / date, or a city/country line right
+            # after one) is never a real list item even when the LLM bullets it —
+            # render it as a plain paragraph so it carries no black dot.
+            _firm_or_date = (
+                any(kw.lower() in content.lower() for kw in _SIG_FIRM_KW)
+                or _SIG_DATE_RE.match(content)
+            )
+            _city = len(content) <= 50 and ("China" in content or "中国" in content)
+            if _firm_or_date or (_city and last_was_signature):
+                p = doc.add_paragraph()
+                _inline(p, content)
+                p.paragraph_format.space_after  = Pt(0)
+                p.paragraph_format.space_before = Pt(0)
+                last_was_blank = False
+                last_was_signature = True
+                i += 1
+                continue
+
             p = doc.add_paragraph(style="List Bullet")
-            _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
+            _inline_bullet(p, content)
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             _pin_list_numpr(p, doc)
             last_was_blank = False
+            last_was_signature = False
 
         elif re.match(r"^\d+\. ", line):
             # Collect the whole consecutive numbered block, keeping the SN
@@ -3469,6 +3503,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             p.paragraph_format.space_after  = Pt(0)
             p.paragraph_format.space_before = Pt(0)
             last_was_blank = False
+            last_was_signature = False
 
         i += 1
 
