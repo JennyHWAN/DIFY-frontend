@@ -742,6 +742,11 @@ _TRANS_KW    = ["处理transaction", "processing user entity transaction"]
 _SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
 _OTHER_KW    = ["other information"]  # kept unless user says no Other Information section
 _AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
+# Multi-SSO selector comment ("注：如涉及多家SSO，使用此句式") — marks the multi-
+# subservice-organization variant of the "uses … to provide …" sentence. The
+# single-SSO variant sits immediately BEFORE the commented span in the same
+# paragraph; exactly one of the two survives depending on the SSO count.
+_MULTI_SSO_KW = ["多家sso"]
 
 
 def _comment_span_text(para_el, cid, ns_w, id_attr):
@@ -757,6 +762,19 @@ def _comment_span_text(para_el, cid, ns_w, id_attr):
         elif el.tag == f"{{{ns_w}}}commentRangeEnd" and el.get(id_attr) == cid:
             inside = False
         elif inside and el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def _comment_before_text(para_el, cid, ns_w, id_attr):
+    """Return the run text in one paragraph that precedes comment *cid*'s range
+    start — used to drop the single-SSO sentence that sits just before the
+    multi-SSO conditional block when multiple subservice organizations exist."""
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeStart" and el.get(id_attr) == cid:
+            break
+        if el.tag == f"{{{ns_w}}}t":
             parts.append(el.text or "")
     return "".join(parts)
 
@@ -840,6 +858,30 @@ def _build_annotation_maps(docx_bytes, flags):
 
         indices = comment_to_indices.get(cid, set())
         if not indices:
+            continue
+
+        # Multi-SSO selector: the paragraph holds two variants of the
+        # "[short] uses [SSO] to provide [services]" sentence — a single-SSO
+        # one (BEFORE the commented span) and a multi-SSO one (the commented
+        # span itself, wrapped in [ ] / 【 】 / { } brackets). Keep exactly one:
+        #   • ≥2 subservice orgs → drop the single-SSO sentence (the BEFORE text)
+        #     and keep the span; its wrapper brackets are stripped later by the
+        #     orphan-bracket cleanup in fill_and_process_template.
+        #   • <2 subservice orgs → drop the whole multi-SSO span (wrapper and all)
+        #     and keep the single-SSO sentence.
+        # Both removals run as raw-template span deletions before substitution.
+        if any(_kw_in(text, kw) for kw in _MULTI_SSO_KW):
+            multi = flags.get("multi_sso", False)
+            for idx in indices:
+                child = body_list[idx]
+                if multi:
+                    before = _comment_before_text(child, cid, ns_w, id_attr)
+                    if before.strip():
+                        span_del_texts.append((idx, before))
+                else:
+                    span = _comment_span_text(child, cid, ns_w, id_attr)
+                    if span.strip():
+                        span_del_texts.append((idx, span))
             continue
 
         # Single-UE: if comment says "delete" → when the flag is set, delete
@@ -1210,8 +1252,14 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     def _apply_brackets(para, is_single_ue):
         # Process one bracket match per loop iteration using smart replacement so
         # that per-run italic/bold formatting outside the matched span is preserved.
+        removed_any = False
+        first_pass = True
         changed = True
         while changed:
+            # Re-entering the loop means the previous pass removed a bracket span.
+            if not first_pass:
+                removed_any = True
+            first_pass = False
             changed = False
             full_text = "".join(r.text for r in para.runs)
             if not full_text or ("[" not in full_text and "【" not in full_text):
@@ -1260,12 +1308,23 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         #    double); once that placeholder is substituted away, the block's
         #    closing 】 is left with no opening to pair against, so cases a–c above
         #    can never match it. By this point all real bracket pairs and [or…]
-        #    phrases are gone, so any remaining 【】[] is an artifact — strip the
+        #    phrases are gone, so any remaining 【】[]{} is an artifact — strip the
         #    lone bracket characters (these templates never use them as literal
-        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN".
+        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN". The { }
+        #    variant wraps the multi-SSO block in the SOC3 EN template, left
+        #    behind when its single-SSO sentence is dropped (see _MULTI_SSO_KW).
         for run in para.runs:
-            if run.text and re.search(r"[【】\[\]]", run.text):
-                run.text = re.sub(r"[【】\[\]]", "", run.text)
+            if run.text and re.search(r"[【】\[\]{}]", run.text):
+                run.text = re.sub(r"[【】\[\]{}]", "", run.text)
+                removed_any = True
+        # Removing a wrapper bracket can leave a stray leading space at the start
+        # of the paragraph (e.g. EN multi-SSO "[ [Service…" → " Service…" once the
+        # single-SSO sentence and wrapper are gone) — trim the first run.
+        if removed_any:
+            for run in para.runs:
+                if run.text:
+                    run.text = run.text.lstrip()
+                    break
 
         # Normalize spaces introduced by empty removals
         prev_ended_space = False
@@ -2418,6 +2477,12 @@ def build_substitutions(ui, tc):
         "[Subservice organization B short name]": _sso_b[1],
         "[identify the function or service provided by the subservice organization B]": _sso_b[2],
         "[Subservice organization C short name]": _sso_c[1],
+        # EN multi-SSO templates quote the short name WITHOUT square brackets,
+        # e.g. (“Subservice organization A short name”) — match the quoted phrase
+        # and keep the surrounding curly quotes. Placed AFTER the bracketed keys
+        # so a "[… short name]" placeholder is consumed whole first.
+        "“Subservice organization A short name”": f"“{_sso_a[1]}”",
+        "“Subservice organization B short name”": f"“{_sso_b[1]}”",
         # Capital-O variant found in some templates
         "[Service Organization short name]":     co_short_name,
         "[Company name]":                        company_name,
@@ -2531,8 +2596,18 @@ def build_substitutions(ui, tc):
     return subs
 
 
-def build_flags(tc):
-    """Build the boolean deletion-flag dict from template_config."""
+def build_flags(tc, ui=None):
+    """Build the boolean deletion-flag dict from template_config.
+
+    *ui* (user inputs) is consulted for the subservice-organization count, which
+    selects the single- vs multi-SSO variant of the MA/AR "uses … to provide …"
+    sentence (see _MULTI_SSO_KW)."""
+    ui = ui or {}
+    # One subservice organization per non-empty line of the Subservice_org input.
+    _sso_lines = [
+        ln for ln in (ui.get("Subservice_org", "") or "").strip().splitlines()
+        if ln.strip()
+    ]
     return {
         "cuec_identified":            tc.get("cuec_identified", True),
         "sso_cc_identified":          tc.get("sso_cc_identified", True),
@@ -2541,6 +2616,7 @@ def build_flags(tc):
         "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
         "has_other_information":      tc.get("has_other_information", True),
         "addressee_choice":           tc.get("addressee_choice", "Management"),
+        "multi_sso":                  len(_sso_lines) >= 2,
     }
 
 
@@ -3178,7 +3254,7 @@ def build_final_document(result_text, ui, tc):
             and tc.get("ar_template_path")
             and tc.get("ma_template_path")):
         subs  = build_substitutions(ui, tc)
-        flags = build_flags(tc)
+        flags = build_flags(tc, ui)
         _lang = ui.get("Output_language", "English")
         _lh_path = tc.get("letterhead_path")
         _use_lh  = bool(_lh_path) and os.path.isfile(_lh_path)
@@ -3596,7 +3672,7 @@ if not final_done:
                 try:
                     with st.spinner("Generating MA + AR sections…"):
                         _t_subs  = build_substitutions(_test_ui, _test_tc)
-                        _t_flags = build_flags(_test_tc)
+                        _t_flags = build_flags(_test_tc, _test_ui)
                         _t_ma    = fill_and_process_template(_ma_path_t, _t_subs, _t_flags, output_language)
                         _t_ar    = fill_and_process_template(_ar_path_t, _t_subs, _t_flags, output_language)
                         _t_use_lh = bool(letterhead_path) and os.path.isfile(letterhead_path)
