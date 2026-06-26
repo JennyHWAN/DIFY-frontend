@@ -779,6 +779,39 @@ def _comment_before_text(para_el, cid, ns_w, id_attr):
     return "".join(parts)
 
 
+def _comment_after_text(para_el, cid, ns_w, id_attr):
+    """Return the run text in one paragraph that follows comment *cid*'s range
+    end (the counterpart of _comment_before_text)."""
+    after = False
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeEnd" and el.get(id_attr) == cid:
+            after = True
+        elif after and el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def _seam_dup_prefix_in_before(before, after):
+    """When deleting a commented (bracketed) clause would leave a connective
+    phrase duplicated across the seam — the EY EN templates repeat e.g.
+    "throughout that period" on both sides of an optional bracketed clause —
+    return the trailing portion of *before* that duplicates the head of *after*,
+    so it can be removed together with the span. Empty when there is no such
+    duplicate (e.g. CJK text, which has no whitespace-delimited words to align)."""
+    bw = before.split()
+    aw = after.split()
+    best = 0
+    for k in range(1, min(len(bw), len(aw)) + 1):
+        if [w.strip(".,;:") for w in bw[-k:]] == [w.strip(".,;:") for w in aw[:k]]:
+            best = k
+    if best == 0:
+        return ""
+    pat = r"\s*" + r"\s+".join(re.escape(w) for w in bw[-best:]) + r"\s*$"
+    m = re.search(pat, before)
+    return m.group(0) if m else ""
+
+
 def _build_annotation_maps(docx_bytes, flags):
     """
     Parse the docx XML (from raw bytes) to determine per-paragraph actions.
@@ -941,7 +974,42 @@ def _build_annotation_maps(docx_bytes, flags):
                 # (do not set should_delete — individual indices already handled)
 
         if should_delete:
-            del_indices |= indices
+            # Delete the whole paragraph only when the comment covers
+            # (essentially) all of it — e.g. "无用户补充性控制时，则delete此段描述".
+            # When it marks just an embedded clause — e.g. "…则相应delete有关
+            # wording", whose range wraps only the bracketed conditional phrase —
+            # drop that commented span and keep the rest of the paragraph,
+            # mirroring the single-user-entity handling above. Without this the
+            # core "suitably designed" / "operated effectively" assertions (which
+            # merely embed a CUEC/SSO-CC clause in brackets) would disappear.
+            for idx in indices:
+                child = body_list[idx]
+                span = _comment_span_text(child, cid, ns_w, id_attr)
+                span_n = _normalize_ws(span)
+                para_n = _normalize_ws("".join(
+                    t.text or "" for t in child.findall(f".//{{{ns_w}}}t")
+                ))
+                if (span_n and span_n != para_n and len(span_n) >= 30
+                        and not _kw_in(text, "本段") and not _kw_in(text, "此段")):
+                    before = _comment_before_text(child, cid, ns_w, id_attr)
+                    after  = _comment_after_text(child, cid, ns_w, id_attr)
+                    # Drop a connective phrase duplicated across the seam (EN).
+                    dup = _seam_dup_prefix_in_before(before, after)
+                    head = before[:len(before) - len(dup)] if dup else before
+                    # Some templates place the optional clause's opening bracket
+                    # and its leading comma OUTSIDE the comment range (CN SOC1).
+                    # Remove that trailing "【，" / "[ ," too, else a stray comma
+                    # is left dangling before the sentence's full stop. Only a
+                    # leading bracket and "soft" punctuation (comma/semicolon) is
+                    # stripped — never a sentence-ending 。/. — so independent
+                    # sentences are not glued together.
+                    m = re.search(r"[【\[]?\s*[，,、；;]*\s*$", head)
+                    lead = m.group(0) if m else ""
+                    if not re.search(r"[【\[，,、；;]", lead):
+                        lead = ""
+                    span_del_texts.append((idx, lead + dup + span))
+                else:
+                    del_indices.add(idx)
 
     return del_indices, single_ue_indices, span_del_texts
 
