@@ -2456,42 +2456,91 @@ _SIG_DATE_RE = re.compile(
 )
 
 
+def _is_signature_line(text, company_names):
+    """True if a (short) paragraph belongs to an MA/AR signature block: the firm
+    name, the formatted date, the city/country line, or the service-org name."""
+    t = (text or "").strip()
+    if not t or len(t) > 120:
+        return False
+    if any(kw.lower() in t.lower() for kw in _SIG_FIRM_KW):
+        return True
+    if _SIG_DATE_RE.match(t):
+        return True
+    if len(t) <= 50 and ("China" in t or "中国" in t):
+        return True
+    if any(nm and t == nm for nm in company_names):
+        return True
+    return False
+
+
+def _signature_blocks(paras, company_names, gap=3):
+    """Group signature-line paragraph indices into contiguous blocks, tolerating
+    up to *gap* intervening paragraphs (blank/spacer lines inside a block). The
+    MA and AR signatures, separated by the whole AR body, form distinct blocks."""
+    sig = [i for i, p in enumerate(paras)
+           if _is_signature_line(p.text, company_names)]
+    blocks = []
+    for i in sig:
+        if blocks and i - blocks[-1][-1] <= gap:
+            blocks[-1].append(i)
+        else:
+            blocks.append([i])
+    return blocks
+
+
 def apply_pagination_controls(docx_bytes, company_names=()):
-    """Render-free pass over every paragraph (body + table cells):
+    """Render-free pass: give Word the information it needs to paginate sensibly.
 
-    1. Enable widow/orphan control so a page never begins or ends with a single
-       dangling line of a paragraph — EY templates sometimes ship it disabled
-       (<w:widowControl w:val="0"/>).
-    2. Strip any keepNext / keepLines properties. Word draws a small black
-       square in the left margin of any paragraph carrying those whenever
-       formatting marks are shown (they never print, but read as stray bullets).
-       Removing them clears the markers no matter their origin — an earlier
-       version of this pass added them to the signature block, but EY templates
-       can carry their own too, so we strip unconditionally.
+    1. Enable widow/orphan control on every paragraph (body + table cells) so a
+       page never begins or ends with a single dangling line of a paragraph —
+       EY templates sometimes ship it disabled (<w:widowControl w:val="0"/>).
+    2. For each MA/AR signature block, bind the block together (keepLines) and
+       glue it to the preceding non-empty paragraph (keepNext) so the signature
+       can never sit alone at the top of a fresh page — it always carries at
+       least the closing line of content above it. keepNext is set on the
+       preceding paragraph (its last line follows onto the signature page)
+       while keepLines is set only on the short signature lines themselves, so a
+       long closing paragraph is still free to split rather than jumping wholesale
+       to the next page and leaving a gap.
 
-    Word evaluates widowControl when it opens the file, so this works
-    everywhere, including the frozen Windows exe. company_names is kept for
-    call-site compatibility but no longer used.
+    Note: keepNext/keepLines make Word draw a small black square in the left
+    margin of each affected paragraph when formatting marks are shown. Those
+    markers never print and are the accepted cost of keeping the signature off a
+    lonely page render-free (the only way to do it inside the frozen exe).
+
+    Word evaluates keepNext/keepLines/widowControl when it opens the file, so
+    this works everywhere, including the frozen Windows exe.
     """
     try:
         doc = Document(io.BytesIO(docx_bytes))
     except Exception:
         return docx_bytes
 
-    def _walk(paragraphs, tables):
+    def _walk_widow(paragraphs, tables):
         for p in paragraphs:
             p.paragraph_format.widow_control = True
-            pPr = p._p.find(qn("w:pPr"))
-            if pPr is not None:
-                for tag in ("w:keepNext", "w:keepLines"):
-                    for el in pPr.findall(qn(tag)):
-                        pPr.remove(el)
         for table in tables:
             for row in table.rows:
                 for cell in row.cells:
-                    _walk(cell.paragraphs, cell.tables)
+                    _walk_widow(cell.paragraphs, cell.tables)
 
-    _walk(doc.paragraphs, doc.tables)
+    _walk_widow(doc.paragraphs, doc.tables)
+
+    paras = doc.paragraphs
+    names = tuple(n for n in company_names if n)
+    for block in _signature_blocks(paras, names):
+        first, last = block[0], block[-1]
+        # Walk back to the closing line of real content above the signature.
+        prev = first - 1
+        while prev >= 0 and not paras[prev].text.strip():
+            prev -= 1
+        start = prev if prev >= 0 else first
+        # keepNext chains the content line + any spacer blanks onto the block.
+        for i in range(start, last):
+            paras[i].paragraph_format.keep_with_next = True
+        # keepLines holds each short signature line undivided.
+        for i in block:
+            paras[i].paragraph_format.keep_together = True
 
     buf = io.BytesIO()
     doc.save(buf)
