@@ -2275,14 +2275,40 @@ def strip_page_top_empty_paragraphs(docx_bytes):
     return buf.getvalue()
 
 
+# Characters Word treats as East-Asian (Han, kana, bopomofo, CJK punctuation,
+# full-width forms). Used to pick a run's eastAsia font: 黑体 only when the run
+# actually contains such a character, otherwise Times New Roman — so English
+# "ambiguous" punctuation (curly quotes/dashes in U+2000–206F, which Word
+# classifies as East-Asian) is rendered in Times New Roman, not 黑体.
+_CJK_RE = re.compile(
+    "["
+    "\u2e80-\u2eff"   # CJK radicals supplement
+    "\u3000-\u303f"   # CJK symbols & punctuation
+    "\u3040-\u30ff"   # hiragana + katakana
+    "\u3100-\u312f"   # bopomofo
+    "\u3400-\u4dbf"   # CJK ext A
+    "\u4e00-\u9fff"   # CJK unified ideographs
+    "\uf900-\ufaff"   # CJK compatibility ideographs
+    "\ufe30-\ufe4f"   # CJK compatibility forms
+    "\uff00-\uffef"   # halfwidth & fullwidth forms
+    "]"
+)
+
+
+def _has_cjk(text):
+    return bool(_CJK_RE.search(text or ""))
+
+
 def enforce_line_spacing(docx_bytes, spacing=1.15):
     """
     Final pass over the finished document: set every paragraph (body and
     table cells, including nested tables) to the given multiple line spacing,
     and normalise every run to Times New Roman Latin/complex-script fonts and
-    black text, and the CJK (eastAsia) font to 黑体 — so the whole document
-    is uniform (Times New Roman for Latin, 黑体 for Chinese) regardless of
-    what each merged section set.
+    black text. The CJK (eastAsia) font is set to 黑体 only on runs that
+    actually contain a CJK character; Latin-only runs get Times New Roman as
+    their eastAsia font too, so English punctuation never falls back to 黑体 —
+    so the whole document is uniform (Times New Roman for Latin, 黑体 for
+    Chinese) regardless of what each merged section set.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -2320,7 +2346,12 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         rFonts.set(qn("w:ascii"),    "Times New Roman")
         rFonts.set(qn("w:hAnsi"),    "Times New Roman")
         rFonts.set(qn("w:cs"),       "Times New Roman")
-        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        # eastAsia per run content: 黑体 only when the run actually contains a
+        # CJK character; otherwise Times New Roman, so this run's English
+        # punctuation is never rendered in 黑体.
+        run_text = "".join(t.text or "" for t in r_el.findall(qn("w:t")))
+        rFonts.set(qn("w:eastAsia"),
+                   FONT_CHINESE if _has_cjk(run_text) else "Times New Roman")
         for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
@@ -3078,8 +3109,10 @@ FONT_CHINESE = "黑体"
 
 
 def _apply_fonts(run):
-    """Set Times New Roman for Latin characters, 华文楷体 for Chinese characters.
-    Word automatically picks the right one per character based on Unicode range."""
+    """Set Times New Roman for Latin characters, 黑体 for Chinese characters.
+    eastAsia is 黑体 only when the run text actually contains a CJK character;
+    Latin-only runs get Times New Roman as eastAsia too, so Word does not render
+    their ambiguous punctuation (curly quotes/dashes) in 黑体."""
     rPr = run._r.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
     if rFonts is None:
@@ -3087,13 +3120,14 @@ def _apply_fonts(run):
         rPr.insert(0, rFonts)
     rFonts.set(qn("w:ascii"),    FONT_LATIN)
     rFonts.set(qn("w:hAnsi"),    FONT_LATIN)
-    rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+    rFonts.set(qn("w:eastAsia"), FONT_CHINESE if _has_cjk(run.text) else FONT_LATIN)
     rFonts.set(qn("w:cs"),       FONT_LATIN)
 
 
 def _set_style_fonts(style):
-    """Apply the same dual-font setting (Times New Roman + 华文楷体) at the
-    paragraph-style level."""
+    """Apply the dual-font setting (Times New Roman Latin + 黑体 CJK) at the
+    paragraph-style level. This is the style default; per-run _apply_fonts and
+    the final enforce_line_spacing pass refine eastAsia per actual run content."""
     rPr = style.element.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
