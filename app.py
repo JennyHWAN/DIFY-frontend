@@ -9,6 +9,8 @@ import tempfile
 import traceback
 import time
 import random
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -2432,6 +2434,239 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         return saved_bytes
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Pagination / signature layout
+#
+# Two-tier, hybrid approach (see the module README): a render-free pass that
+# leans on Word's own pagination engine so it works inside the shipped exe, plus
+# a best-effort auto-fit that only runs when a LibreOffice + poppler renderer is
+# present (dev / server) to literally tighten margins then line spacing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Firm-name keywords that mark an Auditor's-Report signature block. Keyword-
+# matched, case-insensitive (mirrors the bold-keep patterns in
+# fill_and_process_template).
+_SIG_FIRM_KW = (
+    "Ernst & Young", "Hua Ming", "Certified Public Accountants",
+    "安永华明", "会计师事务所",
+)
+# A signature date paragraph is the formatted date and nothing else.
+_SIG_DATE_RE = re.compile(
+    r"^(?:[A-Z][a-z]+ \d{1,2}, \d{4}|\d{4}年\d{1,2}月\d{1,2}日)$"
+)
+
+
+def _is_signature_line(text, company_names):
+    """True if a (short) paragraph belongs to an MA/AR signature block: the firm
+    name, the formatted date, the city/country line, or the service-org name."""
+    t = (text or "").strip()
+    if not t or len(t) > 120:
+        return False
+    if any(kw.lower() in t.lower() for kw in _SIG_FIRM_KW):
+        return True
+    if _SIG_DATE_RE.match(t):
+        return True
+    if len(t) <= 50 and ("China" in t or "中国" in t):
+        return True
+    if any(nm and t == nm for nm in company_names):
+        return True
+    return False
+
+
+def _signature_blocks(paras, company_names, gap=3):
+    """Group signature-line paragraph indices into contiguous blocks, tolerating
+    up to *gap* intervening paragraphs (blank/spacer lines inside a block). The
+    MA and AR signatures, separated by the whole AR body, form distinct blocks."""
+    sig = [i for i, p in enumerate(paras)
+           if _is_signature_line(p.text, company_names)]
+    blocks = []
+    for i in sig:
+        if blocks and i - blocks[-1][-1] <= gap:
+            blocks[-1].append(i)
+        else:
+            blocks.append([i])
+    return blocks
+
+
+def apply_pagination_controls(docx_bytes, company_names=()):
+    """Render-free pass: give Word the information it needs to paginate sensibly.
+
+    1. Enable widow/orphan control on every paragraph (body + table cells) so a
+       page never begins or ends with a single dangling line of a paragraph —
+       EY templates sometimes ship it disabled (<w:widowControl w:val="0"/>).
+    2. For each MA/AR signature block, bind the block together (keepLines) and
+       glue it to the preceding non-empty paragraph (keepNext) so the signature
+       can never sit alone at the top of a fresh page — it always carries at
+       least the closing line of content above it. keepNext is set on the
+       preceding paragraph (its last line follows onto the signature page)
+       while keepLines is set only on the short signature lines themselves, so a
+       long closing paragraph is still free to split rather than jumping wholesale
+       to the next page and leaving a gap.
+
+    Word evaluates keepNext/keepLines/widowControl when it opens the file, so
+    this works everywhere, including the frozen Windows exe.
+    """
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception:
+        return docx_bytes
+
+    def _walk_widow(paragraphs, tables):
+        for p in paragraphs:
+            p.paragraph_format.widow_control = True
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    _walk_widow(cell.paragraphs, cell.tables)
+
+    _walk_widow(doc.paragraphs, doc.tables)
+
+    paras = doc.paragraphs
+    names = tuple(n for n in company_names if n)
+    for block in _signature_blocks(paras, names):
+        first, last = block[0], block[-1]
+        # Walk back to the closing line of real content above the signature.
+        prev = first - 1
+        while prev >= 0 and not paras[prev].text.strip():
+            prev -= 1
+        start = prev if prev >= 0 else first
+        # keepNext chains the content line + any spacer blanks onto the block.
+        for i in range(start, last):
+            paras[i].paragraph_format.keep_with_next = True
+        # keepLines holds each short signature line undivided.
+        for i in block:
+            paras[i].paragraph_format.keep_together = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _soffice_bin():
+    """Path to a LibreOffice headless binary, or None. Absent in the shipped exe
+    (end-users get the render-free pass only)."""
+    for name in ("soffice", "libreoffice"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _render_page_texts(docx_bytes, soffice):
+    """Render *docx_bytes* to PDF (LibreOffice) and return one text string per
+    page (poppler's pdftotext separates pages with form-feeds). Returns None if
+    the renderer/extractor is missing or anything fails — the caller then leaves
+    the document untouched."""
+    pdftotext = shutil.which("pdftotext")
+    if not pdftotext:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "doc.docx")
+        with open(src, "wb") as f:
+            f.write(docx_bytes)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", td, src],
+                check=True, capture_output=True, timeout=120,
+            )
+            pdf = os.path.join(td, "doc.pdf")
+            if not os.path.isfile(pdf):
+                return None
+            out = subprocess.run(
+                [pdftotext, "-layout", pdf, "-"],
+                check=True, capture_output=True, timeout=60,
+            )
+        except Exception:
+            return None
+    return out.stdout.decode("utf-8", "ignore").split("\f")
+
+
+def _signature_is_lonely(pages):
+    """True if a page containing the firm-name signature holds little else — i.e.
+    the signature block has been pushed onto a near-empty page of its own."""
+    def nonspace(t):
+        return len(re.sub(r"\s+", "", t))
+    for t in pages:
+        if any(kw.lower() in t.lower() for kw in _SIG_FIRM_KW) and nonspace(t) < 400:
+            return True
+    return False
+
+
+def _scale_margins(docx_bytes, scale):
+    """Shrink every section's bottom page margin — and the top margin of sections
+    with no header reference — by *scale* (e.g. 0.85), flooring at 720 twips
+    (0.5"). Top margins of letterhead sections (those carrying a headerReference)
+    are left alone so the EY banner is never overlapped."""
+    FLOOR = 720
+    buf_in, buf_out = io.BytesIO(docx_bytes), io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf_in, "r") as zin:
+            names   = zin.namelist()
+            doc_xml = zin.read("word/document.xml").decode("utf-8")
+
+            def fix_sectpr(m):
+                sect = m.group(0)
+                b = _pgmar_attr(sect, "bottom")
+                if b is not None:
+                    sect = _set_pgmar_attr(sect, "bottom",
+                                           max(FLOOR, int(round(b * scale))))
+                if "w:headerReference" not in sect:
+                    t = _pgmar_attr(sect, "top")
+                    if t is not None:
+                        sect = _set_pgmar_attr(sect, "top",
+                                               max(FLOOR, int(round(t * scale))))
+                return sect
+
+            doc_xml = re.sub(r"<w:sectPr\b.*?</w:sectPr>", fix_sectpr,
+                             doc_xml, flags=re.S)
+            with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for n in names:
+                    data = zin.read(n)
+                    if n == "word/document.xml":
+                        data = doc_xml.encode("utf-8")
+                    zout.writestr(n, data)
+    except Exception:
+        return docx_bytes
+    return buf_out.getvalue()
+
+
+def _autofit_layout(docx_bytes, company_names=()):
+    """Best-effort: if a renderer is available and the signature has been pushed
+    onto a lonely page, tighten the layout until it joins the preceding content.
+
+    Honours the stated preference order — page top/bottom margins first, line
+    spacing only after margins are exhausted. Returns the first candidate that
+    resolves the lonely signature, or the original bytes if none does / no
+    renderer is present (so we never compress a document for no benefit)."""
+    if os.environ.get("DIFY_DISABLE_AUTOFIT"):
+        return docx_bytes
+    soffice = _soffice_bin()
+    if not soffice:
+        return docx_bytes
+    pages = _render_page_texts(docx_bytes, soffice)
+    if pages is None or not _signature_is_lonely(pages):
+        return docx_bytes
+
+    # (margin_scale, line_spacing) steps: margins tighten first (1.0 → 0.7),
+    # then spacing steps down only once margins are at their floor.
+    schedule = [
+        (0.90, 1.15), (0.80, 1.15), (0.70, 1.15),
+        (0.70, 1.10), (0.70, 1.05), (0.70, 1.00),
+    ]
+    for scale, spacing in schedule:
+        cand = docx_bytes
+        if spacing != 1.15:
+            cand = enforce_line_spacing(cand, spacing=spacing)
+        if scale != 1.0:
+            cand = _scale_margins(cand, scale)
+        rendered = _render_page_texts(cand, soffice)
+        if rendered is None:
+            return docx_bytes
+        if not _signature_is_lonely(rendered):
+            return cand
+    return docx_bytes
+
+
 def build_substitutions(ui, tc):
     """Build the EN + CN placeholder → value substitution dict."""
     language      = ui.get("Output_language", "English")
@@ -3336,6 +3571,10 @@ def build_final_document(result_text, ui, tc):
             built = strip_page_top_empty_paragraphs(built)
             if _use_lh:
                 built = inject_ar_letterhead(built, _lh_path, ar_index=1)
+            _names = [subs.get("[Service organization name]", ""),
+                      ui.get("Company_name", ""), ui.get("Co_short_name", "")]
+            built = apply_pagination_controls(built, _names)
+            built = _autofit_layout(built, _names)
             fname = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
@@ -3345,6 +3584,9 @@ def build_final_document(result_text, ui, tc):
             st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
 
     built = strip_page_top_empty_paragraphs(enforce_line_spacing(dify_bytes))
+    _names = [ui.get("Company_name", ""), ui.get("Co_short_name", "")]
+    built = apply_pagination_controls(built, _names)
+    built = _autofit_layout(built, _names)
     fname = (
         f"{ui.get('Co_short_name', 'Report')}_"
         f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
@@ -3751,6 +3993,10 @@ if not final_done:
                         _t_merged = strip_page_top_empty_paragraphs(_t_merged)
                         if _t_use_lh:
                             _t_merged = inject_ar_letterhead(_t_merged, letterhead_path, ar_index=1)
+                        _t_names = [_t_subs.get("[Service organization name]", ""),
+                                    company_name, co_short_name]
+                        _t_merged = apply_pagination_controls(_t_merged, _t_names)
+                        _t_merged = _autofit_layout(_t_merged, _t_names)
                     st.session_state["ma_ar_only"] = {
                         "bytes": _t_merged,
                         "filename": (
