@@ -2457,35 +2457,41 @@ _SIG_DATE_RE = re.compile(
 
 
 def apply_pagination_controls(docx_bytes, company_names=()):
-    """Render-free pass: enable widow/orphan control on every paragraph (body +
-    table cells) so a page never begins or ends with a single dangling line of a
-    paragraph — EY templates sometimes ship it disabled (<w:widowControl
-    w:val="0"/>). Word evaluates widowControl when it opens the file, so this
-    works everywhere, including the frozen Windows exe.
+    """Render-free pass over every paragraph (body + table cells):
 
-    Note: this used to also set keepNext/keepLines on the signature block to keep
-    it off a lonely page. Those properties make Word draw a small black square in
-    the left margin of every affected paragraph whenever formatting marks are
-    shown (they never print, but look like stray bullets), and keepLines on a
-    one-line signature paragraph does nothing useful anyway. Orphan-control plus
-    the best-effort margin tightening in _autofit_layout cover signature
-    placement without leaving those markers. company_names is kept for signature
-    callers but no longer needed here.
+    1. Enable widow/orphan control so a page never begins or ends with a single
+       dangling line of a paragraph — EY templates sometimes ship it disabled
+       (<w:widowControl w:val="0"/>).
+    2. Strip any keepNext / keepLines properties. Word draws a small black
+       square in the left margin of any paragraph carrying those whenever
+       formatting marks are shown (they never print, but read as stray bullets).
+       Removing them clears the markers no matter their origin — an earlier
+       version of this pass added them to the signature block, but EY templates
+       can carry their own too, so we strip unconditionally.
+
+    Word evaluates widowControl when it opens the file, so this works
+    everywhere, including the frozen Windows exe. company_names is kept for
+    call-site compatibility but no longer used.
     """
     try:
         doc = Document(io.BytesIO(docx_bytes))
     except Exception:
         return docx_bytes
 
-    def _walk_widow(paragraphs, tables):
+    def _walk(paragraphs, tables):
         for p in paragraphs:
             p.paragraph_format.widow_control = True
+            pPr = p._p.find(qn("w:pPr"))
+            if pPr is not None:
+                for tag in ("w:keepNext", "w:keepLines"):
+                    for el in pPr.findall(qn(tag)):
+                        pPr.remove(el)
         for table in tables:
             for row in table.rows:
                 for cell in row.cells:
-                    _walk_widow(cell.paragraphs, cell.tables)
+                    _walk(cell.paragraphs, cell.tables)
 
-    _walk_widow(doc.paragraphs, doc.tables)
+    _walk(doc.paragraphs, doc.tables)
 
     buf = io.BytesIO()
     doc.save(buf)
