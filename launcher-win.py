@@ -7,6 +7,17 @@ and opens the browser automatically.
 import sys
 import os
 
+# On Windows, Streamlit/Tornado defaults to the asyncio Proactor event loop,
+# whose socket-accept path raises noisy "OSError: [WinError 64] The specified
+# network name is no longer available" (and can wedge) when a client connection
+# drops abruptly (VPN/Wi-Fi change, sleep/wake, tab refresh, corporate proxy).
+# The Selector event loop policy avoids this. It must be set before the Streamlit
+# server starts, so it lives here in the entry point rather than in app.py
+# (which streamlit only runs *after* the server's accept loop already exists).
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Force pure-Python protobuf before any import of google.protobuf (including
 # transitive imports via streamlit).  The bundled _message.pyd C-extension
 # crashes with STATUS_ACCESS_VIOLATION (c0000005) when Streamlit sends a

@@ -9,6 +9,8 @@ import tempfile
 import traceback
 import time
 import random
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -742,6 +744,11 @@ _TRANS_KW    = ["处理transaction", "processing user entity transaction"]
 _SINGLE_KW   = ["single user entity report", "single user entity时", "single user entity 时"]
 _OTHER_KW    = ["other information"]  # kept unless user says no Other Information section
 _AI_KW       = ["使用到了AI技术", "subject matter中某部分使用到了"]  # AI scope exclusion paragraph
+# Multi-SSO selector comment ("注：如涉及多家SSO，使用此句式") — marks the multi-
+# subservice-organization variant of the "uses … to provide …" sentence. The
+# single-SSO variant sits immediately BEFORE the commented span in the same
+# paragraph; exactly one of the two survives depending on the SSO count.
+_MULTI_SSO_KW = ["多家sso"]
 
 
 def _comment_span_text(para_el, cid, ns_w, id_attr):
@@ -759,6 +766,52 @@ def _comment_span_text(para_el, cid, ns_w, id_attr):
         elif inside and el.tag == f"{{{ns_w}}}t":
             parts.append(el.text or "")
     return "".join(parts)
+
+
+def _comment_before_text(para_el, cid, ns_w, id_attr):
+    """Return the run text in one paragraph that precedes comment *cid*'s range
+    start — used to drop the single-SSO sentence that sits just before the
+    multi-SSO conditional block when multiple subservice organizations exist."""
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeStart" and el.get(id_attr) == cid:
+            break
+        if el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def _comment_after_text(para_el, cid, ns_w, id_attr):
+    """Return the run text in one paragraph that follows comment *cid*'s range
+    end (the counterpart of _comment_before_text)."""
+    after = False
+    parts = []
+    for el in para_el.iter():
+        if el.tag == f"{{{ns_w}}}commentRangeEnd" and el.get(id_attr) == cid:
+            after = True
+        elif after and el.tag == f"{{{ns_w}}}t":
+            parts.append(el.text or "")
+    return "".join(parts)
+
+
+def _seam_dup_prefix_in_before(before, after):
+    """When deleting a commented (bracketed) clause would leave a connective
+    phrase duplicated across the seam — the EY EN templates repeat e.g.
+    "throughout that period" on both sides of an optional bracketed clause —
+    return the trailing portion of *before* that duplicates the head of *after*,
+    so it can be removed together with the span. Empty when there is no such
+    duplicate (e.g. CJK text, which has no whitespace-delimited words to align)."""
+    bw = before.split()
+    aw = after.split()
+    best = 0
+    for k in range(1, min(len(bw), len(aw)) + 1):
+        if [w.strip(".,;:") for w in bw[-k:]] == [w.strip(".,;:") for w in aw[:k]]:
+            best = k
+    if best == 0:
+        return ""
+    pat = r"\s*" + r"\s+".join(re.escape(w) for w in bw[-best:]) + r"\s*$"
+    m = re.search(pat, before)
+    return m.group(0) if m else ""
 
 
 def _build_annotation_maps(docx_bytes, flags):
@@ -842,6 +895,30 @@ def _build_annotation_maps(docx_bytes, flags):
         if not indices:
             continue
 
+        # Multi-SSO selector: the paragraph holds two variants of the
+        # "[short] uses [SSO] to provide [services]" sentence — a single-SSO
+        # one (BEFORE the commented span) and a multi-SSO one (the commented
+        # span itself, wrapped in [ ] / 【 】 / { } brackets). Keep exactly one:
+        #   • ≥2 subservice orgs → drop the single-SSO sentence (the BEFORE text)
+        #     and keep the span; its wrapper brackets are stripped later by the
+        #     orphan-bracket cleanup in fill_and_process_template.
+        #   • <2 subservice orgs → drop the whole multi-SSO span (wrapper and all)
+        #     and keep the single-SSO sentence.
+        # Both removals run as raw-template span deletions before substitution.
+        if any(_kw_in(text, kw) for kw in _MULTI_SSO_KW):
+            multi = flags.get("multi_sso", False)
+            for idx in indices:
+                child = body_list[idx]
+                if multi:
+                    before = _comment_before_text(child, cid, ns_w, id_attr)
+                    if before.strip():
+                        span_del_texts.append((idx, before))
+                else:
+                    span = _comment_span_text(child, cid, ns_w, id_attr)
+                    if span.strip():
+                        span_del_texts.append((idx, span))
+            continue
+
         # Single-UE: if comment says "delete" → when the flag is set, delete
         # only the commented sentence span if the comment covers part of a
         # longer paragraph, or the whole paragraph when it covers all of it
@@ -899,7 +976,42 @@ def _build_annotation_maps(docx_bytes, flags):
                 # (do not set should_delete — individual indices already handled)
 
         if should_delete:
-            del_indices |= indices
+            # Delete the whole paragraph only when the comment covers
+            # (essentially) all of it — e.g. "无用户补充性控制时，则delete此段描述".
+            # When it marks just an embedded clause — e.g. "…则相应delete有关
+            # wording", whose range wraps only the bracketed conditional phrase —
+            # drop that commented span and keep the rest of the paragraph,
+            # mirroring the single-user-entity handling above. Without this the
+            # core "suitably designed" / "operated effectively" assertions (which
+            # merely embed a CUEC/SSO-CC clause in brackets) would disappear.
+            for idx in indices:
+                child = body_list[idx]
+                span = _comment_span_text(child, cid, ns_w, id_attr)
+                span_n = _normalize_ws(span)
+                para_n = _normalize_ws("".join(
+                    t.text or "" for t in child.findall(f".//{{{ns_w}}}t")
+                ))
+                if (span_n and span_n != para_n and len(span_n) >= 30
+                        and not _kw_in(text, "本段") and not _kw_in(text, "此段")):
+                    before = _comment_before_text(child, cid, ns_w, id_attr)
+                    after  = _comment_after_text(child, cid, ns_w, id_attr)
+                    # Drop a connective phrase duplicated across the seam (EN).
+                    dup = _seam_dup_prefix_in_before(before, after)
+                    head = before[:len(before) - len(dup)] if dup else before
+                    # Some templates place the optional clause's opening bracket
+                    # and its leading comma OUTSIDE the comment range (CN SOC1).
+                    # Remove that trailing "【，" / "[ ," too, else a stray comma
+                    # is left dangling before the sentence's full stop. Only a
+                    # leading bracket and "soft" punctuation (comma/semicolon) is
+                    # stripped — never a sentence-ending 。/. — so independent
+                    # sentences are not glued together.
+                    m = re.search(r"[【\[]?\s*[，,、；;]*\s*$", head)
+                    lead = m.group(0) if m else ""
+                    if not re.search(r"[【\[，,、；;]", lead):
+                        lead = ""
+                    span_del_texts.append((idx, lead + dup + span))
+                else:
+                    del_indices.add(idx)
 
     return del_indices, single_ue_indices, span_del_texts
 
@@ -1210,8 +1322,14 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
     def _apply_brackets(para, is_single_ue):
         # Process one bracket match per loop iteration using smart replacement so
         # that per-run italic/bold formatting outside the matched span is preserved.
+        removed_any = False
+        first_pass = True
         changed = True
         while changed:
+            # Re-entering the loop means the previous pass removed a bracket span.
+            if not first_pass:
+                removed_any = True
+            first_pass = False
             changed = False
             full_text = "".join(r.text for r in para.runs)
             if not full_text or ("[" not in full_text and "【" not in full_text):
@@ -1260,12 +1378,23 @@ def fill_and_process_template(template_path, subs, flags, language="English"):
         #    double); once that placeholder is substituted away, the block's
         #    closing 】 is left with no opening to pair against, so cases a–c above
         #    can never match it. By this point all real bracket pairs and [or…]
-        #    phrases are gone, so any remaining 【】[] is an artifact — strip the
+        #    phrases are gone, so any remaining 【】[]{} is an artifact — strip the
         #    lone bracket characters (these templates never use them as literal
-        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN".
+        #    text). See template "12.2 AR_SOC2 Type I_SSAE18_IL503_CN". The { }
+        #    variant wraps the multi-SSO block in the SOC3 EN template, left
+        #    behind when its single-SSO sentence is dropped (see _MULTI_SSO_KW).
         for run in para.runs:
-            if run.text and re.search(r"[【】\[\]]", run.text):
-                run.text = re.sub(r"[【】\[\]]", "", run.text)
+            if run.text and re.search(r"[【】\[\]{}]", run.text):
+                run.text = re.sub(r"[【】\[\]{}]", "", run.text)
+                removed_any = True
+        # Removing a wrapper bracket can leave a stray leading space at the start
+        # of the paragraph (e.g. EN multi-SSO "[ [Service…" → " Service…" once the
+        # single-SSO sentence and wrapper are gone) — trim the first run.
+        if removed_any:
+            for run in para.runs:
+                if run.text:
+                    run.text = run.text.lstrip()
+                    break
 
         # Normalize spaces introduced by empty removals
         prev_ended_space = False
@@ -2146,14 +2275,40 @@ def strip_page_top_empty_paragraphs(docx_bytes):
     return buf.getvalue()
 
 
+# Characters Word treats as East-Asian (Han, kana, bopomofo, CJK punctuation,
+# full-width forms). Used to pick a run's eastAsia font: 黑体 only when the run
+# actually contains such a character, otherwise Times New Roman — so English
+# "ambiguous" punctuation (curly quotes/dashes in U+2000–206F, which Word
+# classifies as East-Asian) is rendered in Times New Roman, not 黑体.
+_CJK_RE = re.compile(
+    "["
+    "\u2e80-\u2eff"   # CJK radicals supplement
+    "\u3000-\u303f"   # CJK symbols & punctuation
+    "\u3040-\u30ff"   # hiragana + katakana
+    "\u3100-\u312f"   # bopomofo
+    "\u3400-\u4dbf"   # CJK ext A
+    "\u4e00-\u9fff"   # CJK unified ideographs
+    "\uf900-\ufaff"   # CJK compatibility ideographs
+    "\ufe30-\ufe4f"   # CJK compatibility forms
+    "\uff00-\uffef"   # halfwidth & fullwidth forms
+    "]"
+)
+
+
+def _has_cjk(text):
+    return bool(_CJK_RE.search(text or ""))
+
+
 def enforce_line_spacing(docx_bytes, spacing=1.15):
     """
     Final pass over the finished document: set every paragraph (body and
     table cells, including nested tables) to the given multiple line spacing,
     and normalise every run to Times New Roman Latin/complex-script fonts and
-    black text, and the CJK (eastAsia) font to 黑体 — so the whole document
-    is uniform (Times New Roman for Latin, 黑体 for Chinese) regardless of
-    what each merged section set.
+    black text. The CJK (eastAsia) font is set to 黑体 only on runs that
+    actually contain a CJK character; Latin-only runs get Times New Roman as
+    their eastAsia font too, so English punctuation never falls back to 黑体 —
+    so the whole document is uniform (Times New Roman for Latin, 黑体 for
+    Chinese) regardless of what each merged section set.
 
     Re-injects the original numbering.xml afterwards because python-docx may
     silently drop <w:lvlOverride>/<w:startOverride> elements on save (same
@@ -2191,7 +2346,12 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         rFonts.set(qn("w:ascii"),    "Times New Roman")
         rFonts.set(qn("w:hAnsi"),    "Times New Roman")
         rFonts.set(qn("w:cs"),       "Times New Roman")
-        rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+        # eastAsia per run content: 黑体 only when the run actually contains a
+        # CJK character; otherwise Times New Roman, so this run's English
+        # punctuation is never rendered in 黑体.
+        run_text = "".join(t.text or "" for t in r_el.findall(qn("w:t")))
+        rFonts.set(qn("w:eastAsia"),
+                   FONT_CHINESE if _has_cjk(run_text) else "Times New Roman")
         for theme_attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
             if rFonts.get(qn(theme_attr)) is not None:
                 del rFonts.attrib[qn(theme_attr)]
@@ -2303,6 +2463,244 @@ def enforce_line_spacing(docx_bytes, spacing=1.15):
         return buf_out.read()
     except Exception:
         return saved_bytes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pagination / signature layout
+#
+# Two-tier, hybrid approach (see the module README): a render-free pass that
+# leans on Word's own pagination engine so it works inside the shipped exe, plus
+# a best-effort auto-fit that only runs when a LibreOffice + poppler renderer is
+# present (dev / server) to literally tighten margins then line spacing.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Firm-name keywords that mark an Auditor's-Report signature block. Keyword-
+# matched, case-insensitive (mirrors the bold-keep patterns in
+# fill_and_process_template).
+_SIG_FIRM_KW = (
+    "Ernst & Young", "Hua Ming", "Certified Public Accountants",
+    "安永华明", "会计师事务所",
+)
+# A signature date paragraph is the formatted date and nothing else.
+_SIG_DATE_RE = re.compile(
+    r"^(?:[A-Z][a-z]+ \d{1,2}, \d{4}|\d{4}年\d{1,2}月\d{1,2}日)$"
+)
+
+
+def _is_signature_line(text, company_names):
+    """True if a (short) paragraph belongs to an MA/AR signature block: the firm
+    name, the formatted date, the city/country line, or the service-org name."""
+    t = (text or "").strip()
+    if not t or len(t) > 120:
+        return False
+    if any(kw.lower() in t.lower() for kw in _SIG_FIRM_KW):
+        return True
+    if _SIG_DATE_RE.match(t):
+        return True
+    if len(t) <= 50 and ("China" in t or "中国" in t):
+        return True
+    if any(nm and t == nm for nm in company_names):
+        return True
+    return False
+
+
+def _signature_blocks(paras, company_names, gap=3):
+    """Group signature-line paragraph indices into contiguous blocks, tolerating
+    up to *gap* intervening paragraphs (blank/spacer lines inside a block). The
+    MA and AR signatures, separated by the whole AR body, form distinct blocks."""
+    sig = [i for i, p in enumerate(paras)
+           if _is_signature_line(p.text, company_names)]
+    blocks = []
+    for i in sig:
+        if blocks and i - blocks[-1][-1] <= gap:
+            blocks[-1].append(i)
+        else:
+            blocks.append([i])
+    return blocks
+
+
+def apply_pagination_controls(docx_bytes, company_names=()):
+    """Render-free pass: give Word the information it needs to paginate sensibly.
+
+    1. Enable widow/orphan control on every paragraph (body + table cells) so a
+       page never begins or ends with a single dangling line of a paragraph —
+       EY templates sometimes ship it disabled (<w:widowControl w:val="0"/>).
+    2. For each MA/AR signature block, bind the block together (keepLines) and
+       glue it to the preceding non-empty paragraph (keepNext) so the signature
+       can never sit alone at the top of a fresh page — it always carries at
+       least the closing line of content above it. keepNext is set on the
+       preceding paragraph (its last line follows onto the signature page)
+       while keepLines is set only on the short signature lines themselves, so a
+       long closing paragraph is still free to split rather than jumping wholesale
+       to the next page and leaving a gap.
+
+    Note: keepNext/keepLines make Word draw a small black square in the left
+    margin of each affected paragraph when formatting marks are shown. Those
+    markers never print and are the accepted cost of keeping the signature off a
+    lonely page render-free (the only way to do it inside the frozen exe).
+
+    Word evaluates keepNext/keepLines/widowControl when it opens the file, so
+    this works everywhere, including the frozen Windows exe.
+    """
+    try:
+        doc = Document(io.BytesIO(docx_bytes))
+    except Exception:
+        return docx_bytes
+
+    def _walk_widow(paragraphs, tables):
+        for p in paragraphs:
+            p.paragraph_format.widow_control = True
+        for table in tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    _walk_widow(cell.paragraphs, cell.tables)
+
+    _walk_widow(doc.paragraphs, doc.tables)
+
+    paras = doc.paragraphs
+    names = tuple(n for n in company_names if n)
+    for block in _signature_blocks(paras, names):
+        first, last = block[0], block[-1]
+        # Walk back to the closing line of real content above the signature.
+        prev = first - 1
+        while prev >= 0 and not paras[prev].text.strip():
+            prev -= 1
+        start = prev if prev >= 0 else first
+        # keepNext chains the content line + any spacer blanks onto the block.
+        for i in range(start, last):
+            paras[i].paragraph_format.keep_with_next = True
+        # keepLines holds each short signature line undivided.
+        for i in block:
+            paras[i].paragraph_format.keep_together = True
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    return buf.getvalue()
+
+
+def _soffice_bin():
+    """Path to a LibreOffice headless binary, or None. Absent in the shipped exe
+    (end-users get the render-free pass only)."""
+    for name in ("soffice", "libreoffice"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
+def _render_page_texts(docx_bytes, soffice):
+    """Render *docx_bytes* to PDF (LibreOffice) and return one text string per
+    page (poppler's pdftotext separates pages with form-feeds). Returns None if
+    the renderer/extractor is missing or anything fails — the caller then leaves
+    the document untouched."""
+    pdftotext = shutil.which("pdftotext")
+    if not pdftotext:
+        return None
+    with tempfile.TemporaryDirectory() as td:
+        src = os.path.join(td, "doc.docx")
+        with open(src, "wb") as f:
+            f.write(docx_bytes)
+        try:
+            subprocess.run(
+                [soffice, "--headless", "--convert-to", "pdf", "--outdir", td, src],
+                check=True, capture_output=True, timeout=120,
+            )
+            pdf = os.path.join(td, "doc.pdf")
+            if not os.path.isfile(pdf):
+                return None
+            out = subprocess.run(
+                [pdftotext, "-layout", pdf, "-"],
+                check=True, capture_output=True, timeout=60,
+            )
+        except Exception:
+            return None
+    return out.stdout.decode("utf-8", "ignore").split("\f")
+
+
+def _signature_is_lonely(pages):
+    """True if a page containing the firm-name signature holds little else — i.e.
+    the signature block has been pushed onto a near-empty page of its own."""
+    def nonspace(t):
+        return len(re.sub(r"\s+", "", t))
+    for t in pages:
+        if any(kw.lower() in t.lower() for kw in _SIG_FIRM_KW) and nonspace(t) < 400:
+            return True
+    return False
+
+
+def _scale_margins(docx_bytes, scale):
+    """Shrink every section's bottom page margin — and the top margin of sections
+    with no header reference — by *scale* (e.g. 0.85), flooring at 720 twips
+    (0.5"). Top margins of letterhead sections (those carrying a headerReference)
+    are left alone so the EY banner is never overlapped."""
+    FLOOR = 720
+    buf_in, buf_out = io.BytesIO(docx_bytes), io.BytesIO()
+    try:
+        with zipfile.ZipFile(buf_in, "r") as zin:
+            names   = zin.namelist()
+            doc_xml = zin.read("word/document.xml").decode("utf-8")
+
+            def fix_sectpr(m):
+                sect = m.group(0)
+                b = _pgmar_attr(sect, "bottom")
+                if b is not None:
+                    sect = _set_pgmar_attr(sect, "bottom",
+                                           max(FLOOR, int(round(b * scale))))
+                if "w:headerReference" not in sect:
+                    t = _pgmar_attr(sect, "top")
+                    if t is not None:
+                        sect = _set_pgmar_attr(sect, "top",
+                                               max(FLOOR, int(round(t * scale))))
+                return sect
+
+            doc_xml = re.sub(r"<w:sectPr\b.*?</w:sectPr>", fix_sectpr,
+                             doc_xml, flags=re.S)
+            with zipfile.ZipFile(buf_out, "w", zipfile.ZIP_DEFLATED) as zout:
+                for n in names:
+                    data = zin.read(n)
+                    if n == "word/document.xml":
+                        data = doc_xml.encode("utf-8")
+                    zout.writestr(n, data)
+    except Exception:
+        return docx_bytes
+    return buf_out.getvalue()
+
+
+def _autofit_layout(docx_bytes, company_names=()):
+    """Best-effort: if a renderer is available and the signature has been pushed
+    onto a lonely page, tighten the layout until it joins the preceding content.
+
+    Honours the stated preference order — page top/bottom margins first, line
+    spacing only after margins are exhausted. Returns the first candidate that
+    resolves the lonely signature, or the original bytes if none does / no
+    renderer is present (so we never compress a document for no benefit)."""
+    if os.environ.get("DIFY_DISABLE_AUTOFIT"):
+        return docx_bytes
+    soffice = _soffice_bin()
+    if not soffice:
+        return docx_bytes
+    pages = _render_page_texts(docx_bytes, soffice)
+    if pages is None or not _signature_is_lonely(pages):
+        return docx_bytes
+
+    # (margin_scale, line_spacing) steps: margins tighten first (1.0 → 0.7),
+    # then spacing steps down only once margins are at their floor.
+    schedule = [
+        (0.90, 1.15), (0.80, 1.15), (0.70, 1.15),
+        (0.70, 1.10), (0.70, 1.05), (0.70, 1.00),
+    ]
+    for scale, spacing in schedule:
+        cand = docx_bytes
+        if spacing != 1.15:
+            cand = enforce_line_spacing(cand, spacing=spacing)
+        if scale != 1.0:
+            cand = _scale_margins(cand, scale)
+        rendered = _render_page_texts(cand, soffice)
+        if rendered is None:
+            return docx_bytes
+        if not _signature_is_lonely(rendered):
+            return cand
+    return docx_bytes
 
 
 def build_substitutions(ui, tc):
@@ -2418,6 +2816,12 @@ def build_substitutions(ui, tc):
         "[Subservice organization B short name]": _sso_b[1],
         "[identify the function or service provided by the subservice organization B]": _sso_b[2],
         "[Subservice organization C short name]": _sso_c[1],
+        # EN multi-SSO templates quote the short name WITHOUT square brackets,
+        # e.g. (“Subservice organization A short name”) — match the quoted phrase
+        # and keep the surrounding curly quotes. Placed AFTER the bracketed keys
+        # so a "[… short name]" placeholder is consumed whole first.
+        "“Subservice organization A short name”": f"“{_sso_a[1]}”",
+        "“Subservice organization B short name”": f"“{_sso_b[1]}”",
         # Capital-O variant found in some templates
         "[Service Organization short name]":     co_short_name,
         "[Company name]":                        company_name,
@@ -2531,8 +2935,18 @@ def build_substitutions(ui, tc):
     return subs
 
 
-def build_flags(tc):
-    """Build the boolean deletion-flag dict from template_config."""
+def build_flags(tc, ui=None):
+    """Build the boolean deletion-flag dict from template_config.
+
+    *ui* (user inputs) is consulted for the subservice-organization count, which
+    selects the single- vs multi-SSO variant of the MA/AR "uses … to provide …"
+    sentence (see _MULTI_SSO_KW)."""
+    ui = ui or {}
+    # One subservice organization per non-empty line of the Subservice_org input.
+    _sso_lines = [
+        ln for ln in (ui.get("Subservice_org", "") or "").strip().splitlines()
+        if ln.strip()
+    ]
     return {
         "cuec_identified":            tc.get("cuec_identified", True),
         "sso_cc_identified":          tc.get("sso_cc_identified", True),
@@ -2541,6 +2955,7 @@ def build_flags(tc):
         "has_ai_scope_exclusion":     tc.get("has_ai_scope_exclusion", False),
         "has_other_information":      tc.get("has_other_information", True),
         "addressee_choice":           tc.get("addressee_choice", "Management"),
+        "multi_sso":                  len(_sso_lines) >= 2,
     }
 
 
@@ -2694,8 +3109,10 @@ FONT_CHINESE = "黑体"
 
 
 def _apply_fonts(run):
-    """Set Times New Roman for Latin characters, 华文楷体 for Chinese characters.
-    Word automatically picks the right one per character based on Unicode range."""
+    """Set Times New Roman for Latin characters, 黑体 for Chinese characters.
+    eastAsia is 黑体 only when the run text actually contains a CJK character;
+    Latin-only runs get Times New Roman as eastAsia too, so Word does not render
+    their ambiguous punctuation (curly quotes/dashes) in 黑体."""
     rPr = run._r.get_or_add_rPr()
     rFonts = rPr.find(qn("w:rFonts"))
     if rFonts is None:
@@ -2703,13 +3120,14 @@ def _apply_fonts(run):
         rPr.insert(0, rFonts)
     rFonts.set(qn("w:ascii"),    FONT_LATIN)
     rFonts.set(qn("w:hAnsi"),    FONT_LATIN)
-    rFonts.set(qn("w:eastAsia"), FONT_CHINESE)
+    rFonts.set(qn("w:eastAsia"), FONT_CHINESE if _has_cjk(run.text) else FONT_LATIN)
     rFonts.set(qn("w:cs"),       FONT_LATIN)
 
 
 def _set_style_fonts(style):
-    """Apply the same dual-font setting (Times New Roman + 华文楷体) at the
-    paragraph-style level."""
+    """Apply the dual-font setting (Times New Roman Latin + 黑体 CJK) at the
+    paragraph-style level. This is the style default; per-run _apply_fonts and
+    the final enforce_line_spacing pass refine eastAsia per actual run content."""
     rPr = style.element.find(qn("w:rPr"))
     if rPr is None:
         rPr = OxmlElement("w:rPr")
@@ -2964,6 +3382,10 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
     # sequences the LLM produced.  Start True so leading blank lines are
     # silently dropped.
     last_was_blank = True
+    # Track whether the previous emitted line was a signature line (firm name or
+    # date) so a trailing city/country line is recognised as part of the same
+    # signature block and de-bulleted too (see the bullet branch below).
+    last_was_signature = False
 
     while i < len(lines):
         line = lines[i]
@@ -3007,19 +3429,49 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             last_was_blank = True
 
         # ── Bullet lists ───────────────────────────────────────────────────
-        elif re.match(r"^[-*+] ", line):
-            p = doc.add_paragraph(style="List Bullet")
-            _inline_bullet(p, line[2:].strip())
-            p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
-            _pin_list_numpr(p, doc)
-            last_was_blank = False
+        elif re.match(r"^[-*+] ", line) or re.match(r"^[•·]\s+", line):
+            if re.match(r"^[-*+] ", line):
+                content = line[2:].strip()
+            else:
+                content = re.sub(r"^[•·]\s+", "", line).strip()
 
-        elif re.match(r"^[•·]\s+", line):
+            # An empty bullet ("- " with no text) is layout filler from the LLM,
+            # not a real list item — emit a single blank line instead of a stray
+            # black dot. Keep last_was_signature so "firm / date / blanks / city"
+            # still reads as one signature block.
+            if not content:
+                if not last_was_blank:
+                    blank = doc.add_paragraph()
+                    blank.paragraph_format.space_after  = Pt(0)
+                    blank.paragraph_format.space_before = Pt(0)
+                    last_was_blank = True
+                i += 1
+                continue
+
+            # A signature line (firm name / date, or a city/country line right
+            # after one) is never a real list item even when the LLM bullets it —
+            # render it as a plain paragraph so it carries no black dot.
+            _firm_or_date = (
+                any(kw.lower() in content.lower() for kw in _SIG_FIRM_KW)
+                or _SIG_DATE_RE.match(content)
+            )
+            _city = len(content) <= 50 and ("China" in content or "中国" in content)
+            if _firm_or_date or (_city and last_was_signature):
+                p = doc.add_paragraph()
+                _inline(p, content)
+                p.paragraph_format.space_after  = Pt(0)
+                p.paragraph_format.space_before = Pt(0)
+                last_was_blank = False
+                last_was_signature = True
+                i += 1
+                continue
+
             p = doc.add_paragraph(style="List Bullet")
-            _inline_bullet(p, re.sub(r"^[•·]\s+", "", line))
+            _inline_bullet(p, content)
             p.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             _pin_list_numpr(p, doc)
             last_was_blank = False
+            last_was_signature = False
 
         elif re.match(r"^\d+\. ", line):
             # Collect the whole consecutive numbered block, keeping the SN
@@ -3090,6 +3542,7 @@ def markdown_to_docx(md_text: str, language: str = "English") -> bytes:
             p.paragraph_format.space_after  = Pt(0)
             p.paragraph_format.space_before = Pt(0)
             last_was_blank = False
+            last_was_signature = False
 
         i += 1
 
@@ -3178,7 +3631,7 @@ def build_final_document(result_text, ui, tc):
             and tc.get("ar_template_path")
             and tc.get("ma_template_path")):
         subs  = build_substitutions(ui, tc)
-        flags = build_flags(tc)
+        flags = build_flags(tc, ui)
         _lang = ui.get("Output_language", "English")
         _lh_path = tc.get("letterhead_path")
         _use_lh  = bool(_lh_path) and os.path.isfile(_lh_path)
@@ -3192,6 +3645,10 @@ def build_final_document(result_text, ui, tc):
             built = strip_page_top_empty_paragraphs(built)
             if _use_lh:
                 built = inject_ar_letterhead(built, _lh_path, ar_index=1)
+            _names = [subs.get("[Service organization name]", ""),
+                      ui.get("Company_name", ""), ui.get("Co_short_name", "")]
+            built = apply_pagination_controls(built, _names)
+            built = _autofit_layout(built, _names)
             fname = (
                 f"{ui.get('Co_short_name', 'Report')}_"
                 f"{ui.get('Report_type', '').replace(' ', '_')}_Complete_Report.docx"
@@ -3201,6 +3658,9 @@ def build_final_document(result_text, ui, tc):
             st.error(f"Failed to generate complete report: {exc}\n\nFalling back to Dify sections only.")
 
     built = strip_page_top_empty_paragraphs(enforce_line_spacing(dify_bytes))
+    _names = [ui.get("Company_name", ""), ui.get("Co_short_name", "")]
+    built = apply_pagination_controls(built, _names)
+    built = _autofit_layout(built, _names)
     fname = (
         f"{ui.get('Co_short_name', 'Report')}_"
         f"{ui.get('Report_type', '').replace(' ', '_')}_Report.docx"
@@ -3596,7 +4056,7 @@ if not final_done:
                 try:
                     with st.spinner("Generating MA + AR sections…"):
                         _t_subs  = build_substitutions(_test_ui, _test_tc)
-                        _t_flags = build_flags(_test_tc)
+                        _t_flags = build_flags(_test_tc, _test_ui)
                         _t_ma    = fill_and_process_template(_ma_path_t, _t_subs, _t_flags, output_language)
                         _t_ar    = fill_and_process_template(_ar_path_t, _t_subs, _t_flags, output_language)
                         _t_use_lh = bool(letterhead_path) and os.path.isfile(letterhead_path)
@@ -3607,6 +4067,10 @@ if not final_done:
                         _t_merged = strip_page_top_empty_paragraphs(_t_merged)
                         if _t_use_lh:
                             _t_merged = inject_ar_letterhead(_t_merged, letterhead_path, ar_index=1)
+                        _t_names = [_t_subs.get("[Service organization name]", ""),
+                                    company_name, co_short_name]
+                        _t_merged = apply_pagination_controls(_t_merged, _t_names)
+                        _t_merged = _autofit_layout(_t_merged, _t_names)
                     st.session_state["ma_ar_only"] = {
                         "bytes": _t_merged,
                         "filename": (
