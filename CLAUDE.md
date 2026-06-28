@@ -4,6 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See also: `../CLAUDE.md` at the workspace root for how this frontend connects to the `DIFY-backend` workflows.
 
+## Project Skills
+
+Project-scoped skills live in `.claude/skills/` and are available to anyone working in this repo (Claude Code auto-loads them):
+
+- **`soc-report-generator`** — authoring/editing the EY Word (`.docx`) MA/AR templates in `MA_template/` and `AR_template/` (driven by `template_index.xlsx`) and formatting the Dify-generated Section III. Covers placeholder syntax, the `[or ..]` / `【】` / `（注：…）` conditional markers, the Word-comment annotation markers (CUEC, SSO-CC, single-user-entity, AI-scope, Other-Information), and the WP-number lookup. Use when adding/changing a template, a placeholder, or a conditional rule that `app.py`'s `fill_and_process_template` must honor. Has supporting `references/` and `assets/`.
+- **`frontend-design`** — guidance for distinctive, intentional visual design when building or reshaping UI (palette, typography, layout). General-purpose, not DIFY-specific.
+
 ## Running the App
 
 ```bash
