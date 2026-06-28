@@ -65,25 +65,37 @@ def _read_app_version():
 
 def _update_manager():
     import velopack
-    return velopack.UpdateManager(UPDATE_URL)
+    # A bare URL string is treated by Velopack as an HttpSource (static file host),
+    # which does NOT work for GitHub Releases — the feed files live under release
+    # assets, not at the repo URL. GithubSource knows how to read the Releases API.
+    return velopack.UpdateManager(velopack.GithubSource(UPDATE_URL, None, False))
 
 
-def _check_for_update():
-    """Return UpdateInfo when a newer release exists, else None. Frozen builds only."""
+def _check_for_update(raise_errors=False):
+    """Return UpdateInfo when a newer release exists, else None. Frozen builds only.
+
+    With raise_errors=True the underlying exception propagates so the manual
+    "Check for updates" button can show *why* it failed instead of silently
+    reporting "up to date" (which is what hid the GithubSource bug originally).
+    """
     if not getattr(_sys, "frozen", False):
         return None
     try:
         return _update_manager().check_for_updates()
     except Exception:
+        if raise_errors:
+            raise
         return None
 
 
 def _update_target_version(info):
-    """Best-effort version string from an UpdateInfo, or None (binding-version safe)."""
+    """Best-effort version string from an UpdateInfo, or None.
+
+    Velopack's pyo3 bindings expose PascalCase properties
+    (info.TargetFullRelease.Version), not snake_case.
+    """
     try:
-        rel = getattr(info, "target_full_release", None)
-        ver = getattr(rel, "version", None)
-        return str(ver) if ver else None
+        return str(info.TargetFullRelease.Version)
     except Exception:
         return None
 
@@ -620,8 +632,15 @@ with st.sidebar:
             st.session_state["_update_info"] = _check_for_update()
 
         if st.button("🔍 Check for updates", use_container_width=True):
-            st.session_state["_update_info"] = _check_for_update()
             st.session_state["_update_checked"] = True
+            st.session_state.pop("_update_error", None)
+            try:
+                # raise on failure so the user sees the real reason instead of a
+                # misleading "up to date".
+                st.session_state["_update_info"] = _check_for_update(raise_errors=True)
+            except Exception as _e:
+                st.session_state["_update_info"] = None
+                st.session_state["_update_error"] = str(_e)
             st.rerun()
 
         _info = st.session_state.get("_update_info")
@@ -640,6 +659,8 @@ with st.sidebar:
                         _um.apply_updates_and_restart(_info)
                 except Exception as _e:
                     st.error(f"Update failed: {_e}")
+        elif st.session_state.get("_update_error"):
+            st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
         elif st.session_state.get("_update_checked"):
             st.caption("✅ You're on the latest version.")
 
