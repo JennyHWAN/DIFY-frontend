@@ -99,6 +99,44 @@ def _update_target_version(info):
     except Exception:
         return None
 
+
+def _update_diagnostics():
+    """Collect exactly what Velopack reports, for debugging update problems.
+
+    Returns a dict of label -> value/error string. Distinguishes the local build
+    version (VERSION file) from the version Velopack actually recorded at install
+    time (get_current_version) — a mismatch there explains "I'm on the latest"
+    when you think you're on an older build.
+    """
+    out = {
+        "UPDATE_URL": UPDATE_URL,
+        "frozen": bool(getattr(_sys, "frozen", False)),
+        "VERSION file (sidebar label)": _read_app_version(),
+    }
+    try:
+        um = _update_manager()
+    except Exception as e:
+        out["UpdateManager()"] = f"ERROR: {e!r}"
+        return out
+    for label, fn in (
+        ("get_current_version()", um.get_current_version),
+        ("get_app_id()", um.get_app_id),
+        ("get_is_portable()", um.get_is_portable),
+        ("get_update_pending_restart()", um.get_update_pending_restart),
+    ):
+        try:
+            out[label] = fn()
+        except Exception as e:
+            out[label] = f"ERROR: {e!r}"
+    try:
+        info = um.check_for_updates()
+        out["check_for_updates()"] = (
+            f"update -> {_update_target_version(info)}" if info else "None (no update)"
+        )
+    except Exception:
+        out["check_for_updates()"] = "EXCEPTION:\n" + traceback.format_exc()
+    return out
+
 # EY keeps the authoritative MA/AR templates in the SharePoint library
 # "GCSOCR / Reporting files templates". Rather than ship static copies, the app can
 # pull the latest .docx straight from that library at startup so templates stay
@@ -663,6 +701,16 @@ with st.sidebar:
             st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
         elif st.session_state.get("_update_checked"):
             st.caption("✅ You're on the latest version.")
+
+        # Diagnostics: shows what Velopack actually reports (installed version,
+        # app id, portable flag, raw check result). Compare get_current_version()
+        # to the latest GitHub release to see whether an update *should* be found.
+        with st.expander("🔧 Update diagnostics"):
+            if st.button("Run diagnostics", use_container_width=True):
+                st.session_state["_update_diag"] = _update_diagnostics()
+            _diag = st.session_state.get("_update_diag")
+            if _diag:
+                st.json(_diag)
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
 main_done  = "main_outputs"  in st.session_state
