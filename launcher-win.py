@@ -30,7 +30,6 @@ import threading
 import time
 import traceback
 
-
 def _open_browser():
     """Wait briefly for the server to start, then open the browser."""
     time.sleep(3)
@@ -38,6 +37,18 @@ def _open_browser():
 
 
 def main():
+    # Velopack must process its install/update/uninstall hooks before anything
+    # else: when invoked with --veloapp-* args (during install or after an
+    # update) it runs the hook and exits fast. No-op when running in dev or when
+    # the app was not installed via the Velopack Setup.exe. The actual update
+    # check is user-driven from the app's sidebar (notify, don't force-restart),
+    # so there is no automatic download/apply here.
+    try:
+        import velopack
+        velopack.App().run()
+    except Exception:
+        pass
+
     # When frozen by PyInstaller, all bundled files live under sys._MEIPASS
     if getattr(sys, "frozen", False):
         base_dir = sys._MEIPASS

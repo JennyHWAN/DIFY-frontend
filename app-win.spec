@@ -40,8 +40,24 @@ try:
 except Exception:
     pass
 
+# velopack (Windows auto-update) ships a native helper library that must be
+# bundled alongside the Python bindings, so collect_all pulls its data/binaries.
+try:
+    _vp = collect_all("velopack")
+    datas += _vp[0]
+    binaries += _vp[1]
+    hiddenimports += _vp[2]
+except Exception:
+    pass
+
 # ── Include app source files ───────────────────────────────────────────────────
 datas += [("app.py", ".")]
+
+# Bundle the VERSION file so the app can display the current build version in the
+# sidebar (read from _MEIPASS at runtime). vpk's packVersion is the source of truth
+# for the actual installed version; this is just for the UI label.
+if os.path.exists("VERSION"):
+    datas += [("VERSION", ".")]
 
 # ── Embed API keys as compiled bytecode (not a readable plaintext file) ────────
 # Read .env at build time, write values into a Python module, then bundle it.
