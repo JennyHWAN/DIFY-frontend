@@ -1,7 +1,16 @@
 name: Build Windows EXE
 
+# Push a tag like v1.2.3 to build + publish a GitHub Release that the in-app
+# auto-updater consumes. workflow_dispatch still works for a manual test build
+# (packaged but not published — downloadable as an artifact).
 on:
+  push:
+    tags:
+      - "v*"
   workflow_dispatch:
+
+permissions:
+  contents: write   # needed for vpk to create/publish the GitHub Release
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -13,6 +22,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # vpk needs prior tags/releases to build deltas
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -23,6 +34,9 @@ jobs:
         run: |
           pip install -r requirements.txt
           pip install pyinstaller --upgrade
+
+      - name: Install Velopack CLI (vpk)
+        run: dotnet tool install -g vpk
 
       - name: Create .env from secrets
         run: |
@@ -37,9 +51,47 @@ jobs:
       - name: Build executable
         run: pyinstaller app-win.spec
 
-      - name: Upload artifact
+      # Tag push (v1.2.3) -> use the tag, stripped of the leading 'v'.
+      # Manual run -> fall back to the VERSION file.
+      - name: Resolve version
+        id: ver
+        shell: pwsh
+        run: |
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $v = "${{ github.ref_name }}" -replace '^v',''
+          } else {
+            $v = (Get-Content VERSION -Raw).Trim()
+          }
+          echo "version=$v" >> $env:GITHUB_OUTPUT
+          echo "Packaging version $v"
+
+      - name: Package with Velopack
+        run: >
+          vpk pack
+          --packId SOC_Report_Generator
+          --packVersion ${{ steps.ver.outputs.version }}
+          --packDir dist/SOC_Report_Generator
+          --mainExe SOC_Report_Generator.exe
+          --packTitle "SOC Report Generator"
+
+      # Only publish a Release on a real tag push. vpk first downloads the
+      # previous release to compute delta packages, then uploads Setup.exe +
+      # the full/delta .nupkg and updates the releases feed.
+      - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
+        run: >
+          vpk upload github
+          --repoUrl https://github.com/JennyHWAN/DIFY-frontend
+          --token ${{ secrets.GITHUB_TOKEN }}
+          --tag ${{ github.ref_name }}
+          --releaseName "SOC Report Generator ${{ steps.ver.outputs.version }}"
+          --publish
+
+      # For manual (non-tag) runs, expose the installer as a downloadable artifact.
+      - name: Upload installer artifact
+        if: github.ref_type != 'tag'
         uses: actions/upload-artifact@v4
         with:
-          name: SOC_Report_Generator
-          path: dist/SOC_Report_Generator/
+          name: SOC_Report_Generator-Setup
+          path: Releases/
           if-no-files-found: error

@@ -40,6 +40,53 @@ TEMPLATE_INDEX  = os.path.join(_TEMPLATE_BASE, "template_index.xlsx")
 _BUNDLED_AR_DIR = os.path.join(_TEMPLATE_BASE, "AR_template")
 _BUNDLED_MA_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
 
+# ── Auto-update (Velopack) ──────────────────────────────────────────────────────
+# The frozen exe is installed per-user via a Velopack Setup.exe and self-updates
+# from this repo's GitHub Releases. The UI checks for a newer release and *notifies*
+# the user (sidebar) — it never restarts on its own; the user clicks to apply.
+# All of this is inert in dev / when the app wasn't installed via Velopack.
+UPDATE_URL = "https://github.com/JennyHWAN/DIFY-frontend"
+
+
+def _read_app_version():
+    """Current build version from the bundled VERSION file, or None if absent."""
+    for base in (_TEMPLATE_BASE, getattr(_sys, "_MEIPASS", None)):
+        if not base:
+            continue
+        path = os.path.join(base, "VERSION")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    return fh.read().strip()
+            except Exception:
+                pass
+    return None
+
+
+def _update_manager():
+    import velopack
+    return velopack.UpdateManager(UPDATE_URL)
+
+
+def _check_for_update():
+    """Return UpdateInfo when a newer release exists, else None. Frozen builds only."""
+    if not getattr(_sys, "frozen", False):
+        return None
+    try:
+        return _update_manager().check_for_updates()
+    except Exception:
+        return None
+
+
+def _update_target_version(info):
+    """Best-effort version string from an UpdateInfo, or None (binding-version safe)."""
+    try:
+        rel = getattr(info, "target_full_release", None)
+        ver = getattr(rel, "version", None)
+        return str(ver) if ver else None
+    except Exception:
+        return None
+
 # EY keeps the authoritative MA/AR templates in the SharePoint library
 # "GCSOCR / Reporting files templates". Rather than ship static copies, the app can
 # pull the latest .docx straight from that library at startup so templates stay
@@ -559,6 +606,42 @@ with st.sidebar:
              else _sync_feishu_templates).clear()
             st.session_state.pop("_template_dirs", None)  # re-show the fetch loader
             st.rerun()
+
+    # ── Updates (only meaningful in the frozen, Velopack-installed build) ────────
+    if getattr(_sys, "frozen", False):
+        st.markdown("---")
+        _ver = _read_app_version()
+        if _ver:
+            st.caption(f"Version {_ver}")
+
+        # Check once automatically per session so the user is notified without
+        # having to click; the button below forces a fresh re-check on demand.
+        if "_update_info" not in st.session_state:
+            st.session_state["_update_info"] = _check_for_update()
+
+        if st.button("🔍 Check for updates", use_container_width=True):
+            st.session_state["_update_info"] = _check_for_update()
+            st.session_state["_update_checked"] = True
+            st.rerun()
+
+        _info = st.session_state.get("_update_info")
+        if _info:
+            _new = _update_target_version(_info)
+            st.info(f"🎉 Update available: **{_new}**" if _new
+                    else "🎉 A new version is available.")
+            # User-initiated apply: download then relaunch into the new version.
+            # The app restarts (the browser tab needs a refresh afterwards).
+            if st.button("⬇️ Download & install update", type="primary",
+                         use_container_width=True):
+                try:
+                    with st.spinner("Downloading update… the app will restart when ready."):
+                        _um = _update_manager()
+                        _um.download_updates(_info)
+                        _um.apply_updates_and_restart(_info)
+                except Exception as _e:
+                    st.error(f"Update failed: {_e}")
+        elif st.session_state.get("_update_checked"):
+            st.caption("✅ You're on the latest version.")
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
 main_done  = "main_outputs"  in st.session_state

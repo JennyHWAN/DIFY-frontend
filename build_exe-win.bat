@@ -18,7 +18,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo [1/3] Installing / upgrading dependencies...
+echo [1/4] Installing / upgrading dependencies...
 python -m pip install -r requirements.txt --trusted-host pypi.org --trusted-host files.pythonhosted.org
 python -m pip install pyinstaller --upgrade --trusted-host pypi.org --trusted-host files.pythonhosted.org
 if errorlevel 1 (
@@ -28,12 +28,12 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/3] Cleaning previous build artifacts...
+echo [2/4] Cleaning previous build artifacts...
 if exist C:\DIFY_build\dist   rmdir /s /q C:\DIFY_build\dist
 if exist C:\DIFY_build\work   rmdir /s /q C:\DIFY_build\work
 
 echo.
-echo [3/3] Building executable with PyInstaller...
+echo [3/4] Building executable with PyInstaller...
 :: Use a short output path to avoid Windows 260-char MAX_PATH limit.
 :: The project is inside a long OneDrive path; Streamlit's nested asset
 :: paths would otherwise exceed the limit when appended to dist\.
@@ -57,16 +57,39 @@ if exist MA_template (
     xcopy /E /I /Y MA_template C:\DIFY_build\dist\SOC_Report_Generator\MA_template >nul 2>&1
 )
 
+:: ── Package into a Velopack installer + update bundle ──────────────────────
+:: Produces C:\DIFY_build\Releases\SOC_Report_Generator-<ver>-Setup.exe (per-user,
+:: no-admin install) plus the .nupkg used by the in-app auto-updater. Requires the
+:: .NET SDK; `vpk` is the Velopack CLI (installed once as a global dotnet tool).
+echo.
+echo [4/4] Packaging installer with Velopack (vpk)...
+dotnet tool install -g vpk >nul 2>&1
+dotnet tool update  -g vpk >nul 2>&1
+set /p APPVER=<VERSION
+vpk pack --packId SOC_Report_Generator --packVersion %APPVER% ^
+    --packDir C:\DIFY_build\dist\SOC_Report_Generator ^
+    --mainExe SOC_Report_Generator.exe ^
+    --packTitle "SOC Report Generator" ^
+    --outputDir C:\DIFY_build\Releases
+if errorlevel 1 (
+    echo [ERROR] vpk pack failed. Is the .NET SDK installed? See output above.
+    pause
+    exit /b 1
+)
+
 echo.
 echo ============================================================
 echo  BUILD SUCCESSFUL
-echo  Output folder: C:\DIFY_build\dist\SOC_Report_Generator\
+echo  Installer: C:\DIFY_build\Releases\SOC_Report_Generator-%APPVER%-Setup.exe
 echo.
-echo  TO DISTRIBUTE TO USERS:
-echo    1. Copy the entire folder to the target machine
-echo    2. Double-click SOC_Report_Generator.exe
-echo    (API keys are baked in - no setup required by the user)
-echo    (Templates are included in the folder alongside the exe)
+echo  TO DISTRIBUTE TO USERS (first time):
+echo    1. Send them the Setup.exe above
+echo    2. They double-click it - installs to %%LocalAppData%% (no admin)
+echo    (API keys + templates are baked in - no setup required)
+echo.
+echo  UPDATES AFTER THAT ARE AUTOMATIC:
+echo    Publish a new GitHub Release (bump VERSION) and the app
+echo    self-updates on next launch.
 echo ============================================================
 echo.
 pause
