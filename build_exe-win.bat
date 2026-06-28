@@ -58,7 +58,7 @@ if exist MA_template (
 )
 
 :: ── Package into a Velopack installer + update bundle ──────────────────────
-:: Produces C:\DIFY_build\Releases\SOC_Report_Generator-<ver>-Setup.exe (per-user,
+:: Produces C:\DIFY_build\Releases\SOC_Report_Generator-win-Setup.exe (per-user,
 :: no-admin install) plus the .nupkg used by the in-app auto-updater. Requires the
 :: .NET SDK; `vpk` is the Velopack CLI (installed once as a global dotnet tool).
 echo.
@@ -80,7 +80,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  BUILD SUCCESSFUL
-echo  Installer: C:\DIFY_build\Releases\SOC_Report_Generator-%APPVER%-Setup.exe
+echo  Installer: C:\DIFY_build\Releases\SOC_Report_Generator-win-Setup.exe  (version %APPVER%)
 echo.
 echo  TO DISTRIBUTE TO USERS (first time):
 echo    1. Send them the Setup.exe above
