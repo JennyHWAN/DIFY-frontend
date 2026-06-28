@@ -46,6 +46,14 @@ _BUNDLED_MA_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
 # the user (sidebar) — it never restarts on its own; the user clicks to apply.
 # All of this is inert in dev / when the app wasn't installed via Velopack.
 UPDATE_URL = "https://github.com/JennyHWAN/DIFY-frontend"
+# Velopack reads the feed from {UPDATE_FEED_URL}/releases.<channel>.json. We point
+# it at GitHub's "latest release" download redirect (a plain github.com asset path)
+# via HttpSource rather than GithubSource. GithubSource queries api.github.com,
+# which on locked-down corporate networks returns 403/empty even when the release
+# downloads themselves work — Velopack then silently reports "no update". This
+# static path uses only github.com / githubusercontent.com, the same hosts the
+# installer downloads already use.
+UPDATE_FEED_URL = "https://github.com/JennyHWAN/DIFY-frontend/releases/latest/download"
 
 
 def _read_app_version():
@@ -65,10 +73,9 @@ def _read_app_version():
 
 def _update_manager():
     import velopack
-    # A bare URL string is treated by Velopack as an HttpSource (static file host),
-    # which does NOT work for GitHub Releases — the feed files live under release
-    # assets, not at the repo URL. GithubSource knows how to read the Releases API.
-    return velopack.UpdateManager(velopack.GithubSource(UPDATE_URL, None, False))
+    # HttpSource on the static "latest release" path — see UPDATE_FEED_URL note.
+    # Avoids api.github.com (GithubSource), which fails silently on some networks.
+    return velopack.UpdateManager(velopack.HttpSource(UPDATE_FEED_URL))
 
 
 def _check_for_update(raise_errors=False):
@@ -135,6 +142,14 @@ def _update_diagnostics():
         )
     except Exception:
         out["check_for_updates()"] = "EXCEPTION:\n" + traceback.format_exc()
+    # Independent probe via the app's own HTTP stack (the one Dify uses). If this
+    # reaches the feed but check_for_updates() returns None, the problem is inside
+    # Velopack's HTTP client, not the network.
+    try:
+        r = requests.get(UPDATE_FEED_URL + "/releases.win.json", timeout=15)
+        out["feed probe (requests)"] = f"HTTP {r.status_code}: {r.text[:160]}"
+    except Exception as e:
+        out["feed probe (requests)"] = f"ERROR: {e!r}"
     return out
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
