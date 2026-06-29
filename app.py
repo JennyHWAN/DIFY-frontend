@@ -67,13 +67,21 @@ def _install_corp_certs():
     (HttpSource). Fix: dump the Windows ROOT+CA stores to a PEM and point
     SSL_CERT_FILE / REQUESTS_CA_BUNDLE at it — `requests` and rustls-native-certs
     (Velopack) both consult SSL_CERT_FILE first. Must run before any TLS call.
-    No-op off Windows or if the env vars are already provided. Returns the PEM path.
+    No-op off Windows. If the machine already points SSL_CERT_FILE at a narrow
+    single-purpose bundle (e.g. an internal platform .cer), that cert is folded
+    into the combined bundle and we take over both vars — that bundle alone does
+    NOT contain the interception root, so leaving it in place keeps updates broken.
+    Override is safe: the only verified HTTPS here is the update feed (Dify uses
+    verify=False) and os.environ edits are process-local. Returns the PEM path.
     """
     if _sys.platform != "win32":
         return None
-    existing = os.environ.get("SSL_CERT_FILE")
-    if existing and os.environ.get("REQUESTS_CA_BUNDLE"):
-        return existing
+    target = os.path.join(tempfile.gettempdir(), "soc_winroots.pem")
+    # Streamlit re-runs app.py top-to-bottom on every interaction; once we've built
+    # the combined bundle and pointed the env at it, don't rebuild (re-reading our
+    # own bundle as the "prior" cert would grow it without bound).
+    if os.environ.get("SSL_CERT_FILE") == target and os.path.exists(target):
+        return target
     try:
         import ssl as _ssl
         import base64
@@ -91,12 +99,27 @@ def _install_corp_certs():
                 pass
         if not pems:
             return None
-        path = os.path.join(tempfile.gettempdir(), "soc_winroots.pem")
-        with open(path, "w", encoding="ascii") as fh:
+        # Preserve any cert the machine already trusted (PEM or DER), then add the
+        # full Windows store so github.com (re-signed by the corporate CA) verifies.
+        prior = os.environ.get("SSL_CERT_FILE") or os.environ.get("REQUESTS_CA_BUNDLE")
+        if prior and prior != target and os.path.exists(prior):
+            try:
+                with open(prior, "rb") as fh:
+                    raw = fh.read()
+                if b"BEGIN CERTIFICATE" in raw:
+                    pems.append(raw.decode("ascii", "ignore"))
+                else:  # DER-encoded single cert -> wrap as PEM
+                    b64 = base64.encodebytes(raw).decode("ascii")
+                    pems.append(
+                        "-----BEGIN CERTIFICATE-----\n" + b64 + "-----END CERTIFICATE-----\n"
+                    )
+            except Exception:
+                pass
+        with open(target, "w", encoding="ascii") as fh:
             fh.write("".join(pems))
-        os.environ.setdefault("SSL_CERT_FILE", path)
-        os.environ.setdefault("REQUESTS_CA_BUNDLE", path)
-        return path
+        os.environ["SSL_CERT_FILE"] = target
+        os.environ["REQUESTS_CA_BUNDLE"] = target
+        return target
     except Exception:
         return None
 
