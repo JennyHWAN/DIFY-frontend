@@ -56,6 +56,55 @@ UPDATE_URL = "https://github.com/JennyHWAN/DIFY-frontend"
 UPDATE_FEED_URL = "https://github.com/JennyHWAN/DIFY-frontend/releases/latest/download"
 
 
+def _install_corp_certs():
+    """Make HTTPS trust whatever Windows trusts (incl. a corporate interception CA).
+
+    On a TLS-inspecting corporate network (e.g. EY) the proxy re-signs HTTPS with
+    an internal root CA. Windows has that CA in its system store, so browsers work,
+    but the frozen app's *bundled* trust stores don't: Python's certifi (for
+    `requests`) and Velopack's Rust TLS both reject the cert as 'UnknownIssuer',
+    which is why the update feed silently failed (GithubSource) then errored
+    (HttpSource). Fix: dump the Windows ROOT+CA stores to a PEM and point
+    SSL_CERT_FILE / REQUESTS_CA_BUNDLE at it — `requests` and rustls-native-certs
+    (Velopack) both consult SSL_CERT_FILE first. Must run before any TLS call.
+    No-op off Windows or if the env vars are already provided. Returns the PEM path.
+    """
+    if _sys.platform != "win32":
+        return None
+    existing = os.environ.get("SSL_CERT_FILE")
+    if existing and os.environ.get("REQUESTS_CA_BUNDLE"):
+        return existing
+    try:
+        import ssl as _ssl
+        import base64
+        pems = []
+        for store in ("ROOT", "CA"):
+            try:
+                for der, enc, _trust in _ssl.enum_certificates(store):
+                    if enc != "x509_asn":
+                        continue
+                    b64 = base64.encodebytes(der).decode("ascii")
+                    pems.append(
+                        "-----BEGIN CERTIFICATE-----\n" + b64 + "-----END CERTIFICATE-----\n"
+                    )
+            except Exception:
+                pass
+        if not pems:
+            return None
+        path = os.path.join(tempfile.gettempdir(), "soc_winroots.pem")
+        with open(path, "w", encoding="ascii") as fh:
+            fh.write("".join(pems))
+        os.environ.setdefault("SSL_CERT_FILE", path)
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", path)
+        return path
+    except Exception:
+        return None
+
+
+# Run once at import, before Velopack or requests open any HTTPS connection.
+_CORP_CA_BUNDLE = _install_corp_certs()
+
+
 def _read_app_version():
     """Current build version from the bundled VERSION file, or None if absent."""
     for base in (_TEMPLATE_BASE, getattr(_sys, "_MEIPASS", None)):
@@ -119,6 +168,12 @@ def _update_diagnostics():
         "UPDATE_URL": UPDATE_URL,
         "frozen": bool(getattr(_sys, "frozen", False)),
         "VERSION file (sidebar label)": _read_app_version(),
+        "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE") or "(unset)",
+        "corp CA bundle": (
+            f"{_CORP_CA_BUNDLE} ({os.path.getsize(_CORP_CA_BUNDLE)} bytes)"
+            if _CORP_CA_BUNDLE and os.path.exists(_CORP_CA_BUNDLE)
+            else "(none)"
+        ),
     }
     try:
         um = _update_manager()
