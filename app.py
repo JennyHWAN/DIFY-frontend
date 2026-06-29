@@ -261,7 +261,13 @@ def _apply_update(asset):
     if not info:
         raise RuntimeError("Staged package was not recognized as an update.")
     um.download_updates(info)
-    um.apply_updates_and_restart(info)
+    # apply_updates_and_restart() DEADLOCKS inside the embedded Streamlit server:
+    # Velopack spawns its updater, which waits for this PID to exit before it can
+    # replace files — but the call blocks in the script-run thread, so the process
+    # never exits and both sides wait forever. Instead schedule the apply+restart
+    # for *after* we exit (non-blocking), then hard-exit so the updater proceeds.
+    um.wait_exit_then_apply_updates(info, silent=False, restart=True)
+    os._exit(0)
 
 
 def _update_diagnostics():
@@ -878,9 +884,13 @@ with st.sidebar:
             if st.button("⬇️ Download & install update", type="primary",
                          use_container_width=True):
                 try:
-                    with st.spinner("Downloading update… the app will restart when ready."):
+                    with st.spinner("Downloading update… the app will close and "
+                                    "reopen automatically. This tab will disconnect — "
+                                    "wait a few seconds for the new window."):
                         # Download via requests (works behind corp TLS) and let
                         # Velopack apply the local package — see _apply_update.
+                        # This call does not return (it hard-exits to let the
+                        # Velopack updater replace files and relaunch).
                         _apply_update(_info)
                 except Exception as _e:
                     st.error(f"Update failed: {_e}")
