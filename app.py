@@ -170,13 +170,25 @@ def _ver_tuple(s):
 
 
 def _fetch_release_feed():
-    """Download releases.<channel>.json via requests (works behind corp TLS)."""
-    r = requests.get(
-        f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json",
-        timeout=30, headers=_UPDATE_UA,
-    )
-    r.raise_for_status()
-    return r.json()
+    """Download releases.<channel>.json via requests (works behind corp TLS).
+
+    EY's proxy occasionally read-times-out on the github.com -> objects.github
+    userconnect redirect even though the feed is reachable (detection works, then
+    the apply re-fetch stalls). Use a generous read timeout and retry a few times
+    with backoff so a single slow response doesn't fail the whole update.
+    """
+    url = f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json"
+    last = None
+    for attempt in range(4):
+        try:
+            r = requests.get(url, timeout=(30, 90), headers=_UPDATE_UA)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            last = e
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+    raise last
 
 
 def _latest_full_asset(feed):
@@ -265,13 +277,28 @@ def _apply_update(asset):
         json.dump(local_feed, fh)
 
     fn = full["FileName"]
-    _update_log(f"apply: downloading {fn}")
-    with requests.get(f"{UPDATE_FEED_URL}/{fn}", timeout=(30, 1800),
-                      headers=_UPDATE_UA, stream=True) as resp:
-        resp.raise_for_status()
-        with open(os.path.join(staging, fn), "wb") as fh:
-            for chunk in resp.iter_content(65536):
-                fh.write(chunk)
+    dest = os.path.join(staging, fn)
+    # Retry the package download too — same flaky-proxy read-timeout can hit here.
+    # A failed attempt just leaves a partial file we overwrite on the next try.
+    last = None
+    for attempt in range(4):
+        try:
+            _update_log(f"apply: downloading {fn} (attempt {attempt + 1})")
+            with requests.get(f"{UPDATE_FEED_URL}/{fn}", timeout=(30, 1800),
+                              headers=_UPDATE_UA, stream=True) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as fh:
+                    for chunk in resp.iter_content(65536):
+                        fh.write(chunk)
+            last = None
+            break
+        except requests.exceptions.RequestException as e:
+            last = e
+            _update_log(f"apply: download failed: {e!r}")
+            if attempt < 3:
+                time.sleep(2 * (attempt + 1))
+    if last is not None:
+        raise last
     _update_log("apply: download complete")
 
     um = _update_manager(staging)  # local file source — no network/TLS
