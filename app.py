@@ -225,6 +225,21 @@ def _update_target_version(info):
         return None
 
 
+def _update_log(msg):
+    """Append a timestamped line to update.log next to the exe (temp in dev).
+
+    The apply/restart happens partly outside our process (Velopack's Update.exe),
+    so a UI spinner can't show where it stalls. This log is the only way to tell
+    download vs. apply vs. relaunch apart after the fact.
+    """
+    try:
+        d = os.path.dirname(_sys.executable) if getattr(_sys, "frozen", False) else tempfile.gettempdir()
+        with open(os.path.join(d, "update.log"), "a", encoding="utf-8") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
+    except Exception:
+        pass
+
+
 def _apply_update(asset):
     """Stage the full package locally via requests, then let Velopack apply it.
 
@@ -234,6 +249,7 @@ def _apply_update(asset):
     UpdateManager at it, and run the normal download/apply/restart. Velopack still
     verifies the package SHA against the index, so integrity is preserved.
     """
+    _update_log(f"apply: start, target={_update_target_version(asset)}")
     staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging, exist_ok=True)
@@ -249,86 +265,31 @@ def _apply_update(asset):
         json.dump(local_feed, fh)
 
     fn = full["FileName"]
+    _update_log(f"apply: downloading {fn}")
     with requests.get(f"{UPDATE_FEED_URL}/{fn}", timeout=(30, 1800),
                       headers=_UPDATE_UA, stream=True) as resp:
         resp.raise_for_status()
         with open(os.path.join(staging, fn), "wb") as fh:
             for chunk in resp.iter_content(65536):
                 fh.write(chunk)
+    _update_log("apply: download complete")
 
     um = _update_manager(staging)  # local file source — no network/TLS
     info = um.check_for_updates()
     if not info:
         raise RuntimeError("Staged package was not recognized as an update.")
+    _update_log("apply: download_updates (Velopack copies nupkg into install)")
     um.download_updates(info)
     # apply_updates_and_restart() DEADLOCKS inside the embedded Streamlit server:
     # Velopack spawns its updater, which waits for this PID to exit before it can
     # replace files — but the call blocks in the script-run thread, so the process
     # never exits and both sides wait forever. Instead schedule the apply+restart
     # for *after* we exit (non-blocking), then hard-exit so the updater proceeds.
+    _update_log("apply: spawning Velopack updater (wait_exit_then_apply_updates)")
     um.wait_exit_then_apply_updates(info, silent=False, restart=True)
+    _update_log("apply: updater spawned, hard-exiting now")
     os._exit(0)
 
-
-def _update_diagnostics():
-    """Collect exactly what Velopack reports, for debugging update problems.
-
-    Returns a dict of label -> value/error string. Distinguishes the local build
-    version (VERSION file) from the version Velopack actually recorded at install
-    time (get_current_version) — a mismatch there explains "I'm on the latest"
-    when you think you're on an older build.
-    """
-    out = {
-        "UPDATE_URL": UPDATE_URL,
-        "frozen": bool(getattr(_sys, "frozen", False)),
-        "VERSION file (sidebar label)": _read_app_version(),
-        "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE") or "(unset)",
-        "corp CA bundle": (
-            f"{_CORP_CA_BUNDLE} ({os.path.getsize(_CORP_CA_BUNDLE)} bytes)"
-            if _CORP_CA_BUNDLE and os.path.exists(_CORP_CA_BUNDLE)
-            else "(none)"
-        ),
-    }
-    try:
-        um = _update_manager()
-    except Exception as e:
-        out["UpdateManager()"] = f"ERROR: {e!r}"
-        return out
-    for label, fn in (
-        ("get_current_version()", um.get_current_version),
-        ("get_app_id()", um.get_app_id),
-        ("get_is_portable()", um.get_is_portable),
-        ("get_update_pending_restart()", um.get_update_pending_restart),
-    ):
-        try:
-            out[label] = fn()
-        except Exception as e:
-            out[label] = f"ERROR: {e!r}"
-    # Velopack's own HTTP fetch — expected to FAIL behind EY's TLS interception
-    # (UnknownIssuer); kept here only to confirm that's still the case. The real
-    # detection path is the requests-based one below.
-    try:
-        info = um.check_for_updates()
-        out["check_for_updates() [velopack HTTP, unused]"] = (
-            f"update -> {_update_target_version(info)}" if info else "None (no update)"
-        )
-    except Exception:
-        out["check_for_updates() [velopack HTTP, unused]"] = "EXCEPTION:\n" + traceback.format_exc()
-    # The active detection path: read the feed with requests (honors SSL_CERT_FILE)
-    # and compare versions ourselves. This is what the sidebar actually uses.
-    try:
-        r = requests.get(f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json",
-                         timeout=15, headers=_UPDATE_UA)
-        out["feed probe (requests)"] = f"HTTP {r.status_code}: {r.text[:160]}"
-    except Exception as e:
-        out["feed probe (requests)"] = f"ERROR: {e!r}"
-    try:
-        latest = (_latest_full_asset(_fetch_release_feed()) or {}).get("Version") or "(none)"
-        out["latest full (via requests)"] = latest
-        out["update available?"] = _ver_tuple(latest) > _ver_tuple(_current_version())
-    except Exception as e:
-        out["latest full (via requests)"] = f"ERROR: {e!r}"
-    return out
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
 # "GCSOCR / Reporting files templates". Rather than ship static copies, the app can
@@ -884,9 +845,7 @@ with st.sidebar:
             if st.button("⬇️ Download & install update", type="primary",
                          use_container_width=True):
                 try:
-                    with st.spinner("Downloading update… the app will close and "
-                                    "reopen automatically. This tab will disconnect — "
-                                    "wait a few seconds for the new window."):
+                    with st.spinner("Updating… the app will restart automatically."):
                         # Download via requests (works behind corp TLS) and let
                         # Velopack apply the local package — see _apply_update.
                         # This call does not return (it hard-exits to let the
@@ -898,16 +857,6 @@ with st.sidebar:
             st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
         elif st.session_state.get("_update_checked"):
             st.caption("✅ You're on the latest version.")
-
-        # Diagnostics: shows what Velopack actually reports (installed version,
-        # app id, portable flag, raw check result). Compare get_current_version()
-        # to the latest GitHub release to see whether an update *should* be found.
-        with st.expander("🔧 Update diagnostics"):
-            if st.button("Run diagnostics", use_container_width=True):
-                st.session_state["_update_diag"] = _update_diagnostics()
-            _diag = st.session_state.get("_update_diag")
-            if _diag:
-                st.json(_diag)
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
 main_done  = "main_outputs"  in st.session_state

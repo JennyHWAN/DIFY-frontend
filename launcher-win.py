@@ -59,6 +59,16 @@ def main():
 
     app_file = os.path.join(base_dir, "app.py")
 
+    # Trace launches into update.log (same file app._apply_update writes) so a
+    # post-update relaunch is visible: if this line appears after "apply: updater
+    # spawned", Velopack restarted us successfully.
+    if getattr(sys, "frozen", False):
+        try:
+            with open(os.path.join(exe_dir, "update.log"), "a", encoding="utf-8") as _f:
+                _f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} launcher: started, argv={sys.argv[1:]}\n")
+        except Exception:
+            pass
+
     # Load API keys: compiled-in module when frozen, .env file in development.
     if getattr(sys, "frozen", False):
         import _bundled_config
