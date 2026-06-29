@@ -143,24 +143,72 @@ def _read_app_version():
     return None
 
 
-def _update_manager():
+def _update_manager(source=None):
+    """Velopack UpdateManager. Local calls (version / app-id) and applying a
+    *locally staged* package work fine; only Velopack's own HTTP fetch is unusable
+    behind EY's TLS interception — its bundled Rust TLS ignores SSL_CERT_FILE and
+    rejects the corporate cert as UnknownIssuer (while `requests`, which honors the
+    env var, works). So detection + download go through requests and Velopack only
+    applies a local file source. `source` defaults to the HttpSource (used solely
+    for the local-only get_current_version call); pass a directory for the apply.
+    """
     import velopack
-    # HttpSource on the static "latest release" path — see UPDATE_FEED_URL note.
-    # Avoids api.github.com (GithubSource), which fails silently on some networks.
-    return velopack.UpdateManager(velopack.HttpSource(UPDATE_FEED_URL))
+    if source is None:
+        source = velopack.HttpSource(UPDATE_FEED_URL)
+    return velopack.UpdateManager(source)
+
+
+# A plain UA avoids any "python-requests" bot filtering; the channel matches the
+# vpk build channel (releases.win.json).
+_UPDATE_UA = {"User-Agent": "SOC-Report-Generator-Updater"}
+_UPDATE_CHANNEL = "win"
+
+
+def _ver_tuple(s):
+    """'1.0.10' -> (1, 0, 10) for ordering; non-numeric parts are ignored."""
+    return tuple(int(n) for n in re.findall(r"\d+", str(s or ""))) or (0,)
+
+
+def _fetch_release_feed():
+    """Download releases.<channel>.json via requests (works behind corp TLS)."""
+    r = requests.get(
+        f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json",
+        timeout=30, headers=_UPDATE_UA,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _latest_full_asset(feed):
+    """Highest-version full-package entry in the feed, or None."""
+    fulls = [a for a in feed.get("Assets", []) if a.get("Type") == "Full"]
+    return max(fulls, key=lambda a: _ver_tuple(a.get("Version")), default=None)
+
+
+def _current_version():
+    """Version Velopack recorded at install (local call, no network)."""
+    try:
+        return _update_manager().get_current_version()
+    except Exception:
+        return _read_app_version()
 
 
 def _check_for_update(raise_errors=False):
-    """Return UpdateInfo when a newer release exists, else None. Frozen builds only.
+    """Return the latest full-package asset dict if newer than installed, else None.
 
-    With raise_errors=True the underlying exception propagates so the manual
-    "Check for updates" button can show *why* it failed instead of silently
-    reporting "up to date" (which is what hid the GithubSource bug originally).
+    Frozen builds only. Uses requests rather than Velopack's HTTP client so it
+    works behind corporate TLS interception. raise_errors=True surfaces the real
+    failure to the "Check for updates" button instead of a misleading "up to date".
     """
     if not getattr(_sys, "frozen", False):
         return None
     try:
-        return _update_manager().check_for_updates()
+        asset = _latest_full_asset(_fetch_release_feed())
+        if not asset:
+            return None
+        if _ver_tuple(asset.get("Version")) > _ver_tuple(_current_version()):
+            return asset
+        return None
     except Exception:
         if raise_errors:
             raise
@@ -168,15 +216,52 @@ def _check_for_update(raise_errors=False):
 
 
 def _update_target_version(info):
-    """Best-effort version string from an UpdateInfo, or None.
-
-    Velopack's pyo3 bindings expose PascalCase properties
-    (info.TargetFullRelease.Version), not snake_case.
-    """
+    """Version string from a _check_for_update asset dict (or a Velopack UpdateInfo)."""
+    if isinstance(info, dict):
+        return info.get("Version")
     try:
         return str(info.TargetFullRelease.Version)
     except Exception:
         return None
+
+
+def _apply_update(asset):
+    """Stage the full package locally via requests, then let Velopack apply it.
+
+    Velopack's downloader can't reach GitHub behind EY's TLS interception, but it
+    applies a *local directory* source with no TLS. So download the full .nupkg
+    plus a Full-only releases index into a temp dir, point a file-source
+    UpdateManager at it, and run the normal download/apply/restart. Velopack still
+    verifies the package SHA against the index, so integrity is preserved.
+    """
+    staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+
+    # Write a local index listing ONLY the full package we staged, so Velopack
+    # never looks for delta files we didn't download.
+    feed = _fetch_release_feed()
+    full = _latest_full_asset(feed) or asset
+    local_feed = dict(feed)
+    local_feed["Assets"] = [full]
+    with open(os.path.join(staging, f"releases.{_UPDATE_CHANNEL}.json"),
+              "w", encoding="utf-8") as fh:
+        json.dump(local_feed, fh)
+
+    fn = full["FileName"]
+    with requests.get(f"{UPDATE_FEED_URL}/{fn}", timeout=(30, 1800),
+                      headers=_UPDATE_UA, stream=True) as resp:
+        resp.raise_for_status()
+        with open(os.path.join(staging, fn), "wb") as fh:
+            for chunk in resp.iter_content(65536):
+                fh.write(chunk)
+
+    um = _update_manager(staging)  # local file source — no network/TLS
+    info = um.check_for_updates()
+    if not info:
+        raise RuntimeError("Staged package was not recognized as an update.")
+    um.download_updates(info)
+    um.apply_updates_and_restart(info)
 
 
 def _update_diagnostics():
@@ -213,21 +298,30 @@ def _update_diagnostics():
             out[label] = fn()
         except Exception as e:
             out[label] = f"ERROR: {e!r}"
+    # Velopack's own HTTP fetch — expected to FAIL behind EY's TLS interception
+    # (UnknownIssuer); kept here only to confirm that's still the case. The real
+    # detection path is the requests-based one below.
     try:
         info = um.check_for_updates()
-        out["check_for_updates()"] = (
+        out["check_for_updates() [velopack HTTP, unused]"] = (
             f"update -> {_update_target_version(info)}" if info else "None (no update)"
         )
     except Exception:
-        out["check_for_updates()"] = "EXCEPTION:\n" + traceback.format_exc()
-    # Independent probe via the app's own HTTP stack (the one Dify uses). If this
-    # reaches the feed but check_for_updates() returns None, the problem is inside
-    # Velopack's HTTP client, not the network.
+        out["check_for_updates() [velopack HTTP, unused]"] = "EXCEPTION:\n" + traceback.format_exc()
+    # The active detection path: read the feed with requests (honors SSL_CERT_FILE)
+    # and compare versions ourselves. This is what the sidebar actually uses.
     try:
-        r = requests.get(UPDATE_FEED_URL + "/releases.win.json", timeout=15)
+        r = requests.get(f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json",
+                         timeout=15, headers=_UPDATE_UA)
         out["feed probe (requests)"] = f"HTTP {r.status_code}: {r.text[:160]}"
     except Exception as e:
         out["feed probe (requests)"] = f"ERROR: {e!r}"
+    try:
+        latest = (_latest_full_asset(_fetch_release_feed()) or {}).get("Version") or "(none)"
+        out["latest full (via requests)"] = latest
+        out["update available?"] = _ver_tuple(latest) > _ver_tuple(_current_version())
+    except Exception as e:
+        out["latest full (via requests)"] = f"ERROR: {e!r}"
     return out
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
@@ -785,9 +879,9 @@ with st.sidebar:
                          use_container_width=True):
                 try:
                     with st.spinner("Downloading update… the app will restart when ready."):
-                        _um = _update_manager()
-                        _um.download_updates(_info)
-                        _um.apply_updates_and_restart(_info)
+                        # Download via requests (works behind corp TLS) and let
+                        # Velopack apply the local package — see _apply_update.
+                        _apply_update(_info)
                 except Exception as _e:
                     st.error(f"Update failed: {_e}")
         elif st.session_state.get("_update_error"):
