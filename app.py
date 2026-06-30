@@ -11,6 +11,7 @@ import time
 import random
 import shutil
 import subprocess
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import xml.etree.ElementTree as ET
 from copy import deepcopy
@@ -163,6 +164,15 @@ def _update_manager(source=None):
 _UPDATE_UA = {"User-Agent": "SOC-Report-Generator-Updater"}
 _UPDATE_CHANNEL = "win"
 
+# Serialize the apply across Streamlit script runs. The download blocks one run's
+# thread for many minutes; over a flaky corporate network the websocket reconnects
+# and Streamlit spawns fresh runs that, seeing _do_update still set, would each
+# launch another downloader into the same staging file — they append over each
+# other (byte counts go backwards, file grows past its real size) and every resume
+# Range then 416s. This module-level lock (shared by all runs in the one server
+# process) guarantees a single downloader.
+_UPDATE_LOCK = threading.Lock()
+
 
 def _ver_tuple(s):
     """'1.0.10' -> (1, 0, 10) for ordering; non-numeric parts are ignored."""
@@ -266,17 +276,47 @@ def _download_asset(asset, dest):
     expected = asset.get("Size") or 0
     url = f"{UPDATE_FEED_URL}/{fn}"
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
+    if expected and got >= expected:
+        if got > expected:
+            # Oversize partial = corrupt (an earlier bug let concurrent writers
+            # append past EOF). Resuming would only 416; start over.
+            try:
+                os.remove(dest)
+            except Exception:
+                pass
+            got = 0
+        else:
+            # Exactly the expected size: assume complete (Velopack SHA-checks it).
+            _update_log(f"apply: {fn} already complete ({got} bytes)")
+            return
+    # Retry budget is by CONSECUTIVE no-progress failures, not total attempts:
+    # EY's proxy drops the connection every ~30 MB, so a 95 MB download legitimately
+    # needs many resumes. As long as each resume advances the byte count we keep
+    # going; we only give up after several breaks in a row that gain nothing.
     last = None
-    for attempt in range(8):
+    stalls = 0
+    while stalls < 6:
+        before = got
         try:
             headers = dict(_UPDATE_UA)
             if got:
                 headers["Range"] = f"bytes={got}-"
-            _update_log(f"apply: downloading {fn} (attempt {attempt + 1}, "
-                        f"from {got}, expected {expected} bytes)")
+            _update_log(f"apply: downloading {fn} (from {got}, "
+                        f"expected {expected} bytes)")
             next_mark = got + 10 * 1024 * 1024
             with requests.get(url, timeout=(30, 120), headers=headers,
                               stream=True) as resp:
+                # 416 = our partial is >= the server's size (corrupt/oversize).
+                # Drop it and restart from zero on the next attempt.
+                if resp.status_code == 416:
+                    _update_log(f"apply: {fn} range rejected (416) — restarting from 0")
+                    try:
+                        os.remove(dest)
+                    except Exception:
+                        pass
+                    got = 0
+                    last = IOError("range not satisfiable; restarted from 0")
+                    continue
                 # 206 = server honoured the Range; 200 = it ignored it and is
                 # sending the whole file, so start the file over from zero.
                 if got and resp.status_code == 200:
@@ -297,9 +337,11 @@ def _download_asset(asset, dest):
         except (requests.exceptions.RequestException, IOError) as e:
             last = e
             got = os.path.getsize(dest) if os.path.exists(dest) else 0
-            _update_log(f"apply: download interrupted at {got} bytes: {e!r}")
-            if attempt < 7:
-                time.sleep(2 * (attempt + 1))
+            # Reset the budget whenever the connection gained ground this round.
+            stalls = 0 if got > before else stalls + 1
+            _update_log(f"apply: download interrupted at {got} bytes "
+                        f"(stall {stalls}/6): {e!r}")
+            time.sleep(2 * min(stalls + 1, 5))
     raise last
 
 
@@ -360,40 +402,54 @@ def _apply_update(asset):
     files and Velopack reconstructs the new version from the installed base + the
     delta(s). If no usable delta chain exists, or the delta apply is rejected,
     fall back to the full .nupkg (the previous, always-works behaviour).
+
+    Serialized by _UPDATE_LOCK: if another run is already applying (e.g. a websocket
+    reconnect re-triggered the takeover), this returns immediately rather than
+    starting a competing downloader. On success it never returns (hard-exit); on
+    failure it releases the lock so the user can retry.
     """
-    _update_log(f"apply: start, target={_update_target_version(asset)}")
-    staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
-    feed = _fetch_release_feed()
-    full = _latest_full_asset(feed) or asset
-    target = _ver_tuple(full.get("Version"))
-    current = _ver_tuple(_current_version())
+    if not _UPDATE_LOCK.acquire(blocking=False):
+        _update_log("apply: another apply already running; ignoring duplicate trigger")
+        return
+    try:
+        _update_log(f"apply: start, target={_update_target_version(asset)}")
+        staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
+        feed = _fetch_release_feed()
+        full = _latest_full_asset(feed) or asset
+        target = _ver_tuple(full.get("Version"))
+        current = _ver_tuple(_current_version())
 
-    # Velopack emits one delta per release (each diffs from the immediately prior
-    # version), so the chain that upgrades the installed version to the target is
-    # every delta with current < Version <= target.
-    deltas = sorted(
-        (a for a in feed.get("Assets", [])
-         if a.get("Type") == "Delta"
-         and current < _ver_tuple(a.get("Version")) <= target),
-        key=lambda a: _ver_tuple(a.get("Version")))
-    delta_total = sum(a.get("Size") or 0 for a in deltas)
-    full_size = full.get("Size") or 0
+        # Velopack emits one delta per release (each diffs from the immediately
+        # prior version), so the chain that upgrades the installed version to the
+        # target is every delta with current < Version <= target.
+        deltas = sorted(
+            (a for a in feed.get("Assets", [])
+             if a.get("Type") == "Delta"
+             and current < _ver_tuple(a.get("Version")) <= target),
+            key=lambda a: _ver_tuple(a.get("Version")))
+        delta_total = sum(a.get("Size") or 0 for a in deltas)
+        full_size = full.get("Size") or 0
 
-    # Only worth it if deltas exist and are actually smaller than the full package.
-    if deltas and (not full_size or delta_total < full_size):
-        try:
-            _update_log(f"apply: delta path — {len(deltas)} delta(s), "
-                        f"{delta_total} bytes vs full {full_size} bytes")
-            # The index lists the deltas plus the target Full (Velopack needs its
-            # metadata to plan the chain), but we stage only the delta files;
-            # Velopack assembles the new version locally and never fetches the full.
-            _stage_and_apply(staging, feed, deltas, deltas + [full])
-            return  # not reached — _stage_and_apply hard-exits on success
-        except Exception as e:
-            _update_log(f"apply: delta path failed ({e!r}); falling back to full")
+        # Only worth it if deltas exist and are actually smaller than the full.
+        if deltas and (not full_size or delta_total < full_size):
+            try:
+                _update_log(f"apply: delta path — {len(deltas)} delta(s), "
+                            f"{delta_total} bytes vs full {full_size} bytes")
+                # The index lists the deltas plus the target Full (Velopack needs
+                # its metadata to plan the chain), but we stage only the delta
+                # files; Velopack assembles the new version locally and never
+                # fetches the full.
+                _stage_and_apply(staging, feed, deltas, deltas + [full])
+                return  # not reached — _stage_and_apply hard-exits on success
+            except Exception as e:
+                _update_log(f"apply: delta path failed ({e!r}); falling back to full")
 
-    _update_log(f"apply: full path — {full_size} bytes")
-    _stage_and_apply(staging, feed, [full], [full])
+        _update_log(f"apply: full path — {full_size} bytes")
+        _stage_and_apply(staging, feed, [full], [full])
+    finally:
+        # Reached only if the apply failed (success hard-exits the process). Free
+        # the lock so the user can click "Download & install update" again.
+        _UPDATE_LOCK.release()
 
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
@@ -966,15 +1022,18 @@ with st.sidebar:
         # Check once automatically per session so the user is notified without
         # having to click; the button below forces a fresh re-check on demand.
         if "_update_info" not in st.session_state:
-            st.session_state["_update_info"] = _check_for_update()
+            with st.spinner("Checking for updates…"):
+                st.session_state["_update_info"] = _check_for_update()
 
         if st.button("🔍 Check for updates", use_container_width=True):
             st.session_state["_update_checked"] = True
             st.session_state.pop("_update_error", None)
             try:
                 # raise on failure so the user sees the real reason instead of a
-                # misleading "up to date".
-                st.session_state["_update_info"] = _check_for_update(raise_errors=True)
+                # misleading "up to date". The fetch can take a while on a slow
+                # network (retries), so show a spinner while it runs.
+                with st.spinner("Checking for updates…"):
+                    st.session_state["_update_info"] = _check_for_update(raise_errors=True)
             except Exception as _e:
                 st.session_state["_update_info"] = None
                 st.session_state["_update_error"] = str(_e)
