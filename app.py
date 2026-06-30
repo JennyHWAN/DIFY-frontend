@@ -252,40 +252,19 @@ def _update_log(msg):
         pass
 
 
-def _apply_update(asset):
-    """Stage the full package locally via requests, then let Velopack apply it.
+def _download_asset(asset, dest):
+    """Resumable, retried download of one release asset to `dest` via requests.
 
-    Velopack's downloader can't reach GitHub behind EY's TLS interception, but it
-    applies a *local directory* source with no TLS. So download the full .nupkg
-    plus a Full-only releases index into a temp dir, point a file-source
-    UpdateManager at it, and run the normal download/apply/restart. Velopack still
-    verifies the package SHA against the index, so integrity is preserved.
+    EY's proxy tends to stall large transfers part way through, so rather than
+    restart from zero each time we keep the partial file and resume with an HTTP
+    Range request. The read timeout is PER-CHUNK (reset on each chunk), so a short
+    value only trips on a true stall — which then raises and lets us resume,
+    instead of the old 1800s hang. Progress is logged every ~10 MB so update.log
+    shows whether bytes are actually flowing.
     """
-    _update_log(f"apply: start, target={_update_target_version(asset)}")
-    staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
-    shutil.rmtree(staging, ignore_errors=True)
-    os.makedirs(staging, exist_ok=True)
-
-    # Write a local index listing ONLY the full package we staged, so Velopack
-    # never looks for delta files we didn't download.
-    feed = _fetch_release_feed()
-    full = _latest_full_asset(feed) or asset
-    local_feed = dict(feed)
-    local_feed["Assets"] = [full]
-    with open(os.path.join(staging, f"releases.{_UPDATE_CHANNEL}.json"),
-              "w", encoding="utf-8") as fh:
-        json.dump(local_feed, fh)
-
-    fn = full["FileName"]
-    dest = os.path.join(staging, fn)
-    expected = full.get("Size") or 0
+    fn = asset["FileName"]
+    expected = asset.get("Size") or 0
     url = f"{UPDATE_FEED_URL}/{fn}"
-    # Resumable, retried download. EY's proxy tends to stall large transfers part
-    # way through, so rather than restart from zero each time we keep the partial
-    # file and resume with an HTTP Range request. The read timeout is PER-CHUNK
-    # (reset on each chunk), so a short value only trips on a true stall — which
-    # then raises and lets us resume, instead of the old 1800s hang. Progress is
-    # logged every ~10 MB so update.log shows whether bytes are actually flowing.
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
     last = None
     for attempt in range(8):
@@ -313,24 +292,55 @@ def _apply_update(asset):
                             next_mark += 10 * 1024 * 1024
             if expected and got < expected:
                 raise IOError(f"short read: got {got} of {expected} bytes")
-            last = None
-            break
+            _update_log(f"apply: {fn} complete ({got} bytes)")
+            return
         except (requests.exceptions.RequestException, IOError) as e:
             last = e
             got = os.path.getsize(dest) if os.path.exists(dest) else 0
             _update_log(f"apply: download interrupted at {got} bytes: {e!r}")
             if attempt < 7:
                 time.sleep(2 * (attempt + 1))
-    if last is not None:
-        raise last
-    _update_log(f"apply: download complete ({got} bytes)")
+    raise last
+
+
+def _stage_and_apply(staging, feed, download_assets, index_assets):
+    """Download `download_assets` into a fresh `staging` dir, write a local release
+    index listing `index_assets`, then let Velopack apply the local package.
+
+    Velopack's downloader can't reach GitHub behind EY's TLS interception, but it
+    applies a *local directory* source with no TLS — so we stage the files with
+    requests and point a file-source UpdateManager at the dir. Velopack still
+    verifies the package SHA against the index, so integrity is preserved.
+
+    Does NOT return on success — it hard-exits so Velopack's out-of-process
+    updater can replace files and relaunch. Raises on any failure so the caller
+    can fall back (delta -> full).
+    """
+    shutil.rmtree(staging, ignore_errors=True)
+    os.makedirs(staging, exist_ok=True)
+    local_feed = dict(feed)
+    local_feed["Assets"] = index_assets
+    with open(os.path.join(staging, f"releases.{_UPDATE_CHANNEL}.json"),
+              "w", encoding="utf-8") as fh:
+        json.dump(local_feed, fh)
+    for a in download_assets:
+        _download_asset(a, os.path.join(staging, a["FileName"]))
 
     um = _update_manager(staging)  # local file source — no network/TLS
     info = um.check_for_updates()
     if not info:
         raise RuntimeError("Staged package was not recognized as an update.")
-    _update_log("apply: download_updates (Velopack copies nupkg into install)")
+    _update_log("apply: download_updates (Velopack assembles nupkg into install)")
     um.download_updates(info)
+    # Leave a marker the launcher reads on the next start: it means "this launch is
+    # a post-update relaunch", so the launcher skips opening a *new* browser window
+    # (the user's existing tab reconnects to the restarted server on :8501).
+    try:
+        with open(os.path.join(os.path.dirname(_sys.executable),
+                               "update_restart.flag"), "w", encoding="utf-8") as fh:
+            fh.write(time.strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        pass
     # apply_updates_and_restart() DEADLOCKS inside the embedded Streamlit server:
     # Velopack spawns its updater, which waits for this PID to exit before it can
     # replace files — but the call blocks in the script-run thread, so the process
@@ -340,6 +350,50 @@ def _apply_update(asset):
     um.wait_exit_then_apply_updates(info, silent=False, restart=True)
     _update_log("apply: updater spawned, hard-exiting now")
     os._exit(0)
+
+
+def _apply_update(asset):
+    """Stage the update package locally via requests, then let Velopack apply it.
+
+    Tries the small **delta** package(s) first: the full bundle is hundreds of MB
+    and crawls through EY's proxy / GitHub, whereas a delta is only the changed
+    files and Velopack reconstructs the new version from the installed base + the
+    delta(s). If no usable delta chain exists, or the delta apply is rejected,
+    fall back to the full .nupkg (the previous, always-works behaviour).
+    """
+    _update_log(f"apply: start, target={_update_target_version(asset)}")
+    staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
+    feed = _fetch_release_feed()
+    full = _latest_full_asset(feed) or asset
+    target = _ver_tuple(full.get("Version"))
+    current = _ver_tuple(_current_version())
+
+    # Velopack emits one delta per release (each diffs from the immediately prior
+    # version), so the chain that upgrades the installed version to the target is
+    # every delta with current < Version <= target.
+    deltas = sorted(
+        (a for a in feed.get("Assets", [])
+         if a.get("Type") == "Delta"
+         and current < _ver_tuple(a.get("Version")) <= target),
+        key=lambda a: _ver_tuple(a.get("Version")))
+    delta_total = sum(a.get("Size") or 0 for a in deltas)
+    full_size = full.get("Size") or 0
+
+    # Only worth it if deltas exist and are actually smaller than the full package.
+    if deltas and (not full_size or delta_total < full_size):
+        try:
+            _update_log(f"apply: delta path — {len(deltas)} delta(s), "
+                        f"{delta_total} bytes vs full {full_size} bytes")
+            # The index lists the deltas plus the target Full (Velopack needs its
+            # metadata to plan the chain), but we stage only the delta files;
+            # Velopack assembles the new version locally and never fetches the full.
+            _stage_and_apply(staging, feed, deltas, deltas + [full])
+            return  # not reached — _stage_and_apply hard-exits on success
+        except Exception as e:
+            _update_log(f"apply: delta path failed ({e!r}); falling back to full")
+
+    _update_log(f"apply: full path — {full_size} bytes")
+    _stage_and_apply(staging, feed, [full], [full])
 
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
@@ -773,6 +827,46 @@ API_KEY_SUB2  = os.getenv("DIFY_API_KEY_SUB2", "")
 
 st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 
+# A user clicked "Download & install update" in the sidebar (which only sets this
+# flag + reruns). The apply blocks for the whole download then hard-exits, so paint
+# a clean full-viewport overlay *here* — before the title or anything else renders —
+# instead of letting a spinner sit on the half-drawn page (the title showed twice,
+# see updating.png). Frozen builds only; the flag holds the asset to install.
+if st.session_state.get("_do_update") and getattr(_sys, "frozen", False):
+    _u_asset = st.session_state["_do_update"]
+    _u_ver = _update_target_version(_u_asset) or ""
+    _u_overlay = st.empty()
+    _u_overlay.markdown(
+        f"""
+        <style>@keyframes soc-spin {{ to {{ transform: rotate(360deg); }} }}</style>
+        <div style="position:fixed; inset:0; z-index:2147483647;
+                    display:flex; flex-direction:column; gap:1.1rem;
+                    align-items:center; justify-content:center; text-align:center;
+                    background:var(--background-color, #0e1117);
+                    color:var(--text-color, #fafafa);">
+          <div style="width:46px; height:46px; border-radius:50%;
+                      border:4px solid rgba(128,128,128,.35); border-top-color:#ff4b4b;
+                      animation:soc-spin 1s linear infinite;"></div>
+          <div style="font-size:1.15rem; font-weight:600;">
+            Updating{(" to " + _u_ver) if _u_ver else ""}…</div>
+          <div style="opacity:.7; max-width:32rem;">
+            This can take a few minutes on a slow network. The app will restart and
+            reload this window automatically — please keep it open.</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    try:
+        _apply_update(_u_asset)  # downloads, then hard-exits to relaunch
+    except Exception as _e:
+        # Drop the overlay so the error is visible (it covers the whole viewport).
+        _u_overlay.empty()
+        st.session_state.pop("_do_update", None)
+        st.error(f"Update failed: {_e}")
+        if st.button("← Back"):
+            st.rerun()
+    st.stop()
+
 # Resolve where MA/AR templates come from this session (bundled / SharePoint /
 # Feishu / synced folder). resolve_template() and the UI read the module globals
 # set below. Feishu mode may also override the letterhead dir and
@@ -891,19 +985,15 @@ with st.sidebar:
             _new = _update_target_version(_info)
             st.info(f"🎉 Update available: **{_new}**" if _new
                     else "🎉 A new version is available.")
-            # User-initiated apply: download then relaunch into the new version.
-            # The app restarts (the browser tab needs a refresh afterwards).
+            # User-initiated apply. Don't run it here: this is deep inside the
+            # sidebar, so the apply's spinner would sit on top of the half-drawn
+            # page (the title renders twice, see updating.png). Flag it and rerun;
+            # the top of the script paints a clean full-viewport update screen and
+            # runs the apply there.
             if st.button("⬇️ Download & install update", type="primary",
                          use_container_width=True):
-                try:
-                    with st.spinner("Updating… the app will restart automatically."):
-                        # Download via requests (works behind corp TLS) and let
-                        # Velopack apply the local package — see _apply_update.
-                        # This call does not return (it hard-exits to let the
-                        # Velopack updater replace files and relaunch).
-                        _apply_update(_info)
-                except Exception as _e:
-                    st.error(f"Update failed: {_e}")
+                st.session_state["_do_update"] = _info
+                st.rerun()
         elif st.session_state.get("_update_error"):
             st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
         elif st.session_state.get("_update_checked"):

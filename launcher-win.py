@@ -95,8 +95,22 @@ def main():
             from dotenv import load_dotenv
             load_dotenv(env_file, override=True)
 
-    # Open the browser in the background after a short delay
-    threading.Thread(target=_open_browser, daemon=True).start()
+    # Open the browser — unless this start is a post-update relaunch. After an
+    # update Velopack restarts us on the same :8501; the user's existing tab
+    # (left on the old, now-killed server) auto-reconnects to the new one, so
+    # opening another window just leaves two. _apply_update drops an
+    # `update_restart.flag` right before it exits; consume it and skip the open.
+    _post_update = False
+    if getattr(sys, "frozen", False):
+        flag = os.path.join(exe_dir, "update_restart.flag")
+        if os.path.exists(flag):
+            _post_update = True
+            try:
+                os.remove(flag)
+            except Exception:
+                pass
+    if not _post_update:
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     # Launch Streamlit
     from streamlit.web import cli as stcli
