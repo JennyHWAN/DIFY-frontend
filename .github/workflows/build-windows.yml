@@ -45,6 +45,14 @@ jobs:
           DIFY_API_KEY_MAIN=${{ secrets.DIFY_API_KEY_MAIN }}
           DIFY_API_KEY_SUB1=${{ secrets.DIFY_API_KEY_SUB1 }}
           DIFY_API_KEY_SUB2=${{ secrets.DIFY_API_KEY_SUB2 }}
+          TEMPLATE_SOURCE=${{ secrets.TEMPLATE_SOURCE }}
+          FEISHU_API_BASE=${{ secrets.FEISHU_API_BASE }}
+          FEISHU_APP_ID=${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET=${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_MA_FOLDER_TOKEN=${{ secrets.FEISHU_MA_FOLDER_TOKEN }}
+          FEISHU_AR_FOLDER_TOKEN=${{ secrets.FEISHU_AR_FOLDER_TOKEN }}
+          FEISHU_LETTERHEAD_FOLDER_TOKEN=${{ secrets.FEISHU_LETTERHEAD_FOLDER_TOKEN }}
+          FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN=${{ secrets.FEISHU_TEMPLATE_INDEX_FOLDER_TOKEN }}
           "@ | Set-Content -Encoding UTF8 .env
         shell: pwsh
 
