@@ -278,28 +278,52 @@ def _apply_update(asset):
 
     fn = full["FileName"]
     dest = os.path.join(staging, fn)
-    # Retry the package download too — same flaky-proxy read-timeout can hit here.
-    # A failed attempt just leaves a partial file we overwrite on the next try.
+    expected = full.get("Size") or 0
+    url = f"{UPDATE_FEED_URL}/{fn}"
+    # Resumable, retried download. EY's proxy tends to stall large transfers part
+    # way through, so rather than restart from zero each time we keep the partial
+    # file and resume with an HTTP Range request. The read timeout is PER-CHUNK
+    # (reset on each chunk), so a short value only trips on a true stall — which
+    # then raises and lets us resume, instead of the old 1800s hang. Progress is
+    # logged every ~10 MB so update.log shows whether bytes are actually flowing.
+    got = os.path.getsize(dest) if os.path.exists(dest) else 0
     last = None
-    for attempt in range(4):
+    for attempt in range(8):
         try:
-            _update_log(f"apply: downloading {fn} (attempt {attempt + 1})")
-            with requests.get(f"{UPDATE_FEED_URL}/{fn}", timeout=(30, 1800),
-                              headers=_UPDATE_UA, stream=True) as resp:
+            headers = dict(_UPDATE_UA)
+            if got:
+                headers["Range"] = f"bytes={got}-"
+            _update_log(f"apply: downloading {fn} (attempt {attempt + 1}, "
+                        f"from {got}, expected {expected} bytes)")
+            next_mark = got + 10 * 1024 * 1024
+            with requests.get(url, timeout=(30, 120), headers=headers,
+                              stream=True) as resp:
+                # 206 = server honoured the Range; 200 = it ignored it and is
+                # sending the whole file, so start the file over from zero.
+                if got and resp.status_code == 200:
+                    got = 0
                 resp.raise_for_status()
-                with open(dest, "wb") as fh:
+                mode = "ab" if (got and resp.status_code == 206) else "wb"
+                with open(dest, mode) as fh:
                     for chunk in resp.iter_content(65536):
                         fh.write(chunk)
+                        got += len(chunk)
+                        if got >= next_mark:
+                            _update_log(f"apply: downloaded {got} bytes")
+                            next_mark += 10 * 1024 * 1024
+            if expected and got < expected:
+                raise IOError(f"short read: got {got} of {expected} bytes")
             last = None
             break
-        except requests.exceptions.RequestException as e:
+        except (requests.exceptions.RequestException, IOError) as e:
             last = e
-            _update_log(f"apply: download failed: {e!r}")
-            if attempt < 3:
+            got = os.path.getsize(dest) if os.path.exists(dest) else 0
+            _update_log(f"apply: download interrupted at {got} bytes: {e!r}")
+            if attempt < 7:
                 time.sleep(2 * (attempt + 1))
     if last is not None:
         raise last
-    _update_log("apply: download complete")
+    _update_log(f"apply: download complete ({got} bytes)")
 
     um = _update_manager(staging)  # local file source — no network/TLS
     info = um.check_for_updates()
