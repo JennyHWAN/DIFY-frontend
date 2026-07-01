@@ -516,6 +516,58 @@ def _start_background_update(asset):
     threading.Thread(target=_stage_update_background, args=(asset,), daemon=True).start()
 
 
+def _render_update_status():
+    """Render the update availability / download-progress / staged UI.
+
+    Called through an st.fragment at the sidebar (see below), so while a download is
+    in progress this panel auto-reruns on its own short timer — the background
+    thread's progress advances and the "Restart now" button appears without the
+    user clicking, and **without rerunning the rest of the app** (no disruption to
+    an in-flight report). Every button here calls st.rerun(), whose scope defaults
+    to the whole app, so the top-of-script _do_restart / _do_check handlers still
+    fire from inside the fragment.
+    """
+    _info = st.session_state.get("_update_info")
+    _ust = _update_state()
+    if _ust["state"] == "downloading":
+        _dl = _ust["downloaded"] // (1024 * 1024)
+        st.info(f"⬇️ Downloading update {_ust['version']}…")
+        if _ust["total"]:
+            st.progress(min(_ust["downloaded"] / _ust["total"], 1.0),
+                        text=f"{_dl} / {_ust['total'] // (1024 * 1024)} MB")
+        else:
+            st.caption(f"{_dl} MB downloaded")
+        st.caption("Downloading in the background — you can keep using the app. This "
+                   "refreshes on its own; a **Restart now** button appears here when "
+                   "it's ready.")
+    elif _ust["state"] == "staged":
+        st.success(f"✅ Update {_ust['version']} downloaded and ready to install.")
+        st.caption("Save any work first — installing will close and reopen the app.")
+        if st.button("🔁 Restart now to install", type="primary",
+                     use_container_width=True):
+            # The apply is fast now (already downloaded); flag it and rerun so the
+            # top of the script paints a clean overlay and applies there.
+            st.session_state["_do_restart"] = True
+            st.rerun()
+    elif _ust["state"] == "error":
+        st.warning(f"Update download failed: {_ust['error']}")
+        if _info and st.button("↻ Retry download", use_container_width=True):
+            _start_background_update(_info)
+            st.rerun()
+    elif _info:
+        _new = _update_target_version(_info)
+        st.info(f"🎉 Update available: **{_new}**" if _new
+                else "🎉 A new version is available.")
+        if st.button("⬇️ Download update in background", type="primary",
+                     use_container_width=True):
+            _start_background_update(_info)
+            st.rerun()
+    elif st.session_state.get("_update_error"):
+        st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
+    elif st.session_state.get("_update_checked"):
+        st.caption("✅ You're on the latest version.")
+
+
 # EY keeps the authoritative MA/AR templates in the SharePoint library
 # "GCSOCR / Reporting files templates". Rather than ship static copies, the app can
 # pull the latest .docx straight from that library at startup so templates stay
@@ -1131,49 +1183,14 @@ with st.sidebar:
             st.session_state["_do_check"] = True
             st.rerun()
 
-        _info = st.session_state.get("_update_info")
-        _ust = _update_state()
-        if _ust["state"] == "downloading":
-            # Download runs in a background thread so the app stays usable. Progress
-            # only advances on rerun (any interaction), so offer a manual refresh.
-            _dl = _ust["downloaded"] // (1024 * 1024)
-            st.info(f"⬇️ Downloading update {_ust['version']}…")
-            if _ust["total"]:
-                st.progress(min(_ust["downloaded"] / _ust["total"], 1.0),
-                            text=f"{_dl} / {_ust['total'] // (1024 * 1024)} MB")
-            else:
-                st.caption(f"{_dl} MB downloaded")
-            st.caption("Downloading in the background — you can keep using the app. "
-                       "This can take a long time on a slow network; you'll get a "
-                       "**Restart now** button here when it's ready.")
-            if st.button("🔄 Refresh progress", use_container_width=True):
-                st.rerun()
-        elif _ust["state"] == "staged":
-            st.success(f"✅ Update {_ust['version']} downloaded and ready to install.")
-            st.caption("Save any work first — installing will close and reopen the app.")
-            if st.button("🔁 Restart now to install", type="primary",
-                         use_container_width=True):
-                # The apply is fast now (already downloaded); flag it and rerun so the
-                # top of the script paints a clean overlay and applies there.
-                st.session_state["_do_restart"] = True
-                st.rerun()
-        elif _ust["state"] == "error":
-            st.warning(f"Update download failed: {_ust['error']}")
-            if _info and st.button("↻ Retry download", use_container_width=True):
-                _start_background_update(_info)
-                st.rerun()
-        elif _info:
-            _new = _update_target_version(_info)
-            st.info(f"🎉 Update available: **{_new}**" if _new
-                    else "🎉 A new version is available.")
-            if st.button("⬇️ Download update in background", type="primary",
-                         use_container_width=True):
-                _start_background_update(_info)
-                st.rerun()
-        elif st.session_state.get("_update_error"):
-            st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
-        elif st.session_state.get("_update_checked"):
-            st.caption("✅ You're on the latest version.")
+        # Auto-refresh the update panel every couple of seconds *only while a
+        # download is running* (fragment scope), so progress + the "Restart now"
+        # prompt surface on their own without rerunning the whole app. Idle /
+        # staged / error => run_every None => no polling. Re-wrapping the same
+        # function each run keeps a stable fragment id (functools.wraps preserves
+        # __qualname__), so the run_every change just takes effect on redeclare.
+        _refresh = "2s" if _update_state()["state"] == "downloading" else None
+        st.fragment(run_every=_refresh)(_render_update_status)()
 
 # ── Progress indicator ─────────────────────────────────────────────────────────
 main_done  = "main_outputs"  in st.session_state
