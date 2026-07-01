@@ -66,10 +66,16 @@ echo [4/4] Packaging installer with Velopack (vpk)...
 dotnet tool install -g vpk >nul 2>&1
 dotnet tool update  -g vpk >nul 2>&1
 set /p APPVER=<VERSION
+:: --delta none: ship ONLY full packages. Delta reconstruction (base + delta ->
+:: full) can't rebuild the published full byte-for-byte here (PyInstaller builds
+:: aren't perfectly deterministic), so Velopack rejects the reassembled package
+:: with "Size did not match". Full packages are self-verifying and our resumable
+:: downloader handles the ~95 MB fine, so reliability beats the smaller delta.
 vpk pack --packId SOC_Report_Generator --packVersion %APPVER% ^
     --packDir C:\DIFY_build\dist\SOC_Report_Generator ^
     --mainExe SOC_Report_Generator.exe ^
     --packTitle "SOC Report Generator" ^
+    --delta none ^
     --outputDir C:\DIFY_build\Releases
 if errorlevel 1 (
     echo [ERROR] vpk pack failed. Is the .NET SDK installed? See output above.

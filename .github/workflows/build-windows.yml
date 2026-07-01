@@ -23,7 +23,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # vpk needs prior tags/releases to build deltas
+          fetch-depth: 0   # vpk upload reads prior tags/releases to build the feed
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -81,6 +81,7 @@ jobs:
           --packDir dist/SOC_Report_Generator
           --mainExe SOC_Report_Generator.exe
           --packTitle "SOC Report Generator"
+          --delta none
 
       # Only publish a Release on a real tag push. vpk first downloads the
       # previous release to compute delta packages, then uploads Setup.exe +
