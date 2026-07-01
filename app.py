@@ -164,14 +164,42 @@ def _update_manager(source=None):
 _UPDATE_UA = {"User-Agent": "SOC-Report-Generator-Updater"}
 _UPDATE_CHANNEL = "win"
 
-# Serialize the apply across Streamlit script runs. The download blocks one run's
-# thread for many minutes; over a flaky corporate network the websocket reconnects
-# and Streamlit spawns fresh runs that, seeing _do_update still set, would each
-# launch another downloader into the same staging file — they append over each
-# other (byte counts go backwards, file grows past its real size) and every resume
-# Range then 416s. This module-level lock (shared by all runs in the one server
-# process) guarantees a single downloader.
+# Serialize the background download+stage. The download runs for a long time; a
+# duplicate trigger (websocket reconnect re-firing, an over-eager double click)
+# would launch a competing downloader into the same staging file — they append over
+# each other (byte counts go backwards, file grows past its real size) and every
+# resume Range then 416s. This module-level lock (shared by all runs in the one
+# server process) guarantees a single downloader.
 _UPDATE_LOCK = threading.Lock()
+
+# Background-update progress + result, shared across Streamlit reruns (a worker
+# thread can't touch st.session_state). The updater no longer blocks the UI or
+# restarts on its own: it downloads + assembles the package in a daemon thread
+# while the user keeps working, flips `state` to "staged" when the package is ready,
+# and only then does a user click "Restart now" (which applies + relaunches).
+#   state: "idle" | "downloading" | "staged" | "error"
+_UPDATE_STATE = {"state": "idle", "version": "", "downloaded": 0, "total": 0, "error": ""}
+_UPDATE_STATE_LOCK = threading.Lock()
+# The ready-to-apply (UpdateManager, UpdateInfo) pair, set by the staging thread.
+# Kept as live objects in this process (not session_state) so the "Restart now"
+# click can apply without re-doing the slow download.
+_STAGED = {}
+
+
+def _set_update_state(**kw):
+    with _UPDATE_STATE_LOCK:
+        _UPDATE_STATE.update(kw)
+
+
+def _update_state():
+    with _UPDATE_STATE_LOCK:
+        return dict(_UPDATE_STATE)
+
+
+def _bump_downloaded(n):
+    """Progress callback for _download_asset: add n freshly-written bytes."""
+    with _UPDATE_STATE_LOCK:
+        _UPDATE_STATE["downloaded"] += n
 
 
 def _ver_tuple(s):
@@ -262,8 +290,11 @@ def _update_log(msg):
         pass
 
 
-def _download_asset(asset, dest):
+def _download_asset(asset, dest, on_progress=None):
     """Resumable, retried download of one release asset to `dest` via requests.
+
+    `on_progress(n)`, if given, is called with the number of freshly-written bytes
+    after each chunk so the background UI can show a running total.
 
     EY's proxy tends to stall large transfers part way through, so rather than
     restart from zero each time we keep the partial file and resume with an HTTP
@@ -327,6 +358,8 @@ def _download_asset(asset, dest):
                     for chunk in resp.iter_content(65536):
                         fh.write(chunk)
                         got += len(chunk)
+                        if on_progress:
+                            on_progress(len(chunk))
                         if got >= next_mark:
                             _update_log(f"apply: downloaded {got} bytes")
                             next_mark += 10 * 1024 * 1024
@@ -345,18 +378,18 @@ def _download_asset(asset, dest):
     raise last
 
 
-def _stage_and_apply(staging, feed, download_assets, index_assets):
+def _stage_updates(staging, feed, download_assets, index_assets, on_progress=None):
     """Download `download_assets` into a fresh `staging` dir, write a local release
-    index listing `index_assets`, then let Velopack apply the local package.
+    index listing `index_assets`, and have Velopack assemble the package locally.
 
     Velopack's downloader can't reach GitHub behind EY's TLS interception, but it
     applies a *local directory* source with no TLS — so we stage the files with
     requests and point a file-source UpdateManager at the dir. Velopack still
     verifies the package SHA against the index, so integrity is preserved.
 
-    Does NOT return on success — it hard-exits so Velopack's out-of-process
-    updater can replace files and relaunch. Raises on any failure so the caller
-    can fall back (delta -> full).
+    Returns the ready-to-apply `(UpdateManager, UpdateInfo)`; it does NOT arm the
+    apply or restart (the "Restart now" click does that later). Raises on any
+    failure so the caller can fall back (delta -> full).
     """
     shutil.rmtree(staging, ignore_errors=True)
     os.makedirs(staging, exist_ok=True)
@@ -366,14 +399,26 @@ def _stage_and_apply(staging, feed, download_assets, index_assets):
               "w", encoding="utf-8") as fh:
         json.dump(local_feed, fh)
     for a in download_assets:
-        _download_asset(a, os.path.join(staging, a["FileName"]))
+        _download_asset(a, os.path.join(staging, a["FileName"]), on_progress=on_progress)
 
     um = _update_manager(staging)  # local file source — no network/TLS
     info = um.check_for_updates()
     if not info:
         raise RuntimeError("Staged package was not recognized as an update.")
-    _update_log("apply: download_updates (Velopack assembles nupkg into install)")
+    _update_log("stage: download_updates (Velopack assembles nupkg into install)")
     um.download_updates(info)
+    _update_log("stage: package assembled, ready to apply on restart")
+    return um, info
+
+
+def _restart_to_apply():
+    """Apply the already-staged package and restart. Fast — the slow download ran
+    in the background, so this only arms Velopack + relaunches. Not reached on
+    success (hard-exit); raises if nothing is staged.
+    """
+    um, info = _STAGED.get("um"), _STAGED.get("info")
+    if not (um and info):
+        raise RuntimeError("No staged update to apply.")
     # Leave a marker the launcher reads on the next start: it means "this launch is
     # a post-update relaunch", so the launcher skips opening a *new* browser window
     # (the user's existing tab reconnects to the restarted server on :8501).
@@ -388,14 +433,16 @@ def _stage_and_apply(staging, feed, download_assets, index_assets):
     # replace files — but the call blocks in the script-run thread, so the process
     # never exits and both sides wait forever. Instead schedule the apply+restart
     # for *after* we exit (non-blocking), then hard-exit so the updater proceeds.
-    _update_log("apply: spawning Velopack updater (wait_exit_then_apply_updates)")
+    _update_log("restart: spawning Velopack updater (wait_exit_then_apply_updates)")
     um.wait_exit_then_apply_updates(info, silent=False, restart=True)
-    _update_log("apply: updater spawned, hard-exiting now")
+    _update_log("restart: updater spawned, hard-exiting now")
     os._exit(0)
 
 
-def _apply_update(asset):
-    """Stage the update package locally via requests, then let Velopack apply it.
+def _stage_update_background(asset):
+    """Download + assemble the update package (no apply/restart), updating
+    `_UPDATE_STATE` as it goes. Runs in a daemon thread so the UI stays usable
+    through the (potentially very long) download.
 
     Tries the small **delta** package(s) first: the full bundle is hundreds of MB
     and crawls through EY's proxy / GitHub, whereas a delta is only the changed
@@ -403,16 +450,14 @@ def _apply_update(asset):
     delta(s). If no usable delta chain exists, or the delta apply is rejected,
     fall back to the full .nupkg (the previous, always-works behaviour).
 
-    Serialized by _UPDATE_LOCK: if another run is already applying (e.g. a websocket
-    reconnect re-triggered the takeover), this returns immediately rather than
-    starting a competing downloader. On success it never returns (hard-exit); on
-    failure it releases the lock so the user can retry.
+    Serialized by _UPDATE_LOCK: a duplicate trigger (e.g. a websocket reconnect)
+    returns immediately rather than starting a competing downloader.
     """
     if not _UPDATE_LOCK.acquire(blocking=False):
-        _update_log("apply: another apply already running; ignoring duplicate trigger")
+        _update_log("stage: another stage already running; ignoring duplicate trigger")
         return
     try:
-        _update_log(f"apply: start, target={_update_target_version(asset)}")
+        _update_log(f"stage: start, target={_update_target_version(asset)}")
         staging = os.path.join(tempfile.gettempdir(), "soc_update_stage")
         feed = _fetch_release_feed()
         full = _latest_full_asset(feed) or asset
@@ -433,23 +478,42 @@ def _apply_update(asset):
         # Only worth it if deltas exist and are actually smaller than the full.
         if deltas and (not full_size or delta_total < full_size):
             try:
-                _update_log(f"apply: delta path — {len(deltas)} delta(s), "
+                _update_log(f"stage: delta path — {len(deltas)} delta(s), "
                             f"{delta_total} bytes vs full {full_size} bytes")
+                _set_update_state(total=delta_total, downloaded=0)
                 # The index lists the deltas plus the target Full (Velopack needs
                 # its metadata to plan the chain), but we stage only the delta
                 # files; Velopack assembles the new version locally and never
                 # fetches the full.
-                _stage_and_apply(staging, feed, deltas, deltas + [full])
-                return  # not reached — _stage_and_apply hard-exits on success
+                um, info = _stage_updates(staging, feed, deltas, deltas + [full],
+                                          _bump_downloaded)
+                _STAGED["um"], _STAGED["info"] = um, info
+                _set_update_state(state="staged")
+                _update_log("stage: staged (delta); awaiting user restart")
+                return
             except Exception as e:
-                _update_log(f"apply: delta path failed ({e!r}); falling back to full")
+                _update_log(f"stage: delta path failed ({e!r}); falling back to full")
 
-        _update_log(f"apply: full path — {full_size} bytes")
-        _stage_and_apply(staging, feed, [full], [full])
+        _update_log(f"stage: full path — {full_size} bytes")
+        _set_update_state(total=full_size, downloaded=0)
+        um, info = _stage_updates(staging, feed, [full], [full], _bump_downloaded)
+        _STAGED["um"], _STAGED["info"] = um, info
+        _set_update_state(state="staged")
+        _update_log("stage: staged (full); awaiting user restart")
+    except Exception as e:
+        _set_update_state(state="error", error=str(e))
+        _update_log(f"stage: FAILED — {e!r}")
     finally:
-        # Reached only if the apply failed (success hard-exits the process). Free
-        # the lock so the user can click "Download & install update" again.
         _UPDATE_LOCK.release()
+
+
+def _start_background_update(asset):
+    """Begin (or ignore, if already running/ready) a background download+stage."""
+    if _update_state()["state"] in ("downloading", "staged"):
+        return
+    _set_update_state(state="downloading", version=_update_target_version(asset) or "",
+                      downloaded=0, total=0, error="")
+    threading.Thread(target=_stage_update_background, args=(asset,), daemon=True).start()
 
 
 # EY keeps the authoritative MA/AR templates in the SharePoint library
@@ -883,14 +947,13 @@ API_KEY_SUB2  = os.getenv("DIFY_API_KEY_SUB2", "")
 
 st.set_page_config(page_title="AI-Driven Report Generation", layout="wide")
 
-# A user clicked "Download & install update" in the sidebar (which only sets this
-# flag + reruns). The apply blocks for the whole download then hard-exits, so paint
-# a clean full-viewport overlay *here* — before the title or anything else renders —
-# instead of letting a spinner sit on the half-drawn page (the title showed twice,
-# see updating.png). Frozen builds only; the flag holds the asset to install.
-if st.session_state.get("_do_update") and getattr(_sys, "frozen", False):
-    _u_asset = st.session_state["_do_update"]
-    _u_ver = _update_target_version(_u_asset) or ""
+# A user clicked "Restart now to install" (which only sets this flag + reruns). The
+# slow download already ran in the background, so applying is fast: this only arms
+# Velopack + relaunches. Paint a clean full-viewport overlay *here* — before the
+# title renders — so nothing sits on a half-drawn page (the title showed twice, see
+# updating.png). Frozen builds only.
+if st.session_state.get("_do_restart") and getattr(_sys, "frozen", False):
+    _u_ver = _update_state().get("version") or ""
     _u_overlay = st.empty()
     _u_overlay.markdown(
         f"""
@@ -904,20 +967,20 @@ if st.session_state.get("_do_update") and getattr(_sys, "frozen", False):
                       border:4px solid rgba(128,128,128,.35); border-top-color:#ff4b4b;
                       animation:soc-spin 1s linear infinite;"></div>
           <div style="font-size:1.15rem; font-weight:600;">
-            Updating{(" to " + _u_ver) if _u_ver else ""}…</div>
+            Installing update{(" " + _u_ver) if _u_ver else ""}…</div>
           <div style="opacity:.7; max-width:32rem;">
-            This can take a few minutes on a slow network. The app will restart and
-            reload this window automatically — please keep it open.</div>
+            The app will restart and reload this window automatically — please keep
+            it open.</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
     try:
-        _apply_update(_u_asset)  # downloads, then hard-exits to relaunch
+        _restart_to_apply()  # applies the staged package, then hard-exits to relaunch
     except Exception as _e:
         # Drop the overlay so the error is visible (it covers the whole viewport).
         _u_overlay.empty()
-        st.session_state.pop("_do_update", None)
+        st.session_state.pop("_do_restart", None)
         st.error(f"Update failed: {_e}")
         if st.button("← Back"):
             st.rerun()
@@ -1069,18 +1132,43 @@ with st.sidebar:
             st.rerun()
 
         _info = st.session_state.get("_update_info")
-        if _info:
+        _ust = _update_state()
+        if _ust["state"] == "downloading":
+            # Download runs in a background thread so the app stays usable. Progress
+            # only advances on rerun (any interaction), so offer a manual refresh.
+            _dl = _ust["downloaded"] // (1024 * 1024)
+            st.info(f"⬇️ Downloading update {_ust['version']}…")
+            if _ust["total"]:
+                st.progress(min(_ust["downloaded"] / _ust["total"], 1.0),
+                            text=f"{_dl} / {_ust['total'] // (1024 * 1024)} MB")
+            else:
+                st.caption(f"{_dl} MB downloaded")
+            st.caption("Downloading in the background — you can keep using the app. "
+                       "This can take a long time on a slow network; you'll get a "
+                       "**Restart now** button here when it's ready.")
+            if st.button("🔄 Refresh progress", use_container_width=True):
+                st.rerun()
+        elif _ust["state"] == "staged":
+            st.success(f"✅ Update {_ust['version']} downloaded and ready to install.")
+            st.caption("Save any work first — installing will close and reopen the app.")
+            if st.button("🔁 Restart now to install", type="primary",
+                         use_container_width=True):
+                # The apply is fast now (already downloaded); flag it and rerun so the
+                # top of the script paints a clean overlay and applies there.
+                st.session_state["_do_restart"] = True
+                st.rerun()
+        elif _ust["state"] == "error":
+            st.warning(f"Update download failed: {_ust['error']}")
+            if _info and st.button("↻ Retry download", use_container_width=True):
+                _start_background_update(_info)
+                st.rerun()
+        elif _info:
             _new = _update_target_version(_info)
             st.info(f"🎉 Update available: **{_new}**" if _new
                     else "🎉 A new version is available.")
-            # User-initiated apply. Don't run it here: this is deep inside the
-            # sidebar, so the apply's spinner would sit on top of the half-drawn
-            # page (the title renders twice, see updating.png). Flag it and rerun;
-            # the top of the script paints a clean full-viewport update screen and
-            # runs the apply there.
-            if st.button("⬇️ Download & install update", type="primary",
+            if st.button("⬇️ Download update in background", type="primary",
                          use_container_width=True):
-                st.session_state["_do_update"] = _info
+                _start_background_update(_info)
                 st.rerun()
         elif st.session_state.get("_update_error"):
             st.warning(f"Couldn't check for updates: {st.session_state['_update_error']}")
