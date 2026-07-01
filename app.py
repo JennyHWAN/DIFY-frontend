@@ -47,14 +47,27 @@ _BUNDLED_MA_DIR = os.path.join(_TEMPLATE_BASE, "MA_template")
 # the user (sidebar) — it never restarts on its own; the user clicks to apply.
 # All of this is inert in dev / when the app wasn't installed via Velopack.
 UPDATE_URL = "https://github.com/JennyHWAN/DIFY-frontend"
-# Velopack reads the feed from {UPDATE_FEED_URL}/releases.<channel>.json. We point
-# it at GitHub's "latest release" download redirect (a plain github.com asset path)
-# via HttpSource rather than GithubSource. GithubSource queries api.github.com,
-# which on locked-down corporate networks returns 403/empty even when the release
-# downloads themselves work — Velopack then silently reports "no update". This
-# static path uses only github.com / githubusercontent.com, the same hosts the
-# installer downloads already use.
-UPDATE_FEED_URL = "https://github.com/JennyHWAN/DIFY-frontend/releases/latest/download"
+# We fetch the feed from {base}/releases.<channel>.json and each asset from
+# {base}/{FileName}, always via `requests` (never Velopack's TLS stack), so any
+# HTTPS host that serves those files at those paths works as a mirror.
+# GitHub's "latest release" download redirect (a plain github.com asset path) is
+# the reliable base: we use HttpSource, not GithubSource, because GithubSource
+# queries api.github.com, which on locked-down corporate networks returns
+# 403/empty even when the release downloads themselves work (silent "no update").
+_GITHUB_FEED = "https://github.com/JennyHWAN/DIFY-frontend/releases/latest/download"
+# Optional faster mirror, tried BEFORE GitHub. EY's network reaches gitee.com far
+# faster than github.com. Fill this in once the Gitee repo + release exist — use
+# the base that {base}/<filename> resolves to for a real uploaded asset (confirm
+# the exact scheme by uploading one file and copying its download URL minus the
+# filename), e.g. "https://gitee.com/<owner>/<repo>/releases/download/<tag>".
+# Both hosts must serve the byte-identical releases.win.json + *-full.nupkg (the
+# same `vpk pack` output), so it doesn't matter which mirror answers a request.
+# Leave empty to use GitHub only (unchanged behavior).
+_GITEE_FEED = ""
+# Feed/asset bases in priority order (mirror first, GitHub fallback).
+UPDATE_FEED_URLS = [u for u in (_GITEE_FEED, _GITHUB_FEED) if u]
+# Kept for the local-only HttpSource get_current_version call (no network).
+UPDATE_FEED_URL = UPDATE_FEED_URLS[0]
 
 
 def _install_corp_certs():
@@ -210,22 +223,25 @@ def _ver_tuple(s):
 def _fetch_release_feed():
     """Download releases.<channel>.json via requests (works behind corp TLS).
 
+    Tries each base in UPDATE_FEED_URLS in order — a faster mirror first, GitHub
+    last. A configured mirror gets a single quick shot so a slow/blocked one
+    falls through fast; the final (GitHub) base gets the full retry budget, since
     EY's proxy occasionally read-times-out on the github.com -> objects.github
-    userconnect redirect even though the feed is reachable (detection works, then
-    the apply re-fetch stalls). Use a generous read timeout and retry a few times
-    with backoff so a single slow response doesn't fail the whole update.
+    redirect even when the feed is reachable.
     """
-    url = f"{UPDATE_FEED_URL}/releases.{_UPDATE_CHANNEL}.json"
     last = None
-    for attempt in range(4):
-        try:
-            r = requests.get(url, timeout=(30, 90), headers=_UPDATE_UA)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            last = e
-            if attempt < 3:
-                time.sleep(2 * (attempt + 1))
+    for i, base in enumerate(UPDATE_FEED_URLS):
+        attempts = 4 if i == len(UPDATE_FEED_URLS) - 1 else 1
+        url = f"{base}/releases.{_UPDATE_CHANNEL}.json"
+        for attempt in range(attempts):
+            try:
+                r = requests.get(url, timeout=(30, 90), headers=_UPDATE_UA)
+                r.raise_for_status()
+                return r.json()
+            except requests.exceptions.RequestException as e:
+                last = e
+                if attempt < attempts - 1:
+                    time.sleep(2 * (attempt + 1))
     raise last
 
 
@@ -305,7 +321,6 @@ def _download_asset(asset, dest, on_progress=None):
     """
     fn = asset["FileName"]
     expected = asset.get("Size") or 0
-    url = f"{UPDATE_FEED_URL}/{fn}"
     got = os.path.getsize(dest) if os.path.exists(dest) else 0
     if expected and got >= expected:
         if got > expected:
@@ -320,6 +335,23 @@ def _download_asset(asset, dest, on_progress=None):
             # Exactly the expected size: assume complete (Velopack SHA-checks it).
             _update_log(f"apply: {fn} already complete ({got} bytes)")
             return
+    # Try each mirror in turn. The file bytes are identical across mirrors, so a
+    # partial from one host resumes cleanly (via Range) from the next. Only give
+    # up once every base has exhausted its stall budget.
+    last = None
+    for base in UPDATE_FEED_URLS:
+        try:
+            _download_asset_from(f"{base}/{fn}", dest, expected, fn, on_progress)
+            return
+        except (requests.exceptions.RequestException, IOError) as e:
+            last = e
+            _update_log(f"apply: mirror {base} exhausted for {fn}: {e!r}")
+    raise last
+
+
+def _download_asset_from(url, dest, expected, fn, on_progress=None):
+    """Resumable, retried download of one asset URL into `dest` (see _download_asset)."""
+    got = os.path.getsize(dest) if os.path.exists(dest) else 0
     # Retry budget is by CONSECUTIVE no-progress failures, not total attempts:
     # EY's proxy drops the connection every ~30 MB, so a 95 MB download legitimately
     # needs many resumes. As long as each resume advances the byte count we keep
