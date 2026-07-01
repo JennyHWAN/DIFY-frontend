@@ -923,6 +923,40 @@ if st.session_state.get("_do_update") and getattr(_sys, "frozen", False):
             st.rerun()
     st.stop()
 
+# A user clicked "Check for updates" in the sidebar (which only sets this flag +
+# reruns). Like the apply above, the check does a blocking network call; run it
+# here — before the title renders — behind a full-viewport overlay so the spinner
+# doesn't sit on the half-drawn page with the title painted twice (see updating.png).
+# Frozen builds only. Falls through to render the page (with the result) once done.
+if st.session_state.pop("_do_check", False) and getattr(_sys, "frozen", False):
+    _c_overlay = st.empty()
+    _c_overlay.markdown(
+        """
+        <style>@keyframes soc-spin { to { transform: rotate(360deg); } }</style>
+        <div style="position:fixed; inset:0; z-index:2147483647;
+                    display:flex; flex-direction:column; gap:1.1rem;
+                    align-items:center; justify-content:center; text-align:center;
+                    background:var(--background-color, #0e1117);
+                    color:var(--text-color, #fafafa);">
+          <div style="width:46px; height:46px; border-radius:50%;
+                      border:4px solid rgba(128,128,128,.35); border-top-color:#ff4b4b;
+                      animation:soc-spin 1s linear infinite;"></div>
+          <div style="font-size:1.15rem; font-weight:600;">Checking for updates…</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.session_state["_update_checked"] = True
+    st.session_state.pop("_update_error", None)
+    try:
+        # raise on failure so the user sees the real reason instead of a misleading
+        # "up to date".
+        st.session_state["_update_info"] = _check_for_update(raise_errors=True)
+    except Exception as _e:
+        st.session_state["_update_info"] = None
+        st.session_state["_update_error"] = str(_e)
+    _c_overlay.empty()  # drop the overlay; the page renders below in this same run
+
 # Resolve where MA/AR templates come from this session (bundled / SharePoint /
 # Feishu / synced folder). resolve_template() and the UI read the module globals
 # set below. Feishu mode may also override the letterhead dir and
@@ -1026,17 +1060,12 @@ with st.sidebar:
                 st.session_state["_update_info"] = _check_for_update()
 
         if st.button("🔍 Check for updates", use_container_width=True):
-            st.session_state["_update_checked"] = True
-            st.session_state.pop("_update_error", None)
-            try:
-                # raise on failure so the user sees the real reason instead of a
-                # misleading "up to date". The fetch can take a while on a slow
-                # network (retries), so show a spinner while it runs.
-                with st.spinner("Checking for updates…"):
-                    st.session_state["_update_info"] = _check_for_update(raise_errors=True)
-            except Exception as _e:
-                st.session_state["_update_info"] = None
-                st.session_state["_update_error"] = str(_e)
+            # Don't run the check here: this is deep inside the sidebar, so the
+            # blocking fetch would paint on top of the half-drawn page with the
+            # title rendered twice (same problem as the apply, see updating.png).
+            # Flag it and rerun; the top of the script paints a clean overlay and
+            # runs the check there.
+            st.session_state["_do_check"] = True
             st.rerun()
 
         _info = st.session_state.get("_update_info")
