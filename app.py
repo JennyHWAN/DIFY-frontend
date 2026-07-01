@@ -523,10 +523,26 @@ def _render_update_status():
     in progress this panel auto-reruns on its own short timer — the background
     thread's progress advances and the "Restart now" button appears without the
     user clicking, and **without rerunning the rest of the app** (no disruption to
-    an in-flight report). Every button here calls st.rerun(), whose scope defaults
-    to the whole app, so the top-of-script _do_restart / _do_check handlers still
-    fire from inside the fragment.
+    an in-flight report). The "Restart now" button calls st.rerun(), whose scope
+    defaults to the whole app, so the top-of-script _do_restart handler still fires
+    from inside the fragment.
+
+    The "Check for updates" button also lives here, so the on-demand re-check runs
+    in fragment scope: clicking it reruns only this panel (a sidebar spinner shows
+    during the fetch) and never touches the main app — no title flash, no interrupted
+    report. raise_errors=True so a failure surfaces the real reason instead of a
+    misleading "up to date".
     """
+    if st.button("🔍 Check for updates", use_container_width=True):
+        st.session_state["_update_checked"] = True
+        st.session_state.pop("_update_error", None)
+        try:
+            with st.spinner("Checking for updates…"):
+                st.session_state["_update_info"] = _check_for_update(raise_errors=True)
+        except Exception as _e:
+            st.session_state["_update_info"] = None
+            st.session_state["_update_error"] = str(_e)
+
     _info = st.session_state.get("_update_info")
     _ust = _update_state()
     if _ust["state"] == "downloading":
@@ -1038,40 +1054,6 @@ if st.session_state.get("_do_restart") and getattr(_sys, "frozen", False):
             st.rerun()
     st.stop()
 
-# A user clicked "Check for updates" in the sidebar (which only sets this flag +
-# reruns). Like the apply above, the check does a blocking network call; run it
-# here — before the title renders — behind a full-viewport overlay so the spinner
-# doesn't sit on the half-drawn page with the title painted twice (see updating.png).
-# Frozen builds only. Falls through to render the page (with the result) once done.
-if st.session_state.pop("_do_check", False) and getattr(_sys, "frozen", False):
-    _c_overlay = st.empty()
-    _c_overlay.markdown(
-        """
-        <style>@keyframes soc-spin { to { transform: rotate(360deg); } }</style>
-        <div style="position:fixed; inset:0; z-index:2147483647;
-                    display:flex; flex-direction:column; gap:1.1rem;
-                    align-items:center; justify-content:center; text-align:center;
-                    background:var(--background-color, #0e1117);
-                    color:var(--text-color, #fafafa);">
-          <div style="width:46px; height:46px; border-radius:50%;
-                      border:4px solid rgba(128,128,128,.35); border-top-color:#ff4b4b;
-                      animation:soc-spin 1s linear infinite;"></div>
-          <div style="font-size:1.15rem; font-weight:600;">Checking for updates…</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.session_state["_update_checked"] = True
-    st.session_state.pop("_update_error", None)
-    try:
-        # raise on failure so the user sees the real reason instead of a misleading
-        # "up to date".
-        st.session_state["_update_info"] = _check_for_update(raise_errors=True)
-    except Exception as _e:
-        st.session_state["_update_info"] = None
-        st.session_state["_update_error"] = str(_e)
-    _c_overlay.empty()  # drop the overlay; the page renders below in this same run
-
 # Resolve where MA/AR templates come from this session (bundled / SharePoint /
 # Feishu / synced folder). resolve_template() and the UI read the module globals
 # set below. Feishu mode may also override the letterhead dir and
@@ -1169,26 +1151,21 @@ with st.sidebar:
             st.caption(f"Version {_ver}")
 
         # Check once automatically per session so the user is notified without
-        # having to click; the button below forces a fresh re-check on demand.
+        # having to click (the "Check for updates" button inside the panel forces a
+        # fresh re-check on demand). This one runs at first render, before the
+        # fragment, so it's fine to block briefly here.
         if "_update_info" not in st.session_state:
             with st.spinner("Checking for updates…"):
                 st.session_state["_update_info"] = _check_for_update()
 
-        if st.button("🔍 Check for updates", use_container_width=True):
-            # Don't run the check here: this is deep inside the sidebar, so the
-            # blocking fetch would paint on top of the half-drawn page with the
-            # title rendered twice (same problem as the apply, see updating.png).
-            # Flag it and rerun; the top of the script paints a clean overlay and
-            # runs the check there.
-            st.session_state["_do_check"] = True
-            st.rerun()
-
-        # Auto-refresh the update panel every couple of seconds *only while a
-        # download is running* (fragment scope), so progress + the "Restart now"
-        # prompt surface on their own without rerunning the whole app. Idle /
-        # staged / error => run_every None => no polling. Re-wrapping the same
-        # function each run keeps a stable fragment id (functools.wraps preserves
-        # __qualname__), so the run_every change just takes effect on redeclare.
+        # The whole update panel (check button + progress + restart prompt) is a
+        # fragment, so both the manual re-check and the download progress rerun in
+        # *fragment scope* — they never re-run the main app, so an in-flight report
+        # is never interrupted. Auto-refresh every couple of seconds only while a
+        # download is running; idle / staged / error => run_every None => no polling.
+        # Re-wrapping the same function each run keeps a stable fragment id
+        # (functools.wraps preserves __qualname__), so the run_every change just
+        # takes effect on redeclare.
         _refresh = "2s" if _update_state()["state"] == "downloading" else None
         st.fragment(run_every=_refresh)(_render_update_status)()
 
