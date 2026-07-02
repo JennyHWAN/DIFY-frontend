@@ -22,7 +22,10 @@ binaries += tmp[1]
 hiddenimports += tmp[2]
 
 # ── Other packages that need their data files ──────────────────────────────────
-for pkg in ("docx", "altair", "pyarrow", "pydeck"):
+# altair + pydeck are NOT collected (and are excluded below): they only back
+# st.altair_chart / st.map-style elements, which this app never calls — Streamlit
+# imports them lazily inside those calls, so the frozen app runs fine without them.
+for pkg in ("docx", "pyarrow"):
     try:
         datas += collect_data_files(pkg)
     except Exception:
@@ -137,7 +140,12 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=["rthook_protobuf.py"],
-    excludes=["matplotlib", "scipy", "PIL", "cv2", "tensorflow", "torch"],
+    # altair/pydeck (~33 MB unpacked): chart/map backends for Streamlit elements
+    # this app never calls (no st.*_chart / st.map / st.dataframe in app.py).
+    # Streamlit imports them lazily inside those element calls only — verified by
+    # running a widget app on streamlit 1.58 with both uninstalled (boots + renders).
+    excludes=["matplotlib", "scipy", "PIL", "cv2", "tensorflow", "torch",
+              "altair", "pydeck"],
     noarchive=False,
 )
 
